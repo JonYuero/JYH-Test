@@ -2498,70 +2498,74 @@ task.spawn(function()
 end)
 
 -- Auto Potions
-task.spawn(function()
-    local ItemsRE = Remotes:FindFirstChild("ItemsRE")
+-- Uses ItemsRE.OnClientEvent (same events the game's ItemsClient listens to)
+-- for reliable inventory counts and active boost tracking — no GUI path needed.
+do
+    local ItemsRE = Remotes:WaitForChild("ItemsRE", 15)
+    if ItemsRE then
+        -- potionCounts[itemId] = number owned
+        -- activeBoosts[stat]   = true while that boost is running
+        local potionCounts = {}
+        local activeBoosts = {}
 
-    -- Locate ScrollingFrameItems where potions are listed as ObjectFrame_<PotionId>
-    local function getScrollingFrame()
-        local guiMidObj = playerGui:FindFirstChild("GuiMid")
-        if not guiMidObj then return nil end
-        local itemsGuiObj = guiMidObj:FindFirstChild("Items")
-        if not itemsGuiObj then return nil end
-        local itemsFrameObj = itemsGuiObj:FindFirstChild("ItemsFrame")
-        if not itemsFrameObj then return nil end
-        return itemsFrameObj:FindFirstChild("ScrollingFrameItems")
-    end
-
-    -- Check if a boost is already active via the InfoGui Boost HUD
-    -- (each stat gets a Frame child that turns Visible when active)
-    local function anyBoostActive()
-        local ig = playerGui:FindFirstChild("InfoGui")
-        if not ig then return false end
-        local boostHud = ig:FindFirstChild("Boost")
-        if not boostHud then return false end
-        for _, child in ipairs(boostHud:GetChildren()) do
-            if child:IsA("Frame") and child.Visible then
-                return true
+        local function applyBoosts(boostTable)
+            activeBoosts = {}
+            if type(boostTable) ~= "table" then return end
+            for stat, info in pairs(boostTable) do
+                if type(info) == "table" and (tonumber(info.Remaining) or 0) > 0 then
+                    activeBoosts[stat] = true
+                end
             end
         end
-        return false
-    end
 
-    while true do
-        task.wait(1)
-        if not Config.AutoPotion then continue end
-
-        -- Refresh remote reference if it wasn't ready at startup
-        if not ItemsRE then
-            ItemsRE = Remotes:FindFirstChild("ItemsRE")
-            if not ItemsRE then continue end
+        local function isBoostActive()
+            for _, v in pairs(activeBoosts) do
+                if v then return true end
+            end
+            return false
         end
 
-        -- Skip while any stat boost is currently active
-        if anyBoostActive() then continue end
+        -- Mirror the same event the ItemsClient script handles
+        ItemsRE.OnClientEvent:Connect(function(action, data)
+            if action == "FullInventory" and type(data) == "table" then
+                potionCounts = {}
+                if type(data.Items) == "table" then
+                    for itemId, qty in pairs(data.Items) do
+                        potionCounts[itemId] = qty
+                    end
+                end
+                applyBoosts(data.Boosts)
 
-        local scrollingFrame = getScrollingFrame()
-        if not scrollingFrame then continue end
+            elseif action == "ItemUpdate" and type(data) == "table" then
+                potionCounts[data.ItemId] = data.Quantity or 0
 
-        local selected = Config.SelectedPotions
-        for _, potion in ipairs(POTIONS) do
-            if not selectionIncludes(selected, potion) then continue end
-            -- Ownership check: frame exists and is visible in the items list
-            local frame = scrollingFrame:FindFirstChild("ObjectFrame_" .. potion)
-            if not (frame and frame.Visible) then continue end
-            -- Quantity sanity check via the label inside the frame
-            local qLabel = frame:FindFirstChild("Quantity", true)
-            local qty = qLabel and tonumber(tostring(qLabel.Text):match("%d+")) or 0
-            if qty <= 0 then continue end
-            -- Fire the Items remote with the correct format
-            pcall(function()
-                ItemsRE:FireServer("UseItem", { ItemId = potion, Amount = 1 })
-            end)
-            task.wait(0.75)
-            break
-        end
+            elseif action == "BoostUpdate" then
+                applyBoosts(data)
+            end
+        end)
+
+        task.spawn(function()
+            while true do
+                task.wait(1)
+                if not Config.AutoPotion then continue end
+                if isBoostActive() then continue end
+
+                local selected = Config.SelectedPotions
+                for _, potion in ipairs(POTIONS) do
+                    if not selectionIncludes(selected, potion) then continue end
+                    if (potionCounts[potion] or 0) <= 0 then continue end
+                    pcall(function()
+                        ItemsRE:FireServer("UseItem", { ItemId = potion, Amount = 1 })
+                    end)
+                    task.wait(0.75)
+                    break
+                end
+            end
+        end)
+    else
+        warn("[ACF] ItemsRE not found – Auto Potion disabled")
     end
-end)
+end
 
 -- Auto Claim Playtime
 task.spawn(function()
