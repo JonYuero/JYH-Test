@@ -851,43 +851,72 @@ local function isPackContainer(container, info)
 end
 
 -- ════════════════════════════════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════════════════
 --  OPTIMIZED CONVEYOR & AUTO-BUY SYSTEM
 --  State machine per pack:
 --    Detected → WaitingForItemId / WaitingForPrompt → ReadyToBuy
 --            → Buying → Purchased → Removed
---  One registry entry per pack. Event-driven discovery.
---  Purchase queue prevents double-activation.
---  Filter cache rebuilt only on config change.
---  Debug output rate-limited; no string work when debug is off.
+--
+--  REGISTER BUDGET NOTE
+--  Lua enforces a limit of 200 local registers per function (chunk).
+--  All conveyor internals are wrapped in a do...end block so their ~38
+--  registers are freed when the block ends, keeping the outer chunk well
+--  under the limit. Only the 10 values that other loops need are exposed
+--  as outer upvalues declared before the block.
 -- ════════════════════════════════════════════════════════════════════════
 
--- ── Shared gate used by box handling and combat loops ────────────────
+-- ── Shared gate used by box handling and combat loops ─────────────────
 local boxHandlingActive = false
 
--- ── Single canonical registry ─────────────────────────────────────────
-local ConveyorRecords = {}              -- [packModel] = record
-local ItemIdIndex     = {}              -- [itemId]    = packModel
+-- ── Diagnostic helpers (used throughout the entire script) ───────────
+local diagnosticState = {}
 
--- ── Purchase queue ────────────────────────────────────────────────────
-local PurchaseQueue  = {}               -- ordered list of records
-local PurchaseQueued = {}               -- [record] = true (dedup set)
+-- These upvalues are assigned inside the do block below.
+local warnOnce, passesFilter, debugAutoBuy, markFilterCacheDirty
+local getConveyorPacks, getPackKey, indexPackIds
 
--- ── Per-prompt watcher guard ──────────────────────────────────────────
-local WatchedPrompts = setmetatable({}, { __mode = "k" })
+do -- ════ CONVEYOR INTERNALS (isolated scope — frees ~38 registers on exit) ════
 
--- ── Debug helpers ─────────────────────────────────────────────────────
-local DebugCooldowns   = {}
-local DEBUG_COOLDOWN   = 3             -- seconds between identical debug keys
+-- ── Registry and queue tables ─────────────────────────────────────────
+local ConveyorRecords = {}                     -- [packModel] = record
+local ItemIdIndex     = {}                     -- [itemId]    = packModel
+local PurchaseQueue   = {}                     -- ordered list of records
+local PurchaseQueued  = {}                     -- [record]    = true (dedup)
+local WatchedPrompts  = setmetatable({}, { __mode = "k" })
 
-local function autoBuyDebug(message)
-    -- Centralized debug helper — does nothing when debug is disabled.
+-- ── Timing constants ──────────────────────────────────────────────────
+local BUY_RETRY_DELAY  = 0.75   -- min seconds between buy attempts per record
+local BUYING_TIMEOUT   = 2.5    -- seconds before rolling back from "Buying"
+local METADATA_TTL     = 2.0    -- seconds between metadata refreshes per record
+local DEBUG_COOLDOWN   = 3.0    -- seconds between identical debug lines
+
+-- ── Debug rate-limiting table ─────────────────────────────────────────
+local DebugCooldowns = {}
+
+-- ── Filter cache (rebuilt only when a filter dropdown changes) ────────
+local FilterCache = { Rarities = {}, Mutations = {}, Packs = {}, dirty = true }
+
+-- ── Forward declarations for mutually recursive functions ─────────────
+local cleanupRecord, refreshRecordMetadata, evaluateRecordReadiness
+local queuePurchase, tryBuyRecord
+
+-- ── Outer-upvalue assignments (begin) ────────────────────────────────
+
+warnOnce = function(key, message)
+    if diagnosticState[key] then return end
+    diagnosticState[key] = true
+    warn("[ACF] " .. message)
+end
+
+local function autoBuyDebugInner(message)
+    -- Only builds strings when debug is enabled.
     if Config.AutoBuyDebug then
         warn("[ACF][AutoBuy] " .. tostring(message))
     end
 end
+debugAutoBuy = autoBuyDebugInner
 
 local function debugOnce(key, message, cooldown)
-    -- Rate-limited debug print. Suppresses identical events within cooldown.
     if not Config.AutoBuyDebug then return end
     cooldown = cooldown or DEBUG_COOLDOWN
     local now = os.clock()
@@ -896,32 +925,6 @@ local function debugOnce(key, message, cooldown)
     warn("[ACF][AutoBuy] " .. tostring(message))
 end
 
-local function conveyorLog(message)
-    if Config.AutoBuyDebug then
-        warn("[Conveyor] " .. tostring(message))
-    end
-end
-
--- ── Diagnostic state (also used by warnOnce throughout the script) ────
-local diagnosticState = {}
-
-local function warnOnce(key, message)
-    if diagnosticState[key] then return end
-    diagnosticState[key] = true
-    warn("[ACF] " .. message)
-end
-
--- ── Filter cache ──────────────────────────────────────────────────────
--- Normalized selections are rebuilt at most once per config change,
--- not on every pack evaluation.
-
-local FilterCache = {
-    Rarities  = {},
-    Mutations = {},
-    Packs     = {},
-    dirty     = true,
-}
-
 local function rebuildFilterCache()
     FilterCache.Rarities  = normalizeFilterSelection(Config.SelectedRarities)
     FilterCache.Mutations = normalizeFilterSelection(Config.SelectedMutations)
@@ -929,12 +932,11 @@ local function rebuildFilterCache()
     FilterCache.dirty     = false
 end
 
--- Call this whenever a filter dropdown value changes.
-local function markFilterCacheDirty()
+markFilterCacheDirty = function()
     FilterCache.dirty = true
 end
 
-local passesFilter = function(info)
+passesFilter = function(info)
     if FilterCache.dirty then rebuildFilterCache() end
     info = info or {}
     return filterValueMatches(info.rarity,   FilterCache.Rarities)
@@ -942,21 +944,9 @@ local passesFilter = function(info)
        and filterValueMatches(info.pack,     FilterCache.Packs)
 end
 
--- ── Buy timing constants ──────────────────────────────────────────────
-local BUY_RETRY_DELAY  = 0.75          -- min seconds between attempts on same record
-local BUYING_TIMEOUT   = 2.5           -- seconds before rolling back from "Buying"
-local METADATA_TTL     = 2.0           -- seconds between metadata refreshes
-
--- ── Forward declarations ──────────────────────────────────────────────
-local tryBuyRecord
-local queuePurchase
-local cleanupRecord
-local evaluateRecordReadiness
-local refreshRecordMetadata
-
 -- ── Connection tracker ────────────────────────────────────────────────
-local function trackConnection(record, connection)
-    if connection then table.insert(record.connections, connection) end
+local function trackConnection(record, conn)
+    if conn then table.insert(record.connections, conn) end
 end
 
 -- ── State-machine transition ──────────────────────────────────────────
@@ -964,7 +954,6 @@ local function transitionState(record, newState)
     if record.state == newState then return end
     record.state = newState
     if Config.AutoBuyDebug then
-        -- Always log true transitions immediately (cooldown = 0)
         debugOnce(
             "state:" .. tostring(record.model) .. ":" .. newState,
             "State → " .. newState
@@ -975,8 +964,7 @@ local function transitionState(record, newState)
     end
 end
 
--- ── Conveyor topology helpers ─────────────────────────────────────────
-
+-- ── Conveyor topology checks ──────────────────────────────────────────
 local function hasConveyorAncestor(instance)
     local cur = instance
     for _ = 1, 10 do
@@ -994,24 +982,6 @@ local function isConveyorModel(model)
     return model and model:IsA("Model") and hasConveyorAncestor(model)
 end
 
--- Walk upward to identify the outermost pack model within a conveyor.
-local function resolvePackModel(instance)
-    local cur = instance
-    if cur and not cur:IsA("Model") then
-        cur = cur:FindFirstAncestorOfClass("Model")
-    end
-    local best = nil
-    for _ = 1, 10 do
-        if not cur then break end
-        if isConveyorModel(cur) and isPackContainer(cur, nil) then
-            best = cur
-        end
-        cur = cur.Parent
-        while cur and not cur:IsA("Model") do cur = cur.Parent end
-    end
-    return best
-end
-
 local function isLikelyPackModel(model)
     if not isConveyorModel(model) then return false end
     for _, n in ipairs({ "ItemId", "ItemID", "itemId" }) do
@@ -1026,8 +996,7 @@ local function isLikelyPackModel(model)
     return isPackContainer(model, nil)
 end
 
--- ── Buy prompt detection ──────────────────────────────────────────────
-
+-- ── Buy prompt helpers ────────────────────────────────────────────────
 local function normalizePromptText(value)
     if value == nil then return "" end
     return string.lower(string.gsub(tostring(value), "^%s*(.-)%s*$", "%1"))
@@ -1044,7 +1013,6 @@ local function isBuyPrompt(prompt)
         or string.find(o, "buy", 1, true) ~= nil
 end
 
--- Scan the pack once to find the best active buy prompt.
 local function findBestBuyPrompt(packModel)
     if not packModel then return nil end
     local firstEnabled = nil
@@ -1054,7 +1022,6 @@ local function findBestBuyPrompt(packModel)
             if not firstEnabled then firstEnabled = desc end
         end
     end
-    -- Narrow fallback: siblings under the pack's parent
     local parent = packModel.Parent
     if parent then
         for _, child in ipairs(parent:GetChildren()) do
@@ -1069,26 +1036,18 @@ end
 
 -- ── Record cleanup ────────────────────────────────────────────────────
 cleanupRecord = function(record)
-    if not record then return end
-    if record.state == "Removed" then return end    -- idempotent
+    if not record or record.state == "Removed" then return end
     record.state = "Removed"
-
-    -- Disconnect all event connections attached to this record
     for _, conn in ipairs(record.connections) do
         pcall(function() conn:Disconnect() end)
     end
     table.clear(record.connections)
-
-    -- Remove from all tables
     if record.model then
         ConveyorRecords[record.model] = nil
         metadataCache[record.model]   = nil
     end
-    if record.itemId ~= nil then
-        ItemIdIndex[record.itemId] = nil
-    end
+    if record.itemId ~= nil then ItemIdIndex[record.itemId] = nil end
     PurchaseQueued[record] = nil
-    -- Don't bother removing from PurchaseQueue list — the scheduler skips Removed records.
 end
 
 -- ── Metadata refresh (lazy, TTL-gated) ───────────────────────────────
@@ -1102,8 +1061,6 @@ refreshRecordMetadata = function(record, force)
     end
     record.lastMetadataRefresh = now
     record.info = getBoxInfo(record.model)
-
-    -- Try to fill ItemId if still missing
     if record.itemId == nil then
         local freshId = getItemId(record.model)
         if freshId ~= nil then
@@ -1112,7 +1069,7 @@ refreshRecordMetadata = function(record, force)
             if Config.AutoBuyDebug then
                 debugOnce(
                     "itemid-fallback:" .. tostring(record.model),
-                    "ItemId found via fallback scan: " .. tostring(freshId)
+                    "ItemId found via fallback: " .. tostring(freshId)
                         .. "  pack=" .. tostring(record.info and record.info.pack),
                     0
                 )
@@ -1124,13 +1081,9 @@ end
 -- ── Readiness evaluation ──────────────────────────────────────────────
 evaluateRecordReadiness = function(record)
     if not record then return end
-    if record.state == "Purchased"
-        or record.state == "Removed"
-        or record.state == "Buying" then
-        return
-    end
+    local st = record.state
+    if st == "Purchased" or st == "Removed" or st == "Buying" then return end
 
-    -- Refresh cached buy prompt
     if not record.buyPrompt or not record.buyPrompt.Enabled then
         record.buyPrompt = findBestBuyPrompt(record.model)
     end
@@ -1139,30 +1092,21 @@ evaluateRecordReadiness = function(record)
     local hasPrompt = record.buyPrompt ~= nil and record.buyPrompt.Enabled ~= false
 
     if hasId and hasPrompt then
-        if record.state ~= "ReadyToBuy" then
-            transitionState(record, "ReadyToBuy")
-        end
+        if st ~= "ReadyToBuy" then transitionState(record, "ReadyToBuy") end
         if Config.AutoBuyMatching and not boxHandlingActive then
-            if passesFilter(record.info) then
-                queuePurchase(record)
-            end
+            if passesFilter(record.info) then queuePurchase(record) end
         end
     elseif not hasId then
-        if record.state ~= "WaitingForItemId" then
-            transitionState(record, "WaitingForItemId")
-        end
+        if st ~= "WaitingForItemId" then transitionState(record, "WaitingForItemId") end
     else
-        if record.state ~= "WaitingForPrompt" then
-            transitionState(record, "WaitingForPrompt")
-        end
+        if st ~= "WaitingForPrompt" then transitionState(record, "WaitingForPrompt") end
     end
 end
 
 -- ── Purchase queue ────────────────────────────────────────────────────
 queuePurchase = function(record)
-    if not record then return end
-    if record.state ~= "ReadyToBuy" then return end
-    if PurchaseQueued[record] then return end        -- dedup guard
+    if not record or record.state ~= "ReadyToBuy" then return end
+    if PurchaseQueued[record] then return end
     PurchaseQueued[record] = true
     table.insert(PurchaseQueue, record)
 end
@@ -1174,21 +1118,17 @@ tryBuyRecord = function(record)
         cleanupRecord(record)
         return false
     end
-
     local now = os.clock()
     if now - record.lastBuyAttempt < BUY_RETRY_DELAY then return false end
     record.lastBuyAttempt = now
     record.buyAttempts    = record.buyAttempts + 1
 
-    -- Refresh prompt cache once before attempting
     if not record.buyPrompt or not record.buyPrompt.Enabled then
         record.buyPrompt = findBestBuyPrompt(record.model)
     end
     if not record.buyPrompt then
-        debugOnce(
-            "noprompt:" .. tostring(record.model),
-            "No enabled buy prompt — will retry when prompt appears"
-        )
+        debugOnce("noprompt:" .. tostring(record.model),
+            "No enabled buy prompt — waiting for prompt to appear")
         transitionState(record, "WaitingForPrompt")
         return false
     end
@@ -1199,14 +1139,10 @@ tryBuyRecord = function(record)
     local succeeded = false
 
     if itemId ~= nil then
-        -- Primary path: fire via the game's ConveyorRE remote
         if Config.AutoBuyDebug then
-            debugOnce(
-                "buy:" .. tostring(itemId),
+            debugOnce("buy:" .. tostring(itemId),
                 "Purchase request  ItemId=" .. tostring(itemId)
-                    .. "  pack=" .. tostring(record.info and record.info.pack),
-                0
-            )
+                    .. "  pack=" .. tostring(record.info and record.info.pack), 0)
         end
         local ok, err = pcall(function()
             ConveyorRE:FireServer("TryBuy", { ItemId = itemId })
@@ -1215,7 +1151,7 @@ tryBuyRecord = function(record)
             succeeded = true
         else
             warn("[ACF][AutoBuy] TryBuy remote failed: " .. tostring(err))
-            -- Fallback: activate the prompt only when the remote fails
+            -- Prompt fallback ONLY when the remote fails
             if fireproximityprompt then
                 task.wait(0.12)
                 if record.model:IsDescendantOf(workspace)
@@ -1223,42 +1159,32 @@ tryBuyRecord = function(record)
                     pcall(fireproximityprompt, record.buyPrompt)
                     succeeded = true
                     if Config.AutoBuyDebug then
-                        autoBuyDebug("Prompt fallback used after remote failure")
+                        autoBuyDebugInner("Prompt fallback after remote failure")
                     end
                 end
             end
         end
     else
-        -- No ItemId: use the buy prompt directly
+        -- No ItemId: use prompt only
         if Config.AutoBuyDebug then
-            debugOnce(
-                "buy-prompt:" .. tostring(record.model),
+            debugOnce("buy-prompt:" .. tostring(record.model),
                 "Purchase via prompt (no ItemId)  pack="
-                    .. tostring(record.info and record.info.pack),
-                0
-            )
+                    .. tostring(record.info and record.info.pack), 0)
         end
         if fireproximityprompt then
             local ok, err = pcall(fireproximityprompt, record.buyPrompt)
             if ok then
                 succeeded = true
-            else
-                if Config.AutoBuyDebug then
-                    autoBuyDebug("Prompt activation failed: " .. tostring(err))
-                end
+            elseif Config.AutoBuyDebug then
+                autoBuyDebugInner("Prompt activation failed: " .. tostring(err))
             end
         else
-            warnOnce(
-                "AutoBuy:no-fireproximityprompt",
-                "No ItemId and fireproximityprompt unavailable — cannot buy."
-            )
+            warnOnce("AutoBuy:no-fireproximityprompt",
+                "No ItemId and fireproximityprompt unavailable — cannot buy.")
         end
     end
 
-    if not succeeded then
-        -- Roll back so the cooldown will allow a retry
-        transitionState(record, "ReadyToBuy")
-    end
+    if not succeeded then transitionState(record, "ReadyToBuy") end
     return succeeded
 end
 
@@ -1266,95 +1192,83 @@ end
 local function watchPromptEnabled(prompt, record)
     if not prompt or WatchedPrompts[prompt] then return end
     WatchedPrompts[prompt] = true
-
-    local conn = prompt:GetPropertyChangedSignal("Enabled"):Connect(function()
-        if not prompt.Enabled then return end
-        if record.state == "Purchased" or record.state == "Removed" then return end
-        if isBuyPrompt(prompt) then record.buyPrompt = prompt end
-        refreshRecordMetadata(record, false)
-        evaluateRecordReadiness(record)
-    end)
-    trackConnection(record, conn)
+    trackConnection(record,
+        prompt:GetPropertyChangedSignal("Enabled"):Connect(function()
+            if not prompt.Enabled then return end
+            if record.state == "Purchased" or record.state == "Removed" then return end
+            if isBuyPrompt(prompt) then record.buyPrompt = prompt end
+            refreshRecordMetadata(record, false)
+            evaluateRecordReadiness(record)
+        end)
+    )
 end
 
 local function attachPromptsOnPack(record)
-    -- Watch all current prompts
     for _, desc in ipairs(record.model:GetDescendants()) do
         if desc:IsA("ProximityPrompt") then
             watchPromptEnabled(desc, record)
         end
     end
-    -- Watch for future prompts added to the model
-    local conn = record.model.DescendantAdded:Connect(function(desc)
-        if desc:IsA("ProximityPrompt") then
-            watchPromptEnabled(desc, record)
-            if isBuyPrompt(desc) and desc.Enabled then
-                record.buyPrompt = desc
-                evaluateRecordReadiness(record)
+    trackConnection(record,
+        record.model.DescendantAdded:Connect(function(desc)
+            if desc:IsA("ProximityPrompt") then
+                watchPromptEnabled(desc, record)
+                if isBuyPrompt(desc) and desc.Enabled then
+                    record.buyPrompt = desc
+                    evaluateRecordReadiness(record)
+                end
             end
-        end
-        -- Invalidate metadata cache on any structural change
-        metadataCache[record.model] = nil
-    end)
-    trackConnection(record, conn)
+            metadataCache[record.model] = nil
+        end)
+    )
 end
 
 -- ── ItemId event watcher ──────────────────────────────────────────────
 local function attachItemIdWatcher(record)
     local model = record.model
-
-    -- Watch all three attribute name variants
     for _, attrName in ipairs({ "ItemId", "ItemID", "itemId" }) do
-        local conn = model:GetAttributeChangedSignal(attrName):Connect(function()
-            local v = model:GetAttribute(attrName)
-            if v ~= nil and record.itemId == nil then
+        trackConnection(record,
+            model:GetAttributeChangedSignal(attrName):Connect(function()
+                local v = model:GetAttribute(attrName)
+                if v ~= nil and record.itemId == nil then
+                    record.itemId = v
+                    ItemIdIndex[v] = model
+                    if Config.AutoBuyDebug then
+                        debugOnce("itemid-attr:" .. tostring(model),
+                            "ItemId attribute set: " .. tostring(v), 0)
+                    end
+                    evaluateRecordReadiness(record)
+                end
+            end)
+        )
+    end
+    trackConnection(record,
+        model.ChildAdded:Connect(function(child)
+            if not child:IsA("ValueBase") then return end
+            if string.lower(child.Name) ~= "itemid" then return end
+            if record.itemId ~= nil then return end
+            local v = child.Value
+            if v ~= nil then
                 record.itemId = v
                 ItemIdIndex[v] = model
-                if Config.AutoBuyDebug then
-                    debugOnce(
-                        "itemid-attr:" .. tostring(model),
-                        "ItemId attribute set: " .. tostring(v),
-                        0
-                    )
+                evaluateRecordReadiness(record)
+            end
+            child.Changed:Connect(function(newV)
+                if newV ~= nil and record.itemId == nil then
+                    record.itemId = newV
+                    ItemIdIndex[newV] = model
+                    evaluateRecordReadiness(record)
                 end
-                evaluateRecordReadiness(record)
-            end
+            end)
         end)
-        trackConnection(record, conn)
-    end
-
-    -- Watch for an ItemId ValueBase child being added
-    local conn2 = model.ChildAdded:Connect(function(child)
-        if not child:IsA("ValueBase") then return end
-        if string.lower(child.Name) ~= "itemid" then return end
-        if record.itemId ~= nil then return end
-        local v = child.Value
-        if v ~= nil then
-            record.itemId = v
-            ItemIdIndex[v] = model
-            evaluateRecordReadiness(record)
-        end
-        child.Changed:Connect(function(newV)
-            if newV ~= nil and record.itemId == nil then
-                record.itemId = newV
-                ItemIdIndex[newV] = model
-                evaluateRecordReadiness(record)
-            end
-        end)
-    end)
-    trackConnection(record, conn2)
+    )
 end
 
 -- ── Pack registration (idempotent) ────────────────────────────────────
 local function registerPack(packModel)
     if not packModel then return nil end
+    if ConveyorRecords[packModel] then return ConveyorRecords[packModel] end
 
-    -- Return existing record immediately — never re-register the same model
-    if ConveyorRecords[packModel] then
-        return ConveyorRecords[packModel]
-    end
-
-    -- One-time metadata read at registration
     local info   = getBoxInfo(packModel)
     local itemId = getItemId(packModel)
 
@@ -1370,45 +1284,33 @@ local function registerPack(packModel)
         buyAttempts         = 0,
         connections         = {},
     }
-
     ConveyorRecords[packModel] = record
-    if itemId ~= nil then
-        ItemIdIndex[itemId] = packModel
-    end
+    if itemId ~= nil then ItemIdIndex[itemId] = packModel end
 
     if Config.AutoBuyDebug then
-        debugOnce(
-            "register:" .. tostring(packModel),
+        debugOnce("register:" .. tostring(packModel),
             "Registered  pack=" .. tostring(info and info.pack)
                 .. "  rarity=" .. tostring(info and info.rarity)
-                .. "  ItemId=" .. tostring(itemId),
-            0
-        )
+                .. "  ItemId=" .. tostring(itemId), 0)
     end
 
-    -- Attach watchers (runs once per model)
     attachItemIdWatcher(record)
     attachPromptsOnPack(record)
-
-    -- Initial prompt cache fill
     record.buyPrompt = findBestBuyPrompt(packModel)
 
-    -- Watch for removal from workspace
-    local conn = packModel.AncestryChanged:Connect(function()
-        if not packModel:IsDescendantOf(workspace) then
-            if Config.AutoBuyDebug then
-                autoBuyDebug(
-                    "Pack removed  pack=" .. tostring(record.info and record.info.pack)
-                )
+    trackConnection(record,
+        packModel.AncestryChanged:Connect(function()
+            if not packModel:IsDescendantOf(workspace) then
+                if Config.AutoBuyDebug then
+                    autoBuyDebugInner("Pack removed  pack="
+                        .. tostring(record.info and record.info.pack))
+                end
+                cleanupRecord(record)
             end
-            cleanupRecord(record)
-        end
-    end)
-    trackConnection(record, conn)
+        end)
+    )
 
-    -- Evaluate initial readiness
     evaluateRecordReadiness(record)
-
     return record
 end
 
@@ -1422,10 +1324,7 @@ local function getLocalConveyorContainer()
         or plot:FindFirstChild("Conveyors", true)
 end
 
--- ── Initial scan ──────────────────────────────────────────────────────
--- Runs once, yielding every 200 iterations to avoid hitching.
--- Prefers the local plot's conveyor container; falls back to workspace.
-
+-- ── Initial workspace scan (single pass, yields every 200 items) ──────
 local function doInitialConveyorScan()
     local container = getLocalConveyorContainer() or workspace
     local descendants = container:GetDescendants()
@@ -1440,53 +1339,7 @@ end
 -- ── Plot-change rebind ────────────────────────────────────────────────
 local conveyorContainerListener = nil
 
-local function rebindConveyorContainer()
-    if conveyorContainerListener then
-        pcall(function() conveyorContainerListener:Disconnect() end)
-        conveyorContainerListener = nil
-    end
-
-    -- Clean up all records from the previous plot
-    for _, record in pairs(ConveyorRecords) do
-        cleanupRecord(record)
-    end
-    table.clear(ConveyorRecords)
-    table.clear(ItemIdIndex)
-    table.clear(PurchaseQueue)
-    table.clear(PurchaseQueued)
-
-    -- Scan for the new plot
-    task.spawn(doInitialConveyorScan)
-
-    -- Watch the new container for additions
-    local container = getLocalConveyorContainer()
-    if not container then return end
-
-    local function handleAddedDesc(desc)
-        if desc:IsA("Model") and isLikelyPackModel(desc) then
-            registerPack(desc)
-        elseif desc:IsA("ProximityPrompt") then
-            local ownerModel = desc:FindFirstAncestorOfClass("Model")
-            if ownerModel then
-                local record = ConveyorRecords[ownerModel]
-                if record then
-                    watchPromptEnabled(desc, record)
-                    if isBuyPrompt(desc) and desc.Enabled then
-                        record.buyPrompt = desc
-                        evaluateRecordReadiness(record)
-                    end
-                elseif isLikelyPackModel(ownerModel) then
-                    registerPack(ownerModel)
-                end
-            end
-        end
-    end
-
-    conveyorContainerListener = container.DescendantAdded:Connect(handleAddedDesc)
-end
-
--- ── Workspace-level DescendantAdded (broad net for non-local packs) ───
-workspace.DescendantAdded:Connect(function(desc)
+local function handleContainerAdded(desc)
     if desc:IsA("Model") and isLikelyPackModel(desc) then
         registerPack(desc)
     elseif desc:IsA("ProximityPrompt") then
@@ -1504,7 +1357,28 @@ workspace.DescendantAdded:Connect(function(desc)
             end
         end
     end
-end)
+end
+
+local function rebindConveyorContainerInner()
+    if conveyorContainerListener then
+        pcall(function() conveyorContainerListener:Disconnect() end)
+        conveyorContainerListener = nil
+    end
+    for _, record in pairs(ConveyorRecords) do cleanupRecord(record) end
+    table.clear(ConveyorRecords)
+    table.clear(ItemIdIndex)
+    table.clear(PurchaseQueue)
+    table.clear(PurchaseQueued)
+    task.spawn(doInitialConveyorScan)
+    local container = getLocalConveyorContainer()
+    if container then
+        conveyorContainerListener =
+            container.DescendantAdded:Connect(handleContainerAdded)
+    end
+end
+
+-- ── Workspace-level events (broad net for non-local packs) ───────────
+workspace.DescendantAdded:Connect(handleContainerAdded)
 
 workspace.DescendantRemoving:Connect(function(desc)
     if desc:IsA("Model") then
@@ -1516,29 +1390,22 @@ workspace.DescendantRemoving:Connect(function(desc)
     end
 end)
 
--- ── Conveyor scheduler ────────────────────────────────────────────────
--- Single lightweight loop at 0.15 s.
--- Responsibilities: process purchase queue, slow fallback for waiting records,
--- buying timeout recovery, and removal cleanup.
-
+-- ── Conveyor scheduler (0.15 s) ───────────────────────────────────────
 task.spawn(function()
     while true do
         task.wait(0.15)
 
-        -- ── Process purchase queue ───────────────────────────────────
+        -- Process purchase queue
         if not boxHandlingActive and Config.AutoBuyMatching then
             local i = 1
             while i <= #PurchaseQueue do
                 local record = PurchaseQueue[i]
-                if record.state == "Removed"
-                    or record.state == "Purchased"
+                if record.state == "Removed" or record.state == "Purchased"
                     or not record.model:IsDescendantOf(workspace) then
-                    -- Stale entry — discard
                     PurchaseQueued[record] = nil
                     table.remove(PurchaseQueue, i)
                 else
-                    local attempted = tryBuyRecord(record)
-                    if attempted then
+                    if tryBuyRecord(record) then
                         PurchaseQueued[record] = nil
                         table.remove(PurchaseQueue, i)
                     else
@@ -1548,23 +1415,18 @@ task.spawn(function()
             end
         end
 
-        -- ── Slow fallback for waiting / stuck records ────────────────
+        -- Slow fallback for waiting/stuck records
         for _, record in pairs(ConveyorRecords) do
-            local state = record.state
-            if state == "Detected"
-                or state == "WaitingForItemId"
-                or state == "WaitingForPrompt" then
-                -- Lazy refresh — respects METADATA_TTL
+            local st = record.state
+            if st == "Detected" or st == "WaitingForItemId"
+                or st == "WaitingForPrompt" then
                 refreshRecordMetadata(record, false)
                 evaluateRecordReadiness(record)
-
-            elseif state == "Buying" then
-                -- Timeout recovery: roll back if server never confirmed
+            elseif st == "Buying" then
                 if os.clock() - record.lastBuyAttempt > BUYING_TIMEOUT then
                     if record.model:IsDescendantOf(workspace) then
                         transitionState(record, "ReadyToBuy")
-                        if Config.AutoBuyMatching
-                            and not boxHandlingActive
+                        if Config.AutoBuyMatching and not boxHandlingActive
                             and passesFilter(record.info) then
                             queuePurchase(record)
                         end
@@ -1577,10 +1439,9 @@ task.spawn(function()
     end
 end)
 
--- ── Compatibility shims (used by Auto Spawn and other loops below) ────
+-- ── Compatibility shims assigned to outer upvalues ────────────────────
 
--- Lightweight snapshot of active records (no metadata rebuild per call).
-local function getConveyorPacks()
+getConveyorPacks = function()
     local packs = {}
     for model, record in pairs(ConveyorRecords) do
         if model:IsDescendantOf(workspace) then
@@ -1592,14 +1453,14 @@ local function getConveyorPacks()
     return packs
 end
 
-local function getPackKey(record)
+getPackKey = function(record)
     if record.itemId ~= nil then
         return "id:" .. tostring(record.itemId)
     end
     return "model:" .. record.model:GetFullName()
 end
 
-local function indexPackIds(packs)
+indexPackIds = function(packs)
     local ids = {}
     for _, record in ipairs(packs) do
         ids[getPackKey(record)] = true
@@ -1607,26 +1468,11 @@ local function indexPackIds(packs)
     return ids
 end
 
--- Legacy alias — kept so any remaining downstream code still compiles.
-local debugAutoBuy = autoBuyDebug
-
-local function describePack(record)
-    if not record or not record.model then return "<missing pack>" end
-    local info = record.info or {}
-    return string.format(
-        "model=%s  itemId=%s  pack=%s  state=%s",
-        record.model:GetFullName(),
-        tostring(record.itemId),
-        tostring(info.pack),
-        tostring(record.state)
-    )
-end
-
--- ── Deferred startup ─────────────────────────────────────────────────
--- Initial scan and container binding run after other startup code.
-
+-- ── Deferred startup ──────────────────────────────────────────────────
 task.spawn(doInitialConveyorScan)
-task.spawn(rebindConveyorContainer)
+task.spawn(rebindConveyorContainerInner)
+
+end -- ════ END CONVEYOR INTERNALS ════
 
 -- ── Loops ─────────────────────────────────────────────────────────────
 
@@ -1709,7 +1555,7 @@ task.spawn(function()
                             local didAttemptBuy = false
                             for _ = 1, 50 do
                                 task.wait(0.1)
-                                -- New state name: "Buying" (was "buying")
+                                -- New state name is "Buying" (was "buying")
                                 if watchedRecord.state == "Buying" then
                                     didAttemptBuy = true
                                     break
@@ -1725,11 +1571,13 @@ task.spawn(function()
                                     if Config.AutoContinueSpawn then
                                         Config.AutoSpawnPack = true
                                         pcall(function()
-                                            if Controls.AutoSpawnPack and Controls.AutoSpawnPack.Set then
+                                            if Controls.AutoSpawnPack
+                                                and Controls.AutoSpawnPack.Set then
                                                 Controls.AutoSpawnPack:Set(true)
                                             end
                                         end)
-                                        if Rayfield.Flags and Rayfield.Flags["AutoSpawnPack"] then
+                                        if Rayfield.Flags
+                                            and Rayfield.Flags["AutoSpawnPack"] then
                                             Rayfield.Flags["AutoSpawnPack"]:Set(true)
                                         end
                                         notify("Spawn Manager", "Resumed — pack purchased!")
@@ -1742,23 +1590,21 @@ task.spawn(function()
                         end)
                     end
                 elseif not spawnedRecord then
-                    warnOnce(
-                        "AutoStop:no-new-pack",
-                        "Auto Stop did not detect a new conveyor pack after spawning."
-                    )
+                    warnOnce("AutoStop:no-new-pack",
+                        "Auto Stop did not detect a new conveyor pack after spawning.")
                 end
             end)
         end
     end
 end)
 
--- Auto Buy Matching is now handled by the conveyor scheduler above.
+-- Auto Buy Matching is handled entirely by the conveyor scheduler above.
 -- queuePurchase is called from evaluateRecordReadiness when:
---   • a pack transitions to ReadyToBuy
+--   • a record transitions to ReadyToBuy
 --   • Config.AutoBuyMatching is enabled
 --   • boxHandlingActive is false
 --   • passesFilter returns true
--- The scheduler processes the queue at 0.15 s intervals.
+-- The scheduler drains the queue at 0.15 s intervals.
 
 -- ── Auto Carry Box helpers ───────────────────────────────────
 local function findOneCarryInteractionOnPlot()
@@ -3130,6 +2976,12 @@ end)
 -- ══════════════════════════════════════════════════════════════
 --  Config Manager State & Helper Functions
 -- ══════════════════════════════════════════════════════════════
+-- Keep the complete UI/config construction in its own function scope.
+-- Luau limits the number of local registers in the top-level chunk; without
+-- this boundary the many UI controls added below make the whole script fail
+-- during compilation with "Out of local registers".
+local function buildUserInterface()
+
 local ConfigManager = {
     ConfigName        = "",
     SelectedConfig    = nil,
@@ -4113,3 +3965,7 @@ end)
 -- ── Done ─────────────────────────────────────────────────────
 task.wait(1)
 notify("Anime Card Farm", "Loaded! (" .. userRole .. ")")
+
+end
+
+buildUserInterface()
