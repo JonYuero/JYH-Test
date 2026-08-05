@@ -4747,6 +4747,11 @@ combatTab:CreateToggle({
 -- ══════════════════════════════════════════════════════════════
 local rerollTab = Window:CreateTab("🔄 Reroll", 0)
 
+rerollTab:CreateParagraph({
+    Title   = "Reroll Note",
+    Content = "Unequip the card before starting a reroll. Cards being held are not detected in the backpack, so they cannot be processed.",
+})
+
 rerollTab:CreateSection("Card Ranking")
 
 local initialRankCardOptions, initialRankCardMap = buildRankCardOptions()
