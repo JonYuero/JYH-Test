@@ -1984,8 +1984,14 @@ end
 autoBuyHasPending = function()
     if not Config.AutoBuyMatching then return false end
     for _, record in pairs(ConveyorRecords) do
-        if record.state == "Queued" or record.state == "Buying" or (record.state == "WaitingForPurchaseWindow" and record.filterPassed == true) then
-            return true
+        if record.state == "Queued" or record.state == "Buying"
+            or (record.state == "WaitingForPurchaseWindow" and record.filterPassed == true) then
+            -- Only block if the pack is still physically on the conveyor.
+            -- If ChildRemoved somehow missed it the scheduler will clean it up;
+            -- don't let a ghost record freeze spawning forever.
+            if record.model and record.model:IsDescendantOf(workspace) then
+                return true
+            end
         end
     end
     return false
@@ -2048,7 +2054,7 @@ task.spawn(function()
         task.wait(math.max(0.05, Config.SpawnDelay))
         if not Config.AutoSpawnPack then continue end
         if boxHandlingActive then continue end
-        if autoBuyHasPending and autoBuyHasPending() then continue end
+        if Config.AutoStopSpawn and autoBuyHasPending and autoBuyHasPending() then continue end
         if autoStopHandled then continue end
 
         local previousIds
