@@ -2084,13 +2084,22 @@ task.spawn(function()
                 -- ── Step 2: wait for metadata to replicate, find a match ─
                 -- Rarity/mutation may not be replicated yet the moment the
                 -- model appears. Poll up to 2 s so the filter sees real data.
+                --
+                -- NOTE: refreshRecordMetadata is local to the conveyor do-block
+                -- and is not in scope here. Instead read rarity/mutation directly
+                -- via getPackRarity/getPackMutation (declared before the block)
+                -- and build a fresh info table for the filter check.
                 local spawnedRecord = nil
                 for _ = 1, 20 do
                     task.wait(0.1)
                     for _, record in ipairs(newRecords) do
                         if not record.model:IsDescendantOf(workspace) then continue end
-                        refreshRecordMetadata(record, true)
-                        if passesFilter(record.info) then
+                        local freshInfo = {
+                            pack     = record.packName or record.model.Name,
+                            rarity   = getPackRarity(record.model),
+                            mutation = getPackMutation(record.model),
+                        }
+                        if passesFilter(freshInfo) then
                             spawnedRecord = record
                             break
                         end
