@@ -2499,7 +2499,8 @@ end)
 
 -- Auto Potions
 -- Uses ItemsRE.OnClientEvent (same events the game's ItemsClient listens to)
--- for reliable inventory counts and active boost tracking — no GUI path needed.
+-- for reliable inventory counts and active boost tracking. The replacement
+-- confirmation is handled through the live Items UI when a higher tier is used.
 do
     local ItemsRE = Remotes:WaitForChild("ItemsRE", 15)
     if ItemsRE then
@@ -2507,13 +2508,161 @@ do
         -- activeBoosts[stat]   = true while that boost is running
         local potionCounts = {}
         local activeBoosts = {}
+        local confirmationBusy = false
+
+        -- When a stronger potion replaces a weaker active potion, the game
+        -- opens Items.Confirmation instead of completing UseItem immediately.
+        -- Only accept the specific replacement warning; do not touch unrelated
+        -- confirmation dialogs elsewhere in the game.
+        local function guiObjectIsVisible(object)
+            if not object then return false end
+            local current = object
+            while current do
+                if current:IsA("GuiObject") and not current.Visible then
+                    return false
+                end
+                if current:IsA("ScreenGui") and not current.Enabled then
+                    return false
+                end
+                current = current.Parent
+            end
+            return true
+        end
+
+        local function findPotionConfirmation()
+            local confirmation = playerGui:FindFirstChild("Confirmation", true)
+            if not confirmation or not guiObjectIsVisible(confirmation) then
+                return nil
+            end
+
+            local message = confirmation:FindFirstChild("FrameMessage", true)
+            local messageText = ""
+            if message then
+                if message:IsA("TextLabel") or message:IsA("TextButton") then
+                    messageText = tostring(message.Text or "")
+                else
+                    for _, descendant in ipairs(message:GetDescendants()) do
+                        if descendant:IsA("TextLabel")
+                            or descendant:IsA("TextButton") then
+                            messageText = tostring(descendant.Text or "")
+                            if messageText ~= "" then break end
+                        end
+                    end
+                end
+            end
+
+            local normalized = string.lower(messageText)
+            local isReplacementWarning =
+                string.find(normalized, "already have", 1, true) ~= nil
+                and string.find(normalized, "active", 1, true) ~= nil
+                and (
+                    string.find(normalized, "remove", 1, true) ~= nil
+                    or string.find(normalized, "remaining time", 1, true) ~= nil
+                )
+            if not isReplacementWarning then return nil end
+
+            local yes = confirmation:FindFirstChild("YES", true)
+            if not yes or not yes:IsA("GuiButton")
+                or not guiObjectIsVisible(yes) then
+                return nil
+            end
+            return yes
+        end
+
+        local function acceptPotionReplacementConfirmation()
+            if confirmationBusy then return false end
+            local yes = findPotionConfirmation()
+            if not yes then return false end
+
+            confirmationBusy = true
+            local clicked = false
+            if firesignal then
+                clicked = pcall(firesignal, yes.MouseButton1Click)
+            end
+            if not clicked then
+                clicked = pcall(function() yes:Activate() end)
+            end
+            if clicked then
+                task.wait(0.2)
+            end
+            confirmationBusy = false
+            return clicked
+        end
+
+        local function potionDetails(itemId)
+            local name = string.lower(tostring(itemId or ""))
+            local family
+            if string.find(name, "luckpotion", 1, true) then
+                family = "luck"
+            elseif string.find(name, "cashpotion", 1, true) then
+                family = "cash"
+            elseif string.find(name, "timepotion", 1, true) then
+                family = "time"
+            elseif string.find(name, "mutationpotion", 1, true) then
+                family = "mutation"
+            elseif string.find(name, "productionpotion", 1, true) then
+                family = "production"
+            end
+            if not family then return nil, nil end
+            return family, tonumber(string.match(name, "(%d+)$"))
+        end
+
+        local function tierFromValue(value)
+            if type(value) == "number" then
+                return value >= 1 and math.floor(value) or nil
+            end
+            if type(value) ~= "string" then return nil end
+            local text = string.lower(value)
+            local numeric = tonumber(string.match(text, "potion%s*(%d+)$"))
+                or tonumber(string.match(text, "[^%d](%d+)$"))
+            if numeric then return numeric end
+            local roman = string.match(text, "(iii)$")
+            if roman then return 3 end
+            roman = string.match(text, "(ii)$")
+            if roman then return 2 end
+            if string.match(text, "([^iv]|^)i$") then return 1 end
+            return nil
+        end
+
+        local function boostDetails(stat, info)
+            local statText = string.lower(tostring(stat or ""))
+            local family
+            if string.find(statText, "luck", 1, true) then
+                family = "luck"
+            elseif string.find(statText, "cash", 1, true) then
+                family = "cash"
+            elseif string.find(statText, "time", 1, true) then
+                family = "time"
+            elseif string.find(statText, "mutation", 1, true) then
+                family = "mutation"
+            elseif string.find(statText, "production", 1, true) then
+                family = "production"
+            end
+
+            local tier
+            if type(info) == "table" then
+                for _, key in ipairs({
+                    "Tier", "Level", "PotionTier", "PotionLevel",
+                    "ItemId", "PotionId", "Name", "Id",
+                }) do
+                    tier = tierFromValue(info[key])
+                    if tier then break end
+                end
+            end
+            tier = tier or tierFromValue(stat)
+            return family, tier
+        end
 
         local function applyBoosts(boostTable)
             activeBoosts = {}
             if type(boostTable) ~= "table" then return end
             for stat, info in pairs(boostTable) do
                 if type(info) == "table" and (tonumber(info.Remaining) or 0) > 0 then
-                    activeBoosts[stat] = true
+                    local family, tier = boostDetails(stat, info)
+                    activeBoosts[stat] = {
+                        family = family,
+                        tier = tier,
+                    }
                 end
             end
         end
@@ -2523,6 +2672,24 @@ do
                 if v then return true end
             end
             return false
+        end
+
+        local function canUsePotion(itemId)
+            local family, tier = potionDetails(itemId)
+            if not family then return false end
+
+            for _, active in pairs(activeBoosts) do
+                -- Preserve the existing one-active-potion behavior for
+                -- unrelated families, but allow a higher tier to replace
+                -- the currently active lower tier in the same family.
+                if active.family ~= family then
+                    return false
+                end
+                if active.tier and tier and active.tier >= tier then
+                    return false
+                end
+            end
+            return true
         end
 
         -- Mirror the same event the ItemsClient script handles
@@ -2546,18 +2713,32 @@ do
 
         task.spawn(function()
             while true do
+                task.wait(0.15)
+                if Config.AutoPotion then
+                    acceptPotionReplacementConfirmation()
+                end
+            end
+        end)
+
+        task.spawn(function()
+            while true do
                 task.wait(1)
                 if not Config.AutoPotion then continue end
-                if isBoostActive() then continue end
 
                 local selected = Config.SelectedPotions
                 for _, potion in ipairs(POTIONS) do
                     if not selectionIncludes(selected, potion) then continue end
                     if (potionCounts[potion] or 0) <= 0 then continue end
+                    if not canUsePotion(potion) then continue end
                     pcall(function()
                         ItemsRE:FireServer("UseItem", { ItemId = potion, Amount = 1 })
                     end)
-                    task.wait(0.75)
+                    -- Give the game's ItemsClient time to create the warning,
+                    -- then accept it if this was a tier replacement.
+                    for _ = 1, 12 do
+                        task.wait(0.1)
+                        if acceptPotionReplacementConfirmation() then break end
+                    end
                     break
                 end
             end
