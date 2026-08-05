@@ -1650,13 +1650,13 @@ local function doSellAtStation()
     if not root then return false end
 
     teleportNear(getCFrameOf(station))
-    task.wait(0.2)
+    task.wait(0.35)  -- increased from 0.2 so the server registers the position
 
     if station:IsA("ProximityPrompt") or station:IsA("ClickDetector") then
         local target = station.Parent
         if not target then return false end
         teleportNear(getCFrameOf(target))
-        task.wait(0.1)
+        task.wait(0.2)  -- increased from 0.1
         if station:IsA("ProximityPrompt") then
             return firePrompt(station)
         elseif station:IsA("ClickDetector") then
@@ -1747,13 +1747,14 @@ task.spawn(function()
                 if interactParent then
                     teleportNear(getCFrameOf(interactParent))
                 end
+                task.wait(0.35)  -- let the server register the new position before interacting
 
                 if carryInteraction:IsA("ProximityPrompt") then
                     firePrompt(carryInteraction)
                 elseif carryInteraction:IsA("ClickDetector") then
                     fireClickDetector(carryInteraction)
                 end
-                task.wait(0.4)
+                task.wait(0.5)  -- increased from 0.4 to give the server time to give us the box
 
                 local acquired = getCharacterBox()
                 if acquired then
@@ -2219,6 +2220,7 @@ task.spawn(function()
                 task.wait(0.1)
             end
             teleportNear(getCFrameOf(slot))
+            task.wait(0.2)  -- let the server register the new position
             local btn = findSlotInteraction(slot, { "Place", "Insert", "Add" })
             local fired = false
             if btn then
@@ -2269,7 +2271,15 @@ task.spawn(function()
             local btn = findSlotButton(slot, "Open")
             if not btn then continue end
             teleportNear(getCFrameOf(slot))
-            fireSlotButton(btn)
+            task.wait(0.2)  -- let the server register the new position
+            local fired = fireSlotButton(btn)
+            -- fallback: fire the remote directly if the button didn't work
+            if not fired then
+                local slotIndex = getCardSlotIndex(slot)
+                if slotIndex then
+                    fireRemote("CardSlotRE", "Open", { SlotIndex = slotIndex })
+                end
+            end
             task.wait(Config.CardActionDelay)
         end
 
@@ -2296,7 +2306,14 @@ doEquipBestCards = function(slotLimit)
         local removeBtn = findSlotButton(slot, "Remove")
         if not removeBtn then continue end
         teleportNear(getCFrameOf(slot))
-        fireSlotButton(removeBtn)
+        task.wait(0.2)  -- let the server register the new position
+        local didRemove = fireSlotButton(removeBtn)
+        if not didRemove then
+            local slotIndex2 = getCardSlotIndex(slot)
+            if slotIndex2 then
+                fireRemote("CardSlotRE", "Remove", { SlotIndex = slotIndex2 })
+            end
+        end
         task.wait(CARD_REMOVAL_DELAY)
     end
     task.wait(Config.CardActionDelay)
@@ -2314,6 +2331,7 @@ doEquipBestCards = function(slotLimit)
         pcall(function() humanoid:EquipTool(card) end)
         task.wait(Config.CardActionDelay)
         teleportNear(getCFrameOf(slot))
+        task.wait(0.2)  -- let the server register the new position
         local placeBtn = findSlotButton(slot, "Place")
         if placeBtn then
             fireSlotButton(placeBtn)
@@ -2357,7 +2375,16 @@ removeAllCards = function(limit)
         local removeBtn = findSlotButton(slot, "Remove")
         if not removeBtn then continue end
         teleportNear(getCFrameOf(slot))
-        if fireSlotButton(removeBtn) then
+        task.wait(0.2)  -- let the server register the new position
+        local didRemove = fireSlotButton(removeBtn)
+        -- fallback: fire the remote directly if the button didn't work
+        if not didRemove then
+            local slotIndex = getCardSlotIndex(slot)
+            if slotIndex then
+                didRemove = fireRemote("CardSlotRE", "Remove", { SlotIndex = slotIndex })
+            end
+        end
+        if didRemove then
             removed = removed + 1
         end
         task.wait(CARD_REMOVAL_DELAY)
