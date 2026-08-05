@@ -417,6 +417,10 @@ local Config = {
     SelectedPotions = {},
     SelectedBoosts = {},
     AntiAfk    = true,
+
+    -- Cash safety (Auto Buy Pack)
+    UseCashReserve = false,
+    CashReserve    = 0,
 }
 
 -- ── Controls table (Rayfield control references for config loading) ──
@@ -713,6 +717,202 @@ local function filterValueMatches(value, selected)
     end
     return false
 end
+
+-- ════════════════════════════════════════════════════════════════
+--  AUTO BUY UTILITY FUNCTIONS
+--  These replace all old ItemId-based and workspace-scan-based
+--  approaches with the confirmed game structure from screenshots.
+-- ════════════════════════════════════════════════════════════════
+
+-- Normalize a pack name for comparison (strips spaces, lowercases).
+local function normalizePackName(value)
+    if value == nil then return nil end
+    local s = tostring(value)
+    s = s:gsub("^%s*(.-)%s*$", "%1")  -- trim
+    s = s:lower()
+    s = s:gsub("%s+", "")              -- remove internal spaces for comparison
+    return s
+end
+
+-- Decode compact cash strings like "$500.0K", "$159.83M", "$2.5B", "$1T".
+-- Returns a number on success, nil on failure.
+local function parseCompactCash(text)
+    if type(text) ~= "string" then return nil end
+    text = text:gsub(",", ""):gsub("%s+", "")  -- strip commas and spaces
+    text = text:gsub("^%$", "")                -- strip leading $
+    if text == "" then return nil end
+
+    local suffixMap = {
+        k  = 1e3,  K  = 1e3,
+        m  = 1e6,  M  = 1e6,
+        b  = 1e9,  B  = 1e9,
+        t  = 1e12, T  = 1e12,
+        qa = 1e15, Qa = 1e15, QA = 1e15,
+        qi = 1e18, Qi = 1e18, QI = 1e18,
+        sx = 1e21, Sx = 1e21, SX = 1e21,
+        sp = 1e24, Sp = 1e24, SP = 1e24,
+        oc = 1e27, Oc = 1e27, OC = 1e27,
+        no = 1e30, No = 1e30, NO = 1e30,
+        dc = 1e33, Dc = 1e33, DC = 1e33,
+    }
+
+    -- Try two-letter suffix first, then one-letter suffix, then plain number.
+    local num, suffix2 = text:match("^([%d%.]+)([A-Za-z][A-Za-z])$")
+    if num and suffix2 then
+        local mult = suffixMap[suffix2] or suffixMap[suffix2:lower()]
+        if mult then return (tonumber(num) or 0) * mult end
+    end
+
+    local num1, suffix1 = text:match("^([%d%.]+)([A-Za-z])$")
+    if num1 and suffix1 then
+        local mult = suffixMap[suffix1] or suffixMap[suffix1:lower()]
+        if mult then return (tonumber(num1) or 0) * mult end
+    end
+
+    -- Plain number with no suffix.
+    local plain = text:match("^([%d%.]+)$")
+    if plain then return tonumber(plain) end
+
+    return nil
+end
+
+-- Get the player's current exact cash as a number.
+-- Primary source: Players.LocalPlayer.CashValue (NumberValue or IntValue).
+-- Fallback: leaderstats.Cash text parsed through parseCompactCash.
+local function getPlayerCash()
+    local cv = player:FindFirstChild("CashValue")
+    if cv and (cv:IsA("NumberValue") or cv:IsA("IntValue")) then
+        return tonumber(cv.Value)
+    end
+    -- Fallback: try leaderstats.Cash as a numeric attribute or parsed text.
+    local ls = player:FindFirstChild("leaderstats")
+    local cashObj = ls and ls:FindFirstChild("Cash")
+    if cashObj then
+        if cashObj:IsA("NumberValue") or cashObj:IsA("IntValue") then
+            return tonumber(cashObj.Value)
+        end
+        -- Try to parse formatted text like "$159.83M"
+        local parsed = parseCompactCash(tostring(cashObj.Value or ""))
+        if parsed then return parsed end
+    end
+    return nil
+end
+
+-- CONFIRMED GAME STRUCTURE (from screenshots):
+--   packModel.GuiHolder.BillboardGuiInfo.Price   → TextLabel with Text "$500.0K"
+--   packModel.GuiHolder.BillboardGuiInfo.Rarity  → child named after rarity (e.g. "Epic")
+--   packModel.GuiHolder.BillboardGuiInfo.Mutation → child named after mutation (e.g. "Normal")
+
+-- Get the raw price text from the pack's billboard GUI.
+local function getPackPriceText(packModel)
+    if not packModel then return nil end
+    local gui = packModel:FindFirstChild("GuiHolder")
+    local info = gui and gui:FindFirstChild("BillboardGuiInfo")
+    local priceContainer = info and info:FindFirstChild("Price")
+    if priceContainer then
+        -- Try TextLabel/TextButton text first (confirmed in screenshots).
+        for _, child in ipairs(priceContainer:GetChildren()) do
+            if child:IsA("TextLabel") or child:IsA("TextButton") then
+                local t = tostring(child.Text or ""):gsub("^%s*(.-)%s*$", "%1")
+                if t ~= "" then return t end
+            end
+        end
+        -- The price container itself might be a TextLabel.
+        if priceContainer:IsA("TextLabel") or priceContainer:IsA("TextButton") then
+            local t = tostring(priceContainer.Text or ""):gsub("^%s*(.-)%s*$", "%1")
+            if t ~= "" then return t end
+        end
+    end
+    return nil
+end
+
+-- Decorative UI children to ignore when extracting rarity/mutation names.
+local IGNORE_UI_CLASSES = {
+    UIStroke = true, UIGradient = true, UICorner = true,
+    UIListLayout = true, UIAspectRatioConstraint = true,
+    UIPadding = true, UIScale = true, UITableLayout = true,
+    UIGridLayout = true, UIFlexItem = true,
+}
+
+local function firstMeaningfulChildName(container)
+    if not container then return nil end
+    for _, child in ipairs(container:GetChildren()) do
+        if not IGNORE_UI_CLASSES[child.ClassName] then
+            local n = tostring(child.Name):gsub("^%s*(.-)%s*$", "%1")
+            if n ~= "" then return n end
+        end
+    end
+    return nil
+end
+
+local function firstMeaningfulTextLabel(container)
+    if not container then return nil end
+    for _, child in ipairs(container:GetChildren()) do
+        if not IGNORE_UI_CLASSES[child.ClassName] then
+            if child:IsA("TextLabel") or child:IsA("TextButton") then
+                local t = tostring(child.Text or ""):gsub("^%s*(.-)%s*$", "%1")
+                if t ~= "" then return t end
+            end
+        end
+    end
+    return nil
+end
+
+-- Get the rarity string from the pack's billboard GUI.
+-- Path: packModel.GuiHolder.BillboardGuiInfo.Rarity.<child name> (e.g. "Epic")
+local function getPackRarity(packModel)
+    if not packModel then return nil end
+    local gui = packModel:FindFirstChild("GuiHolder")
+    local info = gui and gui:FindFirstChild("BillboardGuiInfo")
+    local rarityContainer = info and info:FindFirstChild("Rarity")
+    if rarityContainer then
+        -- 1. Check text labels inside (most reliable for display value).
+        local t = firstMeaningfulTextLabel(rarityContainer)
+        if t then return t end
+        -- 2. Check meaningful child name (e.g. a Frame named "Epic").
+        local n = firstMeaningfulChildName(rarityContainer)
+        if n then return n end
+        -- 3. Container itself is a TextLabel.
+        if rarityContainer:IsA("TextLabel") or rarityContainer:IsA("TextButton") then
+            local t2 = tostring(rarityContainer.Text or ""):gsub("^%s*(.-)%s*$", "%1")
+            if t2 ~= "" then return t2 end
+        end
+        -- 4. Attribute fallback.
+        local attr = rarityContainer:GetAttribute("Rarity")
+            or rarityContainer:GetAttribute("Value")
+        if attr then return tostring(attr) end
+    end
+    return nil
+end
+
+-- Get the mutation string from the pack's billboard GUI.
+-- Path: packModel.GuiHolder.BillboardGuiInfo.Mutation.<child name> (e.g. "Normal")
+local function getPackMutation(packModel)
+    if not packModel then return nil end
+    local gui = packModel:FindFirstChild("GuiHolder")
+    local info = gui and gui:FindFirstChild("BillboardGuiInfo")
+    local mutationContainer = info and info:FindFirstChild("Mutation")
+    if mutationContainer then
+        -- 1. Check text labels inside.
+        local t = firstMeaningfulTextLabel(mutationContainer)
+        if t then return t end
+        -- 2. Check meaningful child name (e.g. a Frame named "Normal").
+        local n = firstMeaningfulChildName(mutationContainer)
+        if n then return n end
+        -- 3. Container itself is a TextLabel.
+        if mutationContainer:IsA("TextLabel") or mutationContainer:IsA("TextButton") then
+            local t2 = tostring(mutationContainer.Text or ""):gsub("^%s*(.-)%s*$", "%1")
+            if t2 ~= "" then return t2 end
+        end
+        -- 4. Attribute fallback.
+        local attr = mutationContainer:GetAttribute("Mutation")
+            or mutationContainer:GetAttribute("Value")
+        if attr then return tostring(attr) end
+    end
+    return nil
+end
+
+-- ────────────────────────────────────────────────────────────────────────────
 
 local metadataCache = setmetatable({}, { __mode = "k" })
 
@@ -1074,7 +1274,6 @@ end
 
 local function isBuyPrompt(prompt)
     if not prompt or not prompt:IsA("ProximityPrompt") then return false end
-    if prompt.Enabled == false then return false end
     local n = normalizePromptText(prompt.Name)
     local a = normalizePromptText(prompt.ActionText)
     local o = normalizePromptText(prompt.ObjectText)
@@ -1086,16 +1285,55 @@ local function isBuyPrompt(prompt)
         or string.find(o, "purchase", 1, true) ~= nil
 end
 
-local function findBestBuyPrompt(packModel)
+-- Primary: confirmed path  packModel.Main.ProximityPrompt
+-- Fallback: scan descendants for any enabled buy prompt.
+local function getBuyPrompt(packModel)
     if not packModel then return nil end
-    local firstEnabled = nil
-    for _, desc in ipairs(packModel:GetDescendants()) do
-        if desc:IsA("ProximityPrompt") and desc.Enabled ~= false then
-            if isBuyPrompt(desc) then return desc end
-            if not firstEnabled then firstEnabled = desc end
+    -- Confirmed exact path from screenshots.
+    local main = packModel:FindFirstChild("Main")
+    if main then
+        local prompt = main:FindFirstChild("ProximityPrompt")
+        if prompt and prompt:IsA("ProximityPrompt") then
+            -- Accept even if Enabled==false so we can watch it become true.
+            return prompt
         end
     end
-    return firstEnabled
+    -- Recursive fallback: scan all descendants.
+    local firstAny = nil
+    for _, desc in ipairs(packModel:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") then
+            if isBuyPrompt(desc) then return desc end
+            if not firstAny then firstAny = desc end
+        end
+    end
+    return firstAny
+end
+
+-- Legacy alias used by prompt-watcher helpers below.
+local findBestBuyPrompt = getBuyPrompt
+
+-- ── Cash safety check ─────────────────────────────────────────────────
+-- Returns true when the player has enough cash (and enough reserve) to buy.
+-- Returns false, reason string on any failure.
+local function canBuyWithCash(record)
+    local cash = getPlayerCash()
+    if cash == nil then
+        return false, "MissingCashValue"
+    end
+    local price = record.price
+    if price == nil then
+        return false, "InvalidPrice"
+    end
+    if cash < price then
+        return false, "NotEnoughCash"
+    end
+    if Config.UseCashReserve then
+        local reserve = tonumber(Config.CashReserve) or 0
+        if reserve > 0 and (cash - price) < reserve then
+            return false, "BelowCashReserve"
+        end
+    end
+    return true
 end
 
 -- ── Record cleanup ────────────────────────────────────────────────────
@@ -1138,7 +1376,51 @@ refreshRecordMetadata = function(record, force)
         return
     end
     record.lastMetadataRefresh = now
-    record.info = getBoxInfo(record.model)
+
+    -- ── NEW: read from confirmed BillboardGuiInfo structure ──────────
+    -- Pack name comes from the model name itself.
+    record.packName = record.model.Name
+
+    -- Rarity, mutation from BillboardGuiInfo children.
+    local freshRarity   = getPackRarity(record.model)
+    local freshMutation = getPackMutation(record.model)
+    record.rarity   = freshRarity
+    record.mutation = freshMutation
+
+    -- Price: parse the text label inside BillboardGuiInfo.Price.
+    local priceText = getPackPriceText(record.model)
+    if priceText then
+        local parsed = parseCompactCash(priceText)
+        if parsed and parsed > 0 then
+            record.price     = parsed
+            record.priceText = priceText
+            record.priceState = "Valid"
+        else
+            record.price     = nil
+            record.priceState = "InvalidPrice"
+            debugOnce("price-parse:" .. tostring(record.model),
+                "Could not parse price text: " .. tostring(priceText), 0)
+        end
+    else
+        -- Price GUI not yet replicated; leave existing value in place.
+        if record.price == nil then
+            record.priceState = "Missing"
+        end
+    end
+
+    -- Prompt: use confirmed path first.
+    local freshPrompt = getBuyPrompt(record.model)
+    if freshPrompt then record.prompt = freshPrompt end
+
+    -- ── Legacy compatibility: keep record.info populated for passesFilter ─
+    -- passesFilter reads record.info.{pack,rarity,mutation}.
+    record.info = {
+        pack     = record.packName,
+        rarity   = record.rarity,
+        mutation = record.mutation,
+    }
+
+    -- ── Keep ItemId index updated (kept as optional fallback only) ─────
     local freshId = getItemId(record.model)
     if freshId ~= record.itemId then
         local oldId = record.itemId
@@ -1148,14 +1430,6 @@ refreshRecordMetadata = function(record, force)
         record.itemId = freshId
         if freshId ~= nil then
             ItemIdIndex[freshId] = record.model
-            if Config.AutoBuyDebug then
-                debugOnce(
-                    "itemid-fallback:" .. tostring(record.model),
-                    "ItemId updated via fallback: " .. tostring(freshId)
-                        .. "  pack=" .. tostring(record.info and record.info.pack),
-                    0
-                )
-            end
         end
     end
 end
@@ -1168,11 +1442,14 @@ evaluateRecordReadiness = function(record)
         return
     end
 
-    if not record.buyPrompt or not record.buyPrompt.Enabled then
-        record.buyPrompt = findBestBuyPrompt(record.model)
+    -- Resolve buy prompt using the confirmed path.
+    if not record.prompt then
+        record.prompt = getBuyPrompt(record.model)
+        record.buyPrompt = record.prompt   -- keep legacy alias in sync
     end
-
-    local hasId = record.itemId ~= nil
+    if not record.buyPrompt then
+        record.buyPrompt = record.prompt
+    end
 
     if not passesFilter(record.info) then
         record.filterPassed = false
@@ -1190,22 +1467,31 @@ evaluateRecordReadiness = function(record)
     end
 
     record.filterPassed = true
-    if not hasId then
+
+    -- With the prompt-first approach the purchase window opens as soon as
+    -- the confirmed prompt is present, regardless of whether ItemId has
+    -- replicated yet. The cash/price check is enforced inside tryBuyRecord.
+    local hasPrompt = record.prompt ~= nil
+    local hasId     = record.itemId ~= nil
+
+    if not hasPrompt and not hasId then
+        -- Neither prompt nor ItemId yet; wait for one to appear.
         if st ~= "WaitingForItemId" then
-            transitionState(record, "WaitingForItemId", "ItemId missing")
+            transitionState(record, "WaitingForItemId", "no prompt or ItemId yet")
         end
-        -- A pack may be buyable before its ItemId holder appears. Permit
-        -- the prompt fallback only after a short, controlled wait.
-        if record.buyPrompt and record.buyPrompt.Enabled
-            and os.clock() - record.createdAt >= PROMPT_FALLBACK_DELAY then
-            transitionState(record, "WaitingForPurchaseWindow",
-                "prompt fallback window")
-        end
-    elseif st ~= "WaitingForPurchaseWindow" then
-        transitionState(record, "WaitingForPurchaseWindow", "metadata ready")
+        return
     end
 
-    local purchaseWindowOpen = record.state == "WaitingForPurchaseWindow" and os.clock() >= (record.retryNotBefore or 0) and (hasId or (record.buyPrompt and record.buyPrompt.Enabled))
+    if st ~= "WaitingForPurchaseWindow" then
+        local reason = hasPrompt and "prompt present" or "ItemId present"
+        transitionState(record, "WaitingForPurchaseWindow", reason)
+    end
+
+    local purchaseWindowOpen =
+        record.state == "WaitingForPurchaseWindow"
+        and os.clock() >= (record.retryNotBefore or 0)
+        and (hasPrompt or hasId)
+
     if Config.AutoBuyMatching and purchaseWindowOpen then
         queuePurchase(record)
     end
@@ -1213,10 +1499,7 @@ end
 
 -- ── Purchase queue ────────────────────────────────────────────────────
 queuePurchase = function(record)
-    if not record or record.state ~= "WaitingForPurchaseWindow"
-        or record.filterPassed ~= true
-        or PurchaseQueued[record]
-        or os.clock() < (record.retryNotBefore or 0) then
+    if not record or record.state ~= "WaitingForPurchaseWindow" or record.filterPassed ~= true or PurchaseQueued[record] or os.clock() < (record.retryNotBefore or 0) then
         return
     end
     PurchaseQueued[record] = true
@@ -1234,6 +1517,10 @@ queuePurchase = function(record)
 end
 
 -- ── Buy attempt ───────────────────────────────────────────────────────
+-- PRIMARY PATH: fireproximityprompt(packModel.Main.ProximityPrompt)
+-- FALLBACK:     ConveyorRE:FireServer("TryBuy", { ItemId = itemId })
+--               only when the prompt path is unavailable.
+-- SAFETY RULE:  never fire when cash < price; never fire when price is nil.
 tryBuyRecord = function(record)
     if not record or not record.model or record.state ~= "Queued" then
         return false
@@ -1242,113 +1529,113 @@ tryBuyRecord = function(record)
         cleanupRecord(record)
         return false
     end
-    -- Re-read the live conveyor metadata before sending a queued request.
-    -- This keeps a stale queue entry from buying after the pack changes or
-    -- after its identifier is removed by the game.
+
+    -- Refresh ALL metadata (price, rarity, mutation, prompt) immediately
+    -- before execution so we act on the latest server state.
     refreshRecordMetadata(record, true)
+
+    -- Re-check filters after refresh.
     if not record.filterPassed or not passesFilter(record.info) then
-        transitionState(record, "FilterRejected", "filter changed")
+        transitionState(record, "FilterRejected", "filter changed before buy")
         return true
     end
+
+    -- ── MANDATORY CASH SAFETY CHECK ──────────────────────────────────
+    -- Never fire the prompt when cash is insufficient — that would trigger
+    -- the Robux purchase popup.
+    local cashOk, cashReason = canBuyWithCash(record)
+    if not cashOk then
+        debugOnce(
+            "cash-fail:" .. tostring(record.model),
+            "Cash check failed: " .. tostring(cashReason)
+                .. "  price=" .. tostring(record.priceText)
+                .. "  cash=" .. tostring(getPlayerCash()),
+            DEBUG_COOLDOWN
+        )
+        -- Keep record alive for re-evaluation when cash changes.
+        transitionState(record, "WaitingForPurchaseWindow", cashReason)
+        record.queued = false
+        PurchaseQueued[record] = nil
+        return true
+    end
+
+    -- ── Throttle: respect minimum retry delay ─────────────────────────
     local now = os.clock()
     if now - record.lastBuyAttempt < BUY_RETRY_DELAY then return false end
     record.lastBuyAttempt = now
     record.buyAttempts    = record.buyAttempts + 1
 
-    if not record.buyPrompt or not record.buyPrompt.Enabled then
-        record.buyPrompt = findBestBuyPrompt(record.model)
+    -- ── Resolve the confirmed buy prompt ─────────────────────────────
+    -- record.prompt is set by refreshRecordMetadata via getBuyPrompt().
+    local prompt = record.prompt
+    if not prompt then
+        prompt = getBuyPrompt(record.model)
+        record.prompt = prompt
     end
-    transitionState(record, "Buying", "TryBuy attempt")
+    -- Keep buyPrompt in sync for the existing prompt-watcher code.
+    if prompt then record.buyPrompt = prompt end
 
-    local itemId    = record.itemId
+    transitionState(record, "Buying", "prompt-based attempt #" .. tostring(record.buyAttempts))
 
-    -- This is the proven purchase path from the user's old working script.
-    -- Do not add PackId: the game endpoint expects exactly ItemId here.
-    if itemId ~= nil and not record.remoteFailed then
+    -- ── PRIMARY: fire the ProximityPrompt ────────────────────────────
+    if prompt then
+        -- Final check: prompt must be enabled (not just present).
+        if not prompt.Enabled then
+            debugOnce("prompt-disabled:" .. tostring(record.model),
+                "Prompt not enabled at fire time — waiting", DEBUG_COOLDOWN)
+            transitionState(record, "WaitingForPurchaseWindow", "prompt disabled")
+            record.retryNotBefore = os.clock() + BUY_RETRY_DELAY
+            return true
+        end
+
         if Config.AutoBuyDebug then
-            debugOnce("buy:" .. tostring(itemId),
-                "TryBuy remote request  ItemId=" .. tostring(itemId)
-                    .. "  pack=" .. tostring(record.info and record.info.pack), 0)
+            debugOnce("buy-prompt:" .. tostring(record.model),
+                "Firing ProximityPrompt  pack=" .. tostring(record.packName)
+                    .. "  rarity=" .. tostring(record.rarity)
+                    .. "  mutation=" .. tostring(record.mutation)
+                    .. "  price=" .. tostring(record.priceText)
+                    .. "  cash=" .. tostring(getPlayerCash()),
+                0)
+        end
+
+        local promptOk, promptErr = pcall(fireproximityprompt, prompt)
+        if promptOk then
+            record.promptSent = true
+            debugOnce("prompt-fired:" .. tostring(record.model),
+                "ProximityPrompt fired  pack=" .. tostring(record.packName), 0)
+            -- Confirmation comes from model removal or prompt becoming disabled.
+            return true
+        else
+            debugOnce("prompt-fire-err:" .. tostring(record.model),
+                "fireproximityprompt failed: " .. tostring(promptErr)
+                    .. " — trying ConveyorRE fallback", 0)
+        end
+    end
+
+    -- ── FALLBACK: ConveyorRE:FireServer("TryBuy", ...) ───────────────
+    -- Only used when fireproximityprompt is unavailable or threw.
+    local itemId = record.itemId
+    if itemId ~= nil then
+        if Config.AutoBuyDebug then
+            debugOnce("buy-remote-fallback:" .. tostring(itemId),
+                "ConveyorRE fallback  ItemId=" .. tostring(itemId)
+                    .. "  pack=" .. tostring(record.packName), 0)
         end
         local ok, err = pcall(function()
-            ConveyorRE:FireServer("TryBuy", {
-                ItemId  = itemId,
-            })
+            ConveyorRE:FireServer("TryBuy", { ItemId = itemId })
         end)
         if ok then
             record.remoteSent = true
-            debugOnce(
-                "remote-buy:" .. tostring(itemId),
-                "TryBuy sent  ItemId=" .. tostring(itemId),
-                0
-            )
-
-            -- Do not fire both paths. Removal or prompt disablement confirms
-            -- this request; fallback is reserved for an actual remote error.
             return true
         else
             record.remoteFailed = true
-            debugOnce("trybuy-error:" .. tostring(record.model),
-                "TryBuy failed ItemId=" .. tostring(itemId)
-                    .. " err=" .. tostring(err), 0)
-
-            -- The old script only uses the live prompt after the remote
-            -- throws. Keep that fallback behavior instead of treating a
-            -- prompt activation as proof that the purchase succeeded.
-            if record.model:IsDescendantOf(workspace)
-                and record.buyPrompt
-                and record.buyPrompt.Enabled ~= false then
-                task.wait(0.12)
-                if record.model:IsDescendantOf(workspace) then
-                    local promptOk, promptErr = firePrompt(record.buyPrompt)
-                    if promptOk then
-                        record.fallbackUsed = true
-                        record.promptSent = true
-                        debugOnce(
-                            "prompt-fallback:" .. tostring(record.model),
-                            "Prompt fallback activated after TryBuy failure",
-                            0
-                        )
-                        -- Keep the record in Buying so prompt disablement or
-                        -- local-model removal can confirm the fallback.
-                        return true
-                    else
-                        record.fallbackUsed = true
-                        debugOnce(
-                            "prompt-fallback-failed:" .. tostring(record.model),
-                            "Prompt fallback failed: " .. tostring(promptErr),
-                            0
-                        )
-                    end
-                end
-            end
+            debugOnce("remote-fallback-err:" .. tostring(record.model),
+                "ConveyorRE fallback failed: " .. tostring(err), 0)
         end
-    else
-        if record.buyPrompt and record.buyPrompt.Enabled
-            and os.clock() - record.createdAt >= PROMPT_FALLBACK_DELAY
-            and not record.fallbackUsed then
-            local promptOk, promptErr = firePrompt(record.buyPrompt)
-            record.fallbackUsed = true
-            if promptOk then
-                record.promptSent = true
-                debugOnce(
-                    "prompt-fallback:" .. tostring(record.model),
-                    "Prompt fallback used without ItemId",
-                    0
-                )
-                return true
-            end
-            debugOnce(
-                "prompt-fallback-error:" .. tostring(record.model),
-                "Prompt fallback failed: " .. tostring(promptErr),
-                0
-            )
-        end
-        transitionState(record, "WaitingForPurchaseWindow", "no ItemId")
-        record.retryNotBefore = os.clock() + RETRY_BACKOFF
-        return true
     end
-    transitionState(record, "WaitingForPurchaseWindow", "buy path unavailable")
+
+    -- All purchase paths failed; back off and retry later.
+    transitionState(record, "WaitingForPurchaseWindow", "all buy paths failed")
     record.retryNotBefore = os.clock() + RETRY_BACKOFF
     return true
 end
@@ -1366,7 +1653,11 @@ local function watchPromptEnabled(prompt, record)
                 end
                 return
             end
-            if isBuyPrompt(prompt) then record.buyPrompt = prompt end
+            -- Sync both prompt aliases.
+            if isBuyPrompt(prompt) or record.prompt == nil then
+                record.prompt    = prompt
+                record.buyPrompt = prompt
+            end
             refreshRecordMetadata(record, false)
             evaluateRecordReadiness(record)
         end)
@@ -1374,23 +1665,56 @@ local function watchPromptEnabled(prompt, record)
 end
 
 local function attachPromptsOnPack(record)
+    -- Attach to any already-present ProximityPrompts.
     for _, desc in ipairs(record.model:GetDescendants()) do
         if desc:IsA("ProximityPrompt") then
             watchPromptEnabled(desc, record)
         end
     end
+
     trackConnection(record,
         record.model.DescendantAdded:Connect(function(desc)
             if desc:IsA("ProximityPrompt") then
                 watchPromptEnabled(desc, record)
+                -- Prefer the confirmed exact path when it arrives.
+                local main = record.model:FindFirstChild("Main")
+                if main and desc.Parent == main and desc.Name == "ProximityPrompt" then
+                    record.prompt    = desc
+                    record.buyPrompt = desc
+                end
                 if isBuyPrompt(desc) and desc.Enabled then
                     record.buyPrompt = desc
+                    if record.prompt == nil then record.prompt = desc end
                     evaluateRecordReadiness(record)
                 end
             end
+            -- Any new descendant may bring the Price or rarity/mutation labels.
             metadataCache[record.model] = nil
+            -- Trigger a price/metadata refresh if the Price label arrives.
+            if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+                local parent = desc.Parent
+                local grandparent = parent and parent.Parent
+                local ggparent    = grandparent and grandparent.Parent
+                -- Check if we are inside GuiHolder.BillboardGuiInfo.Price
+                if parent and parent.Name == "Price"
+                    and grandparent and grandparent.Name == "BillboardGuiInfo"
+                    and ggparent and ggparent.Name == "GuiHolder" then
+                    -- Watch for text changes on this price label.
+                    trackConnection(record,
+                        desc:GetPropertyChangedSignal("Text"):Connect(function()
+                            if record.state == "Removed" then return end
+                            refreshRecordMetadata(record, true)
+                            evaluateRecordReadiness(record)
+                        end)
+                    )
+                    -- Refresh immediately so the new price is captured.
+                    refreshRecordMetadata(record, true)
+                    evaluateRecordReadiness(record)
+                end
+            end
         end)
     )
+
     trackConnection(record,
         record.model.DescendantRemoving:Connect(function()
             metadataCache[record.model] = nil
@@ -1405,8 +1729,7 @@ local function attachItemIdWatcher(record)
     local watchedSources = setmetatable({}, { __mode = "k" })
 
     local function refreshItemId()
-        if record.state == "BoughtAndRemove"
-            or record.state == "Removed" then return end
+        if record.state == "BoughtAndRemove" or record.state == "Removed" then return end
 
         -- readBoxValue caches ValueBase lookups; a conveyor can add or
         -- replace its holder after registration, so invalidate that cache
@@ -1478,11 +1801,21 @@ local function registerPack(packModel)
         state               = "New",
         itemId              = itemId,
         info                = info,
-        buyPrompt           = nil,
+
+        -- NEW: confirmed structure fields (populated by refreshRecordMetadata)
+        packName            = packModel.Name,
+        rarity              = nil,
+        mutation            = nil,
+        price               = nil,
+        priceText           = nil,
+        priceState          = "Missing",
+        prompt              = nil,   -- packModel.Main.ProximityPrompt
+
+        buyPrompt           = nil,   -- legacy alias; kept for prompt-watcher code
         filterPassed        = nil,
         queued              = false,
         createdAt           = os.clock(),
-        lastMetadataRefresh = os.clock(),
+        lastMetadataRefresh = 0,     -- force immediate refresh on registration
         lastFallbackCheck   = 0,
         lastBuyAttempt      = 0,
         buyAttempts         = 0,
@@ -1506,7 +1839,16 @@ local function registerPack(packModel)
 
     attachItemIdWatcher(record)
     attachPromptsOnPack(record)
-    record.buyPrompt = findBestBuyPrompt(packModel)
+
+    -- Populate price, rarity, mutation, and confirmed prompt immediately.
+    -- lastMetadataRefresh is 0 so this always runs on first registration.
+    refreshRecordMetadata(record, true)
+
+    -- Sync legacy buyPrompt alias.
+    if not record.buyPrompt then
+        record.buyPrompt = record.prompt or getBuyPrompt(packModel)
+        record.prompt    = record.buyPrompt
+    end
 
     trackConnection(record,
         packModel.AncestryChanged:Connect(function()
@@ -1515,8 +1857,7 @@ local function registerPack(packModel)
                     autoBuyDebugInner("Pack removed  pack="
                         .. tostring(record.info and record.info.pack))
                 end
-                if record.state == "Buying" or record.remoteSent
-                    or record.promptSent then
+                if record.state == "Buying" or record.remoteSent or record.promptSent then
                     confirmBought(record, "model removed")
                 else
                     cleanupRecord(record)
@@ -1588,8 +1929,7 @@ local function rebindConveyorContainerInner()
         container.ChildRemoved:Connect(function(child)
             local record = ConveyorRecords[child]
             if not record then return end
-            if record.state == "Buying" or record.remoteSent
-                or record.promptSent then
+            if record.state == "Buying" or record.remoteSent or record.promptSent then
                 confirmBought(record, "removed from local conveyor")
             else
                 cleanupRecord(record)
@@ -1612,8 +1952,7 @@ task.spawn(function()
                 PurchaseQueued[record] = nil
                 record.queued = false
                 local attempted = tryBuyRecord(record)
-                if not attempted and record.state == "Queued"
-                    and record.model:IsDescendantOf(workspace) then
+                if not attempted and record.state == "Queued" and record.model:IsDescendantOf(workspace) then
                     PurchaseQueued[record] = true
                     record.queued = true
                     table.insert(PurchaseQueue, record)
@@ -1652,8 +1991,7 @@ task.spawn(function()
                                 "buy confirmation timeout")
                             record.retryNotBefore = os.clock() + BUY_RETRY_DELAY
                         end
-                        if Config.AutoBuyMatching and not boxHandlingActive
-                            and record.filterPassed
+                        if Config.AutoBuyMatching and not boxHandlingActive and record.filterPassed then
                             queuePurchase(record)
                         end
                     else
@@ -1688,10 +2026,7 @@ end
 autoBuyHasPending = function()
     if not Config.AutoBuyMatching then return false end
     for _, record in pairs(ConveyorRecords) do
-        if record.state == "Queued"
-            or record.state == "Buying"
-            or (record.state == "WaitingForPurchaseWindow"
-                and record.filterPassed == true) then
+        if record.state == "Queued" or record.state == "Buying" or (record.state == "WaitingForPurchaseWindow" and record.filterPassed == true) then
             return true
         end
     end
@@ -3332,6 +3667,8 @@ local function buildSerializableConfig()
         SelectedPotions   = Config.SelectedPotions,
         SelectedBoosts    = Config.SelectedBoosts,
         AntiAfk           = Config.AntiAfk,
+        UseCashReserve    = Config.UseCashReserve,
+        CashReserve       = Config.CashReserve,
     }
 end
 
@@ -3459,6 +3796,7 @@ local function loadConfig(name, isAutoload)
         "RaidDifficulties", "AutoRaidEquip", "AutoRaid", "AutoRaidHide",
         "AutoTeamCardCycle", "AutoPotion", "SelectedPotions",
         "SelectedBoosts", "AntiAfk", "AutoContinueSpawn",
+        "UseCashReserve", "CashReserve",
     }
 
     for _, key in ipairs(knownKeys) do
