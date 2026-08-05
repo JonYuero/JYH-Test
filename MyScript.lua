@@ -377,7 +377,8 @@ local Config = {
     AutoSpawnPack   = false,
     SpawnDelay      = 0.5,
     AutoStopSpawn   = false,
-    AutoBuyMatching = false,
+    AutoBuyMatching   = false,
+    AutoContinueSpawn = false,
     AutoBuyDebug    = true,
     AutoCarryBox    = false,
     AutoSellBox     = false,
@@ -1354,12 +1355,16 @@ task.spawn(function()
     end
 end)
 
+-- Guard preventing multiple concurrent coroutines from firing stop/resume
+local autoStopHandled = false
+
 -- Auto Spawn Pack
 task.spawn(function()
     while true do
         task.wait(math.max(0.05, Config.SpawnDelay))
         if not Config.AutoSpawnPack then continue end
         if boxHandlingActive then continue end
+        if autoStopHandled then continue end   -- stop already in progress
 
         local previousIds
         if Config.AutoStopSpawn then
@@ -1387,6 +1392,9 @@ task.spawn(function()
         if Config.AutoStopSpawn then
             local capturedIds = previousIds
             task.spawn(function()
+                -- Another coroutine already claimed the stop — bail out
+                if autoStopHandled then return end
+
                 local spawnedRecord
                 for _ = 1, 30 do
                     for _, record in ipairs(getConveyorPacks()) do
@@ -1400,11 +1408,56 @@ task.spawn(function()
                 end
 
                 if spawnedRecord and passesFilter(spawnedRecord.info) then
+                    if autoStopHandled then return end   -- re-check after wait
+                    autoStopHandled = true
+
                     Config.AutoSpawnPack = false
                     if Rayfield and Rayfield.Flags and Rayfield.Flags["AutoSpawnPack"] then
                         Rayfield.Flags["AutoSpawnPack"]:Set(false)
                     end
                     notify("Auto Spawn Pack", "Stopped — filter match found!")
+
+                    if Config.AutoContinueSpawn and Config.AutoBuyMatching then
+                        local watchedRecord = spawnedRecord
+                        task.spawn(function()
+                            local didAttemptBuy = false
+                            for _ = 1, 50 do
+                                task.wait(0.1)
+                                if watchedRecord.stage == "buying" then
+                                    didAttemptBuy = true
+                                    break
+                                end
+                            end
+                            if not didAttemptBuy then
+                                autoStopHandled = false   -- buy never attempted; reset so user can retry
+                                return
+                            end
+                            for _ = 1, 150 do
+                                task.wait(0.1)
+                                if not watchedRecord.model:IsDescendantOf(workspace) then
+                                    if Config.AutoContinueSpawn then
+                                        Config.AutoSpawnPack = true
+                                        pcall(function()
+                                            if Controls.AutoSpawnPack and Controls.AutoSpawnPack.Set then
+                                                Controls.AutoSpawnPack:Set(true)
+                                            end
+                                        end)
+                                        if Rayfield.Flags and Rayfield.Flags["AutoSpawnPack"] then
+                                            Rayfield.Flags["AutoSpawnPack"]:Set(true)
+                                        end
+                                        notify("Spawn Manager", "Resumed — pack purchased!")
+                                    end
+                                    autoStopHandled = false
+                                    return
+                                end
+                            end
+                            -- Timed out without a confirmed purchase — reset guard
+                            autoStopHandled = false
+                        end)
+                    else
+                        -- AutoContinue not enabled; guard stays set until user re-enables spawn
+                        -- Reset only when AutoSpawnPack is toggled back on by the user
+                    end
                 elseif not spawnedRecord then
                     warnOnce(
                         "AutoStop:no-new-pack",
@@ -1415,6 +1468,7 @@ task.spawn(function()
         end
     end
 end)
+
 
 -- Auto Buy Matching
 task.spawn(function()
@@ -2804,8 +2858,8 @@ local ConfigManager = {
     AutoloadParagraph = nil,
 }
 
-local CONFIG_ROOT   = "JonYueroHub/AnimeCardFarm"
-local CONFIG_FOLDER = CONFIG_ROOT .. "/Configs"
+local CONFIG_ROOT   = "Jon Yuero Hub/Anime Card Farm"
+local CONFIG_FOLDER = CONFIG_ROOT .. "/Settings"
 local AUTOLOAD_FILE = CONFIG_ROOT .. "/autoload.json"
 
 -- Check file system support
@@ -2832,10 +2886,23 @@ end
 local function ensureConfigFolders()
     if not FS_SUPPORTED then return false end
     pcall(function()
-        if not isfolder(CONFIG_ROOT)   then makefolder(CONFIG_ROOT)   end
-        if not isfolder(CONFIG_FOLDER) then makefolder(CONFIG_FOLDER) end
+        if not isfolder("Jon Yuero Hub")     then makefolder("Jon Yuero Hub")     end
+        if not isfolder(CONFIG_ROOT)         then makefolder(CONFIG_ROOT)         end
+        if not isfolder(CONFIG_FOLDER)       then makefolder(CONFIG_FOLDER)       end
     end)
     return true
+end
+
+-- Safely extract a plain string from whatever the dropdown callback returns
+-- (Rayfield single-select sometimes still delivers a 1-element table)
+local function resolveConfigName(v)
+    if type(v) == "table" then
+        v = v[1]
+    end
+    if type(v) ~= "string" then return nil end
+    v = v:gsub("^%s+", ""):gsub("%s+$", "")
+    if v == "" then return nil end
+    return v
 end
 
 local function buildSerializableConfig()
@@ -2844,6 +2911,7 @@ local function buildSerializableConfig()
         SpawnDelay        = Config.SpawnDelay,
         AutoStopSpawn     = Config.AutoStopSpawn,
         AutoBuyMatching   = Config.AutoBuyMatching,
+        AutoContinueSpawn = Config.AutoContinueSpawn,
         AutoCarryBox      = Config.AutoCarryBox,
         AutoSellBox       = Config.AutoSellBox,
         AutoSellDelay     = Config.AutoSellDelay,
@@ -2875,7 +2943,12 @@ local function buildSerializableConfig()
     }
 end
 
-local function saveConfig(name)
+local function configExists(name)
+    if not FS_SUPPORTED then return false end
+    return isfile(CONFIG_FOLDER .. "/" .. name .. ".json")
+end
+
+local function saveConfig(name, allowOverwrite)
     if not FS_SUPPORTED then
         Rayfield:Notify({
             Title    = "Unsupported Executor",
@@ -2886,6 +2959,14 @@ local function saveConfig(name)
     end
     ensureConfigFolders()
     local filePath = CONFIG_FOLDER .. "/" .. name .. ".json"
+    if not allowOverwrite and isfile(filePath) then
+        Rayfield:Notify({
+            Title    = "Config Already Exists",
+            Content  = name .. " already exists. Use Overwrite to replace it.",
+            Duration = 4,
+        })
+        return false
+    end
     local data = buildSerializableConfig()
     local HttpService = game:GetService("HttpService")
     local ok, encoded = pcall(HttpService.JSONEncode, HttpService, data)
@@ -2926,13 +3007,20 @@ local function refreshConfigList()
         if name then table.insert(names, name) end
     end
     table.sort(names)
+    ConfigManager.ConfigNames = names
 
     if ConfigManager.Dropdown then
-        local current = ConfigManager.SelectedConfig
-        pcall(function()
-            ConfigManager.Dropdown:Set(names)
+        -- Try Refresh (newer Rayfield) first, fall back to Set
+        local ok = pcall(function()
+            ConfigManager.Dropdown:Refresh(names, ConfigManager.SelectedConfig or "")
         end)
-        -- If current selection no longer exists, clear it
+        if not ok then
+            pcall(function()
+                ConfigManager.Dropdown:Set(names)
+            end)
+        end
+        -- Validate current selection still exists
+        local current = ConfigManager.SelectedConfig
         if current then
             local found = false
             for _, n in ipairs(names) do
@@ -2977,7 +3065,7 @@ local function loadConfig(name, isAutoload)
         "AutoInfinityEquip", "AutoInfinityTower", "AutoInfinityHide",
         "RaidDifficulties", "AutoRaidEquip", "AutoRaid", "AutoRaidHide",
         "AutoTeamCardCycle", "AutoPotion", "SelectedPotions",
-        "SelectedBoosts", "AntiAfk",
+        "SelectedBoosts", "AntiAfk", "AutoContinueSpawn",
     }
 
     for _, key in ipairs(knownKeys) do
@@ -3073,8 +3161,12 @@ end
 -- ══════════════════════════════════════════════════════════════
 --  Rayfield Window
 -- ══════════════════════════════════════════════════════════════
+local windowTitle = isPremium
+    and "👑 Jon Yuero Hub | Anime Card Farm"
+    or  "Jon Yuero Hub | Anime Card Farm"
+
 local Window = Rayfield:CreateWindow({
-    Name            = "Anime Card Farm  |  " .. userRole,
+    Name            = windowTitle,
     LoadingTitle    = "Anime Card Farm",
     LoadingSubtitle = "Loading...",
     Icon            = 0,
@@ -3090,13 +3182,16 @@ local Window = Rayfield:CreateWindow({
 -- ══════════════════════════════════════════════════════════════
 local spawnTab = Window:CreateTab("🃏 Auto Spawn Pack", 4483362458)
 
-spawnTab:CreateSection("Spawn")
+spawnTab:CreateSection("Spawn Manager")
 
 Controls.AutoSpawnPack = spawnTab:CreateToggle({
     Name         = "Auto Spawn Pack",
     CurrentValue = Config.AutoSpawnPack,
     Flag         = "AutoSpawnPack",
-    Callback     = function(v) Config.AutoSpawnPack = v end,
+    Callback     = function(v)
+        Config.AutoSpawnPack = v
+        if v then autoStopHandled = false end   -- reset guard on manual re-enable
+    end,
 })
 
 Controls.SpawnDelay = spawnTab:CreateSlider({
@@ -3114,6 +3209,20 @@ Controls.AutoStopSpawn = spawnTab:CreateToggle({
     CurrentValue = Config.AutoStopSpawn,
     Flag         = "AutoStopSpawn",
     Callback     = function(v) Config.AutoStopSpawn = v end,
+})
+
+Controls.AutoBuyMatching = spawnTab:CreateToggle({
+    Name         = "Auto Buy Pack (Using Filter)",
+    CurrentValue = Config.AutoBuyMatching,
+    Flag         = "AutoBuyMatching",
+    Callback     = function(v) Config.AutoBuyMatching = v end,
+})
+
+Controls.AutoContinueSpawn = spawnTab:CreateToggle({
+    Name         = "Auto Continue",
+    CurrentValue = Config.AutoContinueSpawn,
+    Flag         = "AutoContinueSpawn",
+    Callback     = function(v) Config.AutoContinueSpawn = v end,
 })
 
 spawnTab:CreateSection("Filters")
@@ -3166,15 +3275,6 @@ Controls.SelectedMutations = spawnTab:CreateDropdown({
     end,
 })
 
-spawnTab:CreateSection("Auto Buy Pack")
-
-Controls.AutoBuyMatching = spawnTab:CreateToggle({
-    Name         = "Auto Buy Pack (Using Filter)",
-    CurrentValue = Config.AutoBuyMatching,
-    Flag         = "AutoBuyMatching",
-    Callback     = function(v) Config.AutoBuyMatching = v end,
-})
-
 -- ══════════════════════════════════════════════════════════════
 --  TAB 2 – Cards
 -- ══════════════════════════════════════════════════════════════
@@ -3182,16 +3282,16 @@ local cardsTab = Window:CreateTab("⬆️ Cards", 4483362458)
 
 cardsTab:CreateSection("Card Management")
 
+cardsTab:CreateParagraph({
+    Title   = "Auto Place Pack Filter",
+    Content = "Uses the same Pack / Rarity / Mutation filters set in the Auto Spawn Pack tab.",
+})
+
 cardsTab:CreateToggle({
     Name         = "Auto Place Pack",
     CurrentValue = Config.AutoPlacePack,
     Flag         = "AutoPlacePack",
     Callback     = function(v) Config.AutoPlacePack = v end,
-})
-
-cardsTab:CreateParagraph({
-    Title   = "Auto Place Pack Filter",
-    Content = "Uses the same Pack / Rarity / Mutation filters set in the Auto Spawn Pack tab.",
 })
 
 cardsTab:CreateToggle({
@@ -3319,8 +3419,8 @@ updateRaidInfoDisplay(Config.RaidDifficulties)
 Controls.RaidDifficulties = combatTab:CreateDropdown({
     Name          = "Select Difficulty",
     Options       = raidDifficultyOptions,
-    CurrentOption = Config.RaidDifficulties,
-    MultipleOptions = true,
+    CurrentOption = Config.RaidDifficulties[1] or "Easy",
+    MultipleOptions = false,
     Flag          = "RaidDifficulties",
     Callback      = function(v)
         local selected = normalizeRaidDifficulties(v)
@@ -3452,11 +3552,6 @@ miscTab:CreateToggle({
     Callback     = function(v) Config.AutoBuyBoost = v end,
 })
 
-miscTab:CreateParagraph({
-    Title   = "Boost purchase IDs",
-    Content = "Base Expansion uses the confirmed BuyCash id 'base'. Other selected boosts use their matching upgrade id.",
-})
-
 miscTab:CreateSection("Anti-AFK")
 
 Controls.AntiAfk = miscTab:CreateToggle({
@@ -3466,7 +3561,7 @@ Controls.AntiAfk = miscTab:CreateToggle({
     Callback     = function(v) Config.AntiAfk = v end,
 })
 
-miscTab:CreateSection("Playtime Rewards")
+miscTab:CreateSection("Player Rewards")
 
 miscTab:CreateToggle({
     Name         = "Auto Claim Playtime Rewards",
@@ -3485,7 +3580,7 @@ miscTab:CreateToggle({
 -- ══════════════════════════════════════════════════════════════
 --  TAB 7 – Settings
 -- ══════════════════════════════════════════════════════════════
-local settingsTab = Window:CreateTab("Settings", 4483362458)
+local settingsTab = Window:CreateTab("⚙️ Settings", 0)
 
 settingsTab:CreateSection("Configuration Manager")
 
@@ -3524,7 +3619,8 @@ settingsTab:CreateButton({
             })
             return
         end
-        if saveConfig(name) then
+        -- saveConfig(name, false) = do NOT overwrite if already exists
+        if saveConfig(name, false) then
             refreshConfigList()
             ConfigManager.SelectedConfig = name
             Rayfield:Notify({
@@ -3536,15 +3632,44 @@ settingsTab:CreateButton({
     end,
 })
 
--- Saved Configurations dropdown
+-- Load initial config names for the dropdown
+local function getInitialConfigNames()
+    if not FS_SUPPORTED then return {} end
+    ensureConfigFolders()
+    local files = {}
+    pcall(function() files = listfiles(CONFIG_FOLDER) or {} end)
+    local names = {}
+    for _, filePath in ipairs(files) do
+        local name = tostring(filePath):match("([^/\\]+)%.json$")
+        if name then table.insert(names, name) end
+    end
+    table.sort(names)
+    return names
+end
+
+-- Select Config dropdown
 ConfigManager.Dropdown = settingsTab:CreateDropdown({
-    Name            = "Saved Configurations",
-    Options         = {},
+    Name            = "Select Config",
+    Options         = getInitialConfigNames(),
     CurrentOption   = {},
     MultipleOptions = false,
     Flag            = "ConfigManagerSelected",
     Callback        = function(v)
-        ConfigManager.SelectedConfig = v
+        -- Rayfield single-select may still deliver a table; normalize to string
+        ConfigManager.SelectedConfig = resolveConfigName(v)
+    end,
+})
+
+-- Refresh List button
+settingsTab:CreateButton({
+    Name     = "Refresh List",
+    Callback = function()
+        refreshConfigList()
+        Rayfield:Notify({
+            Title    = "Config List Refreshed",
+            Content  = "The configuration list has been updated.",
+            Duration = 3,
+        })
     end,
 })
 
@@ -3552,8 +3677,8 @@ ConfigManager.Dropdown = settingsTab:CreateDropdown({
 settingsTab:CreateButton({
     Name     = "Load",
     Callback = function()
-        local name = ConfigManager.SelectedConfig
-        if not name or name == "" then
+        local name = resolveConfigName(ConfigManager.SelectedConfig)
+        if not name then
             Rayfield:Notify({
                 Title    = "No Configuration Selected",
                 Content  = "Select a saved configuration first.",
@@ -3565,12 +3690,45 @@ settingsTab:CreateButton({
     end,
 })
 
+-- Overwrite button
+settingsTab:CreateButton({
+    Name     = "Overwrite",
+    Callback = function()
+        local name = resolveConfigName(ConfigManager.SelectedConfig)
+        if not name then
+            Rayfield:Notify({
+                Title    = "No Configuration Selected",
+                Content  = "Select a saved configuration first.",
+                Duration = 4,
+            })
+            return
+        end
+        if not FS_SUPPORTED then
+            Rayfield:Notify({
+                Title    = "Unsupported Executor",
+                Content  = "File storage is unavailable in this executor.",
+                Duration = 5,
+            })
+            return
+        end
+        -- saveConfig(name, true) = allow overwrite
+        if saveConfig(name, true) then
+            refreshConfigList()
+            Rayfield:Notify({
+                Title    = "Configuration Overwritten",
+                Content  = name .. " was overwritten successfully.",
+                Duration = 4,
+            })
+        end
+    end,
+})
+
 -- Delete button
 settingsTab:CreateButton({
     Name     = "Delete",
     Callback = function()
-        local name = ConfigManager.SelectedConfig
-        if not name or name == "" then
+        local name = resolveConfigName(ConfigManager.SelectedConfig)
+        if not name then
             Rayfield:Notify({
                 Title    = "No Configuration Selected",
                 Content  = "Select a saved configuration first.",
@@ -3579,12 +3737,11 @@ settingsTab:CreateButton({
             return
         end
         if deleteConfig(name) then
-            local deletedName = name
             ConfigManager.SelectedConfig = nil
             refreshConfigList()
             Rayfield:Notify({
                 Title    = "Configuration Deleted",
-                Content  = deletedName .. " was deleted.",
+                Content  = name .. " was deleted.",
                 Duration = 4,
             })
         end
@@ -3595,8 +3752,8 @@ settingsTab:CreateButton({
 settingsTab:CreateButton({
     Name     = "Set as Autoload",
     Callback = function()
-        local name = ConfigManager.SelectedConfig
-        if not name or name == "" then
+        local name = resolveConfigName(ConfigManager.SelectedConfig)
+        if not name then
             Rayfield:Notify({
                 Title    = "No Configuration Selected",
                 Content  = "Select a saved configuration first.",
