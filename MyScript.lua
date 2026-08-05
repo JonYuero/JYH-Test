@@ -1,9 +1,228 @@
 -- ============================================================
 --  Anime Card Farm  –  Rayfield Edition
---  Config auto-saves via Rayfield's built-in ConfigurationSaving
+--  JonYueroHub  ·  Config auto-saves via Rayfield's built-in
+--  ConfigurationSaving.
+--
+--  SECURITY NOTE
+--  This direct-execution check prevents simple bypasses such as
+--  running this file directly without first running Loader.lua.
+--  It is NOT unbreakable: a determined user can fabricate
+--  getgenv().JYH_SESSION because all client-side state can be
+--  modified.  For stronger protection consider a server-issued
+--  short-lived launch token, backend verification from this
+--  script, authenticated script delivery, or obfuscation as an
+--  additional deterrent.  Do not add fake cryptography or
+--  hardcoded secrets here.
 -- ============================================================
 
--- Try multiple Rayfield sources in case one is down
+-- ── URL constants (single source of truth) ───────────────────
+local LOADER_URL    = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/Loader.lua"
+local MY_SCRIPT_URL = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/MyScript.lua"
+
+local VALID_LICENSE_TYPES = { FREE = true, ["30D"] = true, LIFETIME = true }
+
+-- ── Environment ───────────────────────────────────────────────
+local ENV = getgenv()
+
+-- ── Lightweight notification (available before Rayfield) ──────
+local function coreNotify(title, text)
+    pcall(
+        game:GetService("StarterGui").SetCore,
+        game:GetService("StarterGui"),
+        "SendNotification",
+        { Title = title, Text = text, Duration = 5 }
+    )
+end
+
+-- ── Safe Lua source fetcher ───────────────────────────────────
+-- Returns a compiled function on success, or nil + reason on failure.
+local function fetchLua(url)
+    local ok, raw = pcall(game.HttpGet, game, url, true)
+    if not ok or type(raw) ~= "string" or raw == "" then
+        return nil, "HttpGet failed: " .. tostring(raw)
+    end
+    local head = raw:sub(1, 300):lower()
+    if head:find("<!doctype", 1, true)
+    or head:find("<html",     1, true)
+    or head:find("404: not found", 1, true)
+    or head:find("rate limit",     1, true)
+    or head:find("access denied",  1, true) then
+        return nil, "Server returned HTML or error page instead of Lua source"
+    end
+    local fn, err = loadstring(raw)
+    if not fn then
+        return nil, "Compile error: " .. tostring(err)
+    end
+    return fn
+end
+
+-- ── Return to the official loader ────────────────────────────
+-- Shows the reason, clears session state, and re-executes Loader.lua.
+-- A duplicate guard prevents the Loader ↔ MyScript redirect loop.
+local function returnToLoader(reason)
+    -- Prevent multiple concurrent redirect attempts.
+    if ENV.JYH_RETURNING_TO_LOADER == true then
+        return
+    end
+    ENV.JYH_RETURNING_TO_LOADER = true
+    ENV.JYH_SESSION             = nil
+    ENV.JYH_ACTIVE_SESSION      = nil
+
+    local msg = tostring(reason or "Session validation failed")
+    warn("[MyScript] Returning to Loader. Reason: " .. msg)
+    coreNotify("JonYueroHub", msg .. "\nReturning to Loader…")
+
+    local fn, fetchErr = fetchLua(LOADER_URL)
+    if not fn then
+        warn("[MyScript] Could not fetch Loader: " .. tostring(fetchErr))
+        coreNotify("JonYueroHub",
+            "Could not load Loader automatically.\n"
+            .. "Please run Loader.lua manually.")
+        -- Clear the redirect guard so the user can try again.
+        ENV.JYH_RETURNING_TO_LOADER = nil
+        return
+    end
+
+    local execOk, execErr = pcall(fn)
+    if not execOk then
+        warn("[MyScript] Loader execution failed: " .. tostring(execErr))
+        ENV.JYH_RETURNING_TO_LOADER = nil
+    end
+    -- If execOk == true, the Loader is now running; leave
+    -- JYH_RETURNING_TO_LOADER = true so a stale MyScript coroutine
+    -- cannot kick off another redirect.
+end
+
+-- ── Session validator ─────────────────────────────────────────
+-- Validates every required field of the short-lived launch session.
+-- Returns true on success; false + reason string on any failure.
+-- Uses os.time() throughout — never tick() — for Unix comparisons.
+local function validateSession(session)
+    -- 1. Must be a table
+    if type(session) ~= "table" then
+        return false, "No valid session found. Run Loader.lua first."
+    end
+
+    -- 2. authenticated must be exactly true
+    if session.authenticated ~= true then
+        return false, "Session is not authenticated"
+    end
+
+    -- 3. issuedAt must be numeric
+    local issuedAt = tonumber(session.issuedAt)
+    if not issuedAt then
+        return false, "Session issuedAt is missing or non-numeric"
+    end
+
+    -- 4. Session must not be older than 120 seconds
+    if math.abs(os.time() - issuedAt) > 120 then
+        return false, "The loader session has expired (> 120 s old)"
+    end
+
+    -- 5. PlaceId must match
+    if session.placeId ~= game.PlaceId then
+        return false, "Session PlaceId does not match current game"
+    end
+
+    -- 6. UserId must match
+    local LocalPlayer = game:GetService("Players").LocalPlayer
+    if session.userId ~= LocalPlayer.UserId then
+        return false, "Session UserId does not match current player"
+    end
+
+    -- 7. currentGame must be "Anime Card Farm"
+    if session.currentGame ~= "Anime Card Farm" then
+        return false, "Session currentGame mismatch"
+    end
+
+    -- 8. licenseType must be FREE, 30D, or LIFETIME
+    local lt = tostring(session.licenseType or "")
+    if not VALID_LICENSE_TYPES[lt] then
+        return false, "Unknown license type: '" .. lt .. "'"
+    end
+
+    -- 9. loaderUrl must match the official URL when present
+    if session.loaderUrl ~= nil and session.loaderUrl ~= LOADER_URL then
+        return false, "Session loaderUrl does not match the official Loader"
+    end
+
+    -- 10. scriptUrl must match the official MyScript URL when present
+    if session.scriptUrl ~= nil and session.scriptUrl ~= MY_SCRIPT_URL then
+        return false, "Session scriptUrl does not match the official game script"
+    end
+
+    return true
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  SESSION VALIDATION  ← must be the first executable gate
+--  Nothing below this point runs if the session is invalid.
+-- ════════════════════════════════════════════════════════════════
+local valid, reason = validateSession(ENV.JYH_SESSION)
+if not valid then
+    returnToLoader(reason)
+    return   -- stop all further initialization
+end
+
+-- ── Duplicate game-script guard ───────────────────────────────
+-- Validation passed.  Check for an already-running instance before
+-- consuming the session token so a double-run is caught cleanly.
+if ENV.JYH_GAME_SCRIPT_RUNNING == true then
+    coreNotify("JonYueroHub", "Anime Card Farm is already running.")
+    return
+end
+
+-- From this point the script is the single authoritative instance.
+ENV.JYH_GAME_SCRIPT_RUNNING = true
+
+-- ── Consume the one-time launch session ──────────────────────
+-- Copy necessary values to the long-lived active session, then nil
+-- the short-lived token.  Running MyScript again directly will fail
+-- validation because JYH_SESSION is now nil.
+ENV.JYH_ACTIVE_SESSION = {
+    authenticated = true,
+    licenseType   = ENV.JYH_SESSION.licenseType,
+    expiresAt     = ENV.JYH_SESSION.expiresAt,
+    issuedAt      = ENV.JYH_SESSION.issuedAt,
+    userId        = ENV.JYH_SESSION.userId,
+    placeId       = ENV.JYH_SESSION.placeId,
+    currentGame   = ENV.JYH_SESSION.currentGame,
+}
+
+ENV.JYH_SESSION             = nil
+ENV.JYH_RETURNING_TO_LOADER = nil
+
+-- ── Derive membership from validated license type ─────────────
+-- Do NOT trust a client-supplied role string; derive it here.
+local licenseType = ENV.JYH_ACTIVE_SESSION.licenseType
+local isPremium   = (licenseType == "30D" or licenseType == "LIFETIME")
+local userRole    = isPremium and "Premium User" or "Freemium User"
+
+local licenseLabel = licenseType == "LIFETIME" and "Lifetime"
+                  or licenseType == "30D"       and "30 Days"
+                  or "FREE"
+
+-- ── Expiry check for FREE and 30D keys ───────────────────────
+-- For LIFETIME allow nil / "Never" / any non-numeric sentinel.
+-- Use os.time() — never tick() — for Unix timestamp comparisons.
+if licenseType ~= "LIFETIME" then
+    local expiry = tonumber(ENV.JYH_ACTIVE_SESSION.expiresAt)
+    if expiry and expiry <= os.time() then
+        returnToLoader("The license has expired")
+        return
+    end
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  Everything below this line is the original Anime Card Farm
+--  game script, unchanged except for:
+--    • Rayfield now loads here (after validation) instead of at line 1.
+--    • The Rayfield window name includes the membership role.
+--    • The `notify` helper is defined early (before setPlotNumber).
+--    • The Misc tab Info section shows the current membership status.
+-- ════════════════════════════════════════════════════════════════
+
+-- ── Load Rayfield ─────────────────────────────────────────────
 local Rayfield
 local rayfieldUrls = {
     "https://sirius.menu/rayfield",
@@ -20,7 +239,7 @@ for _, url in ipairs(rayfieldUrls) do
     end
 end
 if not Rayfield then
-    error("[ACF] Failed to load Rayfield from all sources. Check your executor's HTTP settings.")
+    error("[ACF] Failed to load Rayfield from all sources. Check executor HTTP settings.")
 end
 
 -- ── Services ─────────────────────────────────────────────────
@@ -33,9 +252,15 @@ local player = Players.LocalPlayer
 if not player.Character then player.CharacterAdded:Wait() end
 local playerGui = player:WaitForChild("PlayerGui")
 
+-- ── In-game notification (uses StarterGui, defined early so
+--    setPlotNumber and other helpers can call it safely) ───────
+local function notify(title, text)
+    pcall(StarterGui.SetCore, StarterGui, "SendNotification", {
+        Title = title, Text = text, Duration = 3,
+    })
+end
+
 -- ── Remotes ──────────────────────────────────────────────────
--- CONFIRMED: ReplicatedStorage.Remotes.ConveyorRE
--- Purchase: ConveyorRE:FireServer("TryBuy", { ItemId = X })
 local Remotes    = ReplicatedStorage:WaitForChild("Remotes")
 local ConveyorRE = Remotes:WaitForChild("ConveyorRE")
 local PlayTimeRewardRE = Remotes:FindFirstChild("PlayTimeRewardRE")
@@ -194,13 +419,11 @@ local Config = {
     AntiAfk    = true,
 }
 
--- Playtime state is pushed by the game's client remote. Keep only ready,
--- unclaimed indexes so Auto Claim does not spam all 12 rewards every cycle.
+-- Playtime state is pushed by the game's client remote.
 local playtimeReadyRewards = {}
 local playtimeStateReceived = false
 
--- Forward declarations used by the combat loops, which are intentionally
--- started before the optional GUI controls are resolved.
+-- Forward declarations
 local clickGuiButton
 local startCombatBattle
 local removeAllCards
@@ -208,7 +431,6 @@ local removeFirstFourCardSlots
 local doEquipBestCards
 
 -- ── Remote helpers ───────────────────────────────────────────
--- Used for non-ConveyorRE remotes only.
 local function findRemote(name)
     local directRemote = Remotes and Remotes:FindFirstChild(name)
     if directRemote then return directRemote end
@@ -239,12 +461,9 @@ local function fireRemote(name, ...)
 end
 
 -- ── Button firing ────────────────────────────────────────────
--- CONFIRMED: spawn button = ButtonPart with a ClickDetector child.
--- Priority order: fireclickdetector → fireproximityprompt → MouseClick:Fire
 local function fireButton(part)
     if not part then return false end
 
-    -- ClickDetector (CONFIRMED method for ButtonPart)
     local click = part:FindFirstChildOfClass("ClickDetector")
                or part:FindFirstChild("ClickDetector")
     if click then
@@ -252,12 +471,10 @@ local function fireButton(part)
             pcall(fireclickdetector, click)
             return true
         end
-        -- Fallback: fire the MouseClick signal directly
         pcall(function() click.MouseClick:Fire(player.Character) end)
         return true
     end
 
-    -- ProximityPrompt (fallback for other buttons)
     local prompt = part:FindFirstChildOfClass("ProximityPrompt")
     if prompt then
         if fireproximityprompt then
@@ -273,9 +490,6 @@ local function fireButton(part)
     return false
 end
 
--- Prefer executor interaction helpers, but also support games that expose the
--- same action through a RemoteEvent/RemoteFunction. This matters on tablets
--- and on executors that do not implement fireproximityprompt/fireclickdetector.
 local function firePrompt(prompt)
     if not prompt then return false end
     if fireproximityprompt then
@@ -331,18 +545,9 @@ if PlayTimeRewardRE and PlayTimeRewardRE:IsA("RemoteEvent") then
 end
 
 -- ══════════════════════════════════════════════════════════════
---  PLOT AUTO-DETECTION  (fully automatic, no UI controls)
---
---  CONFIRMED (from in-game Explorer): the game stores the assigned plot
---  number as an IntValue named "PlotNumber" directly under each Player
---  object in game.Players.  e.g. Players.Hayju76.PlotNumber = 3
---
---  The script waits for workspace.MAP to exist and for the server to
---  assign the IntValue before proceeding.  No slider or button needed.
+--  PLOT AUTO-DETECTION
 -- ══════════════════════════════════════════════════════════════
 
--- Internal setter — updates Config.PlotNumber and prints a log line.
--- No UI references; the plot is managed entirely in the background.
 local function setPlotNumber(n)
     if type(n) ~= "number" or n == Config.PlotNumber then return end
     Config.PlotNumber = n
@@ -350,7 +555,6 @@ local function setPlotNumber(n)
     notify("Plot Detected", "Your plot is slot #" .. tostring(n))
 end
 
--- Read the IntValue the game puts on the Player object.
 local function readPlayerPlotNumber()
     local iv = player:FindFirstChild("PlotNumber")
     if iv and iv:IsA("IntValue") then return tonumber(iv.Value) end
@@ -359,15 +563,11 @@ local function readPlayerPlotNumber()
     return nil
 end
 
--- Re-exported for the spawn loop's fallback re-detection call.
 local function autoDetectMyPlotNumber()
     return readPlayerPlotNumber()
 end
 
--- Wait for the game world and server assignment, then set the plot number.
--- Runs in a background task so it never blocks the main thread.
 task.spawn(function()
-    -- 1. Wait for workspace.MAP to exist (game is still loading without it).
     local map = workspace:FindFirstChild("MAP")
     if not map then
         map = workspace:WaitForChild("MAP", 30)
@@ -376,11 +576,8 @@ task.spawn(function()
         warn("[ACF] workspace.MAP not found after 30 s — game may use a different structure.")
     end
 
-    -- 2. Wait for the server to assign PlotNumber on the player object.
-    --    This is typically an IntValue added within the first 1–3 seconds.
     local iv = player:FindFirstChild("PlotNumber")
     if not iv then
-        -- Block up to 15 s for the IntValue to appear.
         iv = player:WaitForChild("PlotNumber", 15)
     end
 
@@ -390,19 +587,16 @@ task.spawn(function()
             setPlotNumber(n)
         end
 
-        -- Watch for server-side reassignments (e.g. player changes slot).
         iv.Changed:Connect(function(newVal)
             local num = tonumber(newVal)
             if num and num > 0 then
                 Config.PlotNumber = num
                 warn("[ACF] Plot reassigned by server: #" .. tostring(num))
                 notify("Plot Updated", "Moved to slot #" .. tostring(num))
-                -- Clear the sell station cache so it rescans on the new plot.
                 sellBoxPartCache = nil
             end
         end)
     else
-        -- Attribute fallback (some server builds store it as an Attribute).
         local attr = player:GetAttribute("PlotNumber")
         if attr ~= nil then
             local n = tonumber(attr)
@@ -411,7 +605,6 @@ task.spawn(function()
             warn("[ACF] PlotNumber not found on player after 15 s. "
                 .. "Carry/Sell will not work correctly until the plot is assigned.")
         end
-        -- Watch attribute version.
         player:GetAttributeChangedSignal("PlotNumber"):Connect(function()
             local num = tonumber(player:GetAttribute("PlotNumber"))
             if num and num > 0 then
@@ -423,27 +616,18 @@ task.spawn(function()
     end
 end)
 
--- CONFIRMED path (from in-game dump):
---   workspace.MAP.Plots.<plotNumber>.Plot_N0.ButtonPart.ClickDetector
---
--- findPlot returns the Plot_N0 model for the given plot number.
 local function findPlot(plotNumber)
-    -- Primary confirmed path
     local map   = workspace:FindFirstChild("MAP")
     local plots = map and map:FindFirstChild("Plots")
     if plots then
         local slot = plots:FindFirstChild(tostring(plotNumber))
         if slot then
-            -- Plot_N0 is the actual plot model inside the numbered slot
             local plotN0 = slot:FindFirstChild("Plot_N0")
             if plotN0 then return plotN0 end
-            -- Fallback: return the slot itself if no Plot_N0
             return slot
         end
     end
 
-    -- Fallback: search all of workspace for Plot_N0 near a ButtonPart
-    -- (handles edge cases if MAP folder is renamed)
     local fallbackPlots = workspace:FindFirstChild("Plots")
     if fallbackPlots then
         local slot = fallbackPlots:FindFirstChild(tostring(plotNumber))
@@ -456,28 +640,18 @@ local function findPlot(plotNumber)
     return nil
 end
 
--- Find spawn / place button parts inside a plot.
--- CONFIRMED: workspace.MAP.Plots.<N>.Plot_N0.ButtonPart  (has ClickDetector child)
 local function getPlotButtons(plotNumber)
     local plot = findPlot(plotNumber)
     if not plot then return nil, nil end
 
-    -- Confirmed spawn button name
     local spawnBtn = plot:FindFirstChild("ButtonPart", true)
                or plot:FindFirstChild("ButtonSelect", true)
 
-    -- Place button — not yet confirmed; try common names recursively
     local placeBtn = plot:FindFirstChild("PlaceButton",    true)
                or plot:FindFirstChild("ConveyorButton", true)
                or plot:FindFirstChild("ButtonPlace",    true)
 
     return spawnBtn, placeBtn
-end
-
-local function notify(title, text)
-    pcall(StarterGui.SetCore, StarterGui, "SendNotification", {
-        Title = title, Text = text, Duration = 3,
-    })
 end
 
 -- ── Filter logic ─────────────────────────────────────────────
@@ -500,8 +674,6 @@ local function normalizeFilterSelection(value)
         end
     end
 
-    -- Rayfield normally returns an array, while older saved configurations
-    -- may restore a dictionary or a single string. Accept all three forms.
     local hadArrayValues = false
     for _, option in ipairs(value) do
         hadArrayValues = true
@@ -519,8 +691,6 @@ end
 local function filterCompareKey(value)
     local normalized = normalizeFilterValue(value)
     if not normalized then return nil end
-    -- Pack names can be replicated as "IcePack" or "Ice Pack" depending on
-    -- which client object supplied the metadata.
     return string.gsub(normalized, "[^%w]", "")
 end
 
@@ -540,8 +710,6 @@ local function filterValueMatches(value, selected)
     return false
 end
 
--- Metadata is read from live replicated objects, but the hierarchy itself
--- does not need to be traversed on every poll.
 local metadataCache = setmetatable({}, { __mode = "k" })
 
 local function readBoxValue(box, names)
@@ -552,9 +720,6 @@ local function readBoxValue(box, names)
         end
     end
 
-    -- Some game revisions put the metadata on a child model rather than the
-    -- conveyor container itself. Check descendant attributes before using the
-    -- cached value-object lookup.
     for _, descendant in ipairs(box:GetDescendants()) do
         for _, name in ipairs(names) do
             local attribute = descendant:GetAttribute(name)
@@ -596,9 +761,6 @@ local function getBoxInfo(box)
 
     local packValue = readBoxValue(box, { "Pack", "PackName", "pack" })
 
-    -- CONFIRMED (from logs): the game does not store pack name as an Attribute or
-    -- ValueBase. The model is simply named after the pack (e.g. "Ice Pack",
-    -- "Sand Pack"). Fall back to the model name when no attribute is found.
     if packValue == nil and box:IsA("Model") then
         local name = box.Name
         if string.find(string.lower(name), "pack", 1, true) then
@@ -606,9 +768,6 @@ local function getBoxInfo(box)
         end
     end
 
-    -- If the container is a generic BoxBaseModel, the pack name is often on a
-    -- nearby ancestor or child model. Prefer a known pack name over a generic
-    -- object name so a matching pack is not discarded during replication.
     if packValue == nil then
         local function findKnownPackName(value)
             local key = filterCompareKey(value)
@@ -647,15 +806,10 @@ local function getBoxInfo(box)
     }
 end
 
--- CONFIRMED: ItemId is sequential per session, starting from 1.
--- It may live as an Attribute or ValueBase on the pack model or any ancestor
--- up the conveyor hierarchy (e.g. LocalConveyorModels or Plot_N0 level).
 local function getItemId(container)
-    -- First check the container itself.
     local value = readBoxValue(container, { "ItemId", "ItemID", "itemId" })
     if value ~= nil then return tonumber(value) or value end
 
-    -- Walk up ancestors (up to 6 levels) to find the ItemId on a parent model.
     local current = container.Parent
     for _ = 1, 6 do
         if not current or current == workspace then break end
@@ -665,7 +819,6 @@ local function getItemId(container)
             if parentValue ~= nil then break end
         end
         if parentValue == nil then
-            -- Try ValueBase child on this ancestor.
             local child = current:FindFirstChild("ItemId")
                        or current:FindFirstChild("ItemID")
                        or current:FindFirstChild("itemId")
@@ -690,18 +843,13 @@ local function isPackContainer(container, info)
         return true
     end
 
-    -- ItemId or Pack metadata on this model is stronger evidence than a
-    -- generic ancestor name. Rarity/mutation alone is not enough.
     return getItemId(container) ~= nil
         or info and info.pack ~= nil
 end
 
 -- ── Conveyor container registry ──────────────────────────────
--- Single shared tracking table used by both Auto Stop and Auto Buy.
--- Model → { itemId, info, stage, timeCreated }
--- "stage" values: "spawned", "reachedB" (purchasable), "buying", "gone"
-local conveyorState = {}          -- model → state record
-local itemIdIndex   = {}          -- itemId (number) → model (for fast O(1) lookup)
+local conveyorState = {}
+local itemIdIndex   = {}
 local watchedModels = setmetatable({}, { __mode = "k" })
 local registerConveyorContainer
 local watchAllPromptsOnPack
@@ -787,7 +935,6 @@ registerConveyorContainer = function(container)
     watchModel(pack)
 
     if conveyorState[pack] then
-        -- Already registered; refresh ItemId in case it was just assigned.
         local itemId = getItemId(pack)
         if itemId ~= nil and conveyorState[pack].itemId == nil then
             conveyorState[pack].itemId = itemId
@@ -843,8 +990,6 @@ local function unregisterConveyorContainer(container)
     metadataCache[container] = nil
 end
 
--- Build the candidate set once, then maintain it as replicated objects enter
--- and leave workspace. This replaces repeated full-workspace scans.
 for _, descendant in ipairs(workspace:GetDescendants()) do
     if descendant:IsA("Model") then
         if shouldWatchModel(descendant) then
@@ -860,11 +1005,6 @@ for _, descendant in ipairs(workspace:GetDescendants()) do
     end
 end
 
--- ── Event-driven buy on prompt enable ────────────────────────
--- Instead of (only) polling every second, hook each ProximityPrompt's
--- Enabled signal so we react the instant the pack reaches the buy zone.
--- tryBuyConveyorPack / passesFilter / isBuyPrompt are declared later but
--- this function is only *called* at runtime, so forward references are fine.
 local watchedPrompts = setmetatable({}, { __mode = "k" })
 
 local function watchPromptForBuy(prompt, packModel)
@@ -878,15 +1018,12 @@ local function watchPromptForBuy(prompt, packModel)
         if not Config.AutoBuyMatching then return end
         if boxHandlingActive then return end
 
-        -- Find the state record for this pack.
         local record = conveyorState[trackedPack]
         if not record then return end
         if record.stage == "bought" then return end
         record.info = getBoxInfo(trackedPack)
 
-        -- Only act on prompts that look like buy prompts.
         if not isBuyPrompt(prompt) then
-            -- If there is only one prompt on this pack, treat it as the buy prompt.
             local count = 0
             for _, d in ipairs(packModel:GetDescendants()) do
                 if d:IsA("ProximityPrompt") then count += 1 end
@@ -904,7 +1041,6 @@ local function watchPromptForBuy(prompt, packModel)
     end)
 end
 
--- Hook all existing prompts on a pack model.
 watchAllPromptsOnPack = function(packModel)
     for _, descendant in ipairs(packModel:GetDescendants()) do
         if descendant:IsA("ProximityPrompt") then
@@ -913,9 +1049,6 @@ watchAllPromptsOnPack = function(packModel)
     end
 end
 
--- The initial model scan happens before the prompt watcher was declared.
--- Hook existing prompts here as well as in DescendantAdded so packs that are
--- already on the conveyor are not missed.
 for _, descendant in ipairs(workspace:GetDescendants()) do
     if descendant:IsA("ProximityPrompt") then
         local promptModel = getOwningModel(descendant)
@@ -965,16 +1098,11 @@ workspace.DescendantRemoving:Connect(function(descendant)
     end
 end)
 
--- ── Conveyor stage helpers ────────────────────────────────────
--- Returns all tracked pack records that are still in workspace.
 local function getConveyorPacks()
     local packs = {}
     for model, record in pairs(conveyorState) do
         if model:IsDescendantOf(workspace) then
-            -- Refresh every pass because rarity/mutation metadata can arrive
-            -- after the model and ItemId have already replicated.
             record.info = getBoxInfo(model)
-            -- Refresh ItemId if it wasn't available at registration time.
             if record.itemId == nil then
                 local itemId = getItemId(model)
                 if itemId ~= nil then
@@ -990,9 +1118,6 @@ local function getConveyorPacks()
     return packs
 end
 
--- Mark a pack as having reached the buy zone (ReachedB equivalent).
--- CONFIRMED: when the buy ProximityPrompt becomes enabled, the pack is at B
--- and is purchasable via ConveyorRE:FireServer("TryBuy", { ItemId = X }).
 local function markReachedB(record)
     if record.stage == "spawned" then
         record.stage = "reachedB"
@@ -1006,9 +1131,7 @@ local function markReachedB(record)
     end
 end
 
--- ── Pack key helpers ─────────────────────────────────────────
 local function getPackKey(record)
-    -- CONFIRMED: ItemId is sequential and reliable; prefer it as the key.
     if record.itemId ~= nil then
         return "id:" .. tostring(record.itemId)
     end
@@ -1023,7 +1146,6 @@ local function indexPackIds(packs)
     return ids
 end
 
--- ── Diagnostic helpers ───────────────────────────────────────
 local diagnosticState = {}
 
 local function warnOnce(key, message)
@@ -1032,13 +1154,13 @@ local function warnOnce(key, message)
     warn("[ACF] " .. message)
 end
 
-local function debugAutoBuy(message)
+debugAutoBuy = function(message)
     if Config.AutoBuyDebug then
         warn("[ACF][AutoBuy] " .. message)
     end
 end
 
-local function describePack(record)
+describePack = function(record)
     if not record or not record.model then
         return "<missing pack>"
     end
@@ -1074,9 +1196,6 @@ local function dumpPackHierarchy(record)
     )
 end
 
--- ── Buy prompt detection ─────────────────────────────────────
--- The buy ProximityPrompt being enabled is the client-visible indicator
--- that the pack has reached the buy zone (equivalent to ReachedB).
 local function normalizePromptText(value)
     if value == nil then return "" end
     return string.lower(string.gsub(tostring(value), "^%s*(.-)%s*$", "%1"))
@@ -1098,10 +1217,6 @@ isBuyPrompt = function(prompt)
         or string.find(objectText, "buy", 1, true) ~= nil
 end
 
--- Search a model and optionally its parent for an enabled buy prompt.
--- Priority: explicit "buy" label > first enabled prompt on the pack model >
--- first enabled prompt on the parent model (in case the prompt lives one
--- level above the pack, e.g. on LocalConveyorModels).
 local function findBuyPrompt(packModel)
     if not packModel then return nil end
 
@@ -1114,7 +1229,7 @@ local function findBuyPrompt(packModel)
                     continue
                 end
                 if isBuyPrompt(descendant) then
-                    return descendant, nil   -- explicit match wins immediately
+                    return descendant, nil
                 end
                 if not firstEnabled then
                     firstEnabled = descendant
@@ -1124,26 +1239,16 @@ local function findBuyPrompt(packModel)
         return nil, firstEnabled
     end
 
-    -- 1. Search the pack model's own descendants for an explicit buy label.
     local explicit, firstOnPack = searchIn(packModel, true)
     if explicit then return explicit end
 
-    -- 2. Search the parent model's descendants (catches prompts one level up).
     local parent = packModel.Parent
     local explicitOnParent, firstOnParent = searchIn(parent, true)
     if explicitOnParent then return explicitOnParent end
 
-    -- 3. No explicit label found. Fall back to the first enabled prompt:
-    --    prefer one on the pack model itself; only use parent if pack has none.
     return firstOnPack or firstOnParent
 end
 
--- ── Purchase flow ─────────────────────────────────────────────
--- CONFIRMED purchase mechanism:
---   ConveyorRE:FireServer("TryBuy", { ItemId = X })
---
--- The buy ProximityPrompt being enabled signals that the pack has reached
--- the buy zone. We use that as our ReachedB gate before firing TryBuy.
 tryBuyConveyorPack = function(record)
     if not record or not record.model then return false end
     local now = os.clock()
@@ -1152,17 +1257,14 @@ tryBuyConveyorPack = function(record)
     end
     record.lastBuyAttempt = now
 
-    -- Gate: buy ProximityPrompt must be enabled (= pack is at buy zone / ReachedB).
     local prompt = findBuyPrompt(record.model)
     if not prompt then
         debugAutoBuy("SKIP — no enabled buy prompt (not yet at B)  " .. describePack(record))
         return false
     end
 
-    -- Mark as ReachedB if not already done, and log it.
     markReachedB(record)
 
-    -- Refresh ItemId one last time right before purchase (it may have arrived late).
     if record.itemId == nil then
         local freshId = getItemId(record.model)
         if freshId ~= nil then
@@ -1174,7 +1276,6 @@ tryBuyConveyorPack = function(record)
     local itemId = record.itemId
 
     if itemId ~= nil then
-        -- CONFIRMED path: ConveyorRE:FireServer("TryBuy", { ItemId = X })
         debugAutoBuy(
             "TryBuy (remote)  ItemId=" .. tostring(itemId) ..
             "  " .. describePack(record)
@@ -1183,18 +1284,12 @@ tryBuyConveyorPack = function(record)
             ConveyorRE:FireServer("TryBuy", { ItemId = itemId })
         end)
         if ok then
-            -- A successful pcall only confirms that the client sent the
-            -- request. Keep the record retryable until the server removes the
-            -- pack or disables its buy prompt.
             record.stage = "buying"
             debugAutoBuy("TryBuy sent  ItemId=" .. tostring(itemId))
         else
             warn("[ACF][AutoBuy] TryBuy failed  ItemId=" .. tostring(itemId) .. "  err=" .. tostring(err))
         end
         if ok and record.model:IsDescendantOf(workspace) then
-            -- Some server revisions do not accept the replicated ItemId
-            -- immediately. Give the live prompt one fallback activation while
-            -- it is still enabled, then let the polling loop retry normally.
             local livePrompt = findBuyPrompt(record.model)
             if livePrompt and fireproximityprompt then
                 task.wait(0.12)
@@ -1205,8 +1300,6 @@ tryBuyConveyorPack = function(record)
         end
         return ok
     else
-        -- ItemId not replicated to this client. Fall back to activating the
-        -- buy ProximityPrompt directly — the server handles the rest.
         debugAutoBuy(
             "TryBuy (prompt fallback — ItemId not available)  prompt=" ..
             prompt:GetFullName() ..
@@ -1233,8 +1326,6 @@ tryBuyConveyorPack = function(record)
     end
 end
 
--- Returns true if a card passes the current filter.
--- info = { rarity = string, mutation = string, pack = string }
 passesFilter = function(info)
     info = info or {}
 
@@ -1275,7 +1366,6 @@ task.spawn(function()
 
         local spawnBtn, _ = getPlotButtons(Config.PlotNumber)
         if not spawnBtn then
-            -- Spawn button missing — try re-detecting the plot first
             local detected = autoDetectMyPlotNumber()
             if detected and detected ~= Config.PlotNumber then
                 warn("[ACF] Spawn: plot " .. Config.PlotNumber
@@ -1292,12 +1382,8 @@ task.spawn(function()
         end
         fireButton(spawnBtn)
 
-        -- Auto Stop: detect the newly spawned pack and check the filter.
-        -- Runs in a background task so the spawn loop is never blocked —
-        -- the next spawn fires at the configured delay without waiting for
-        -- the detection to complete.
         if Config.AutoStopSpawn then
-            local capturedIds = previousIds  -- close over this spawn's snapshot
+            local capturedIds = previousIds
             task.spawn(function()
                 local spawnedRecord
                 for _ = 1, 30 do
@@ -1329,18 +1415,7 @@ task.spawn(function()
 end)
 
 -- Auto Buy Matching
--- CONFIRMED flow:
---   1. Pack spawns → registered in conveyorState with stage = "spawned".
---   2. Pack reaches buy zone → buy ProximityPrompt becomes enabled (= ReachedB).
---   3. If pack matches filter → ConveyorRE:FireServer("TryBuy", { ItemId = X }).
---   4. Pack is destroyed → removed from conveyorState.
---
--- Deduplication is by ItemId (confirmed sequential from 1). A pack remains
--- retryable after a request is sent; the server's removal of the model is the
--- success signal.
 task.spawn(function()
-    -- lastBuyAttempt is keyed by ItemId string for fast lookup.
-    -- It throttles retries in case the pack survives after TryBuy.
     local lastBuyAttempt = {}
 
     while true do
@@ -1358,9 +1433,6 @@ task.spawn(function()
 
         local now = os.clock()
         for _, record in ipairs(packs) do
-            -- "buying" is intentionally not skipped: the server may reject a
-            -- request while the prompt remains enabled, so retry until the
-            -- pack disappears.
             if record.stage == "bought" then continue end
 
             if passesFilter(record.info) then
@@ -1368,9 +1440,6 @@ task.spawn(function()
 
                 debugAutoBuy("Candidate " .. describePack(record))
 
-                -- Retry quickly while the pack remains present. A request can
-                -- be lost during replication, but retrying too slowly lets the
-                -- pack pass the purchase zone.
                 if not lastBuyAttempt[key] or now - lastBuyAttempt[key] >= 0.3 then
                     if tryBuyConveyorPack(record) then
                         lastBuyAttempt[key] = now
@@ -1382,12 +1451,6 @@ task.spawn(function()
 end)
 
 -- ── Auto Carry Box helpers ───────────────────────────────────
--- Boxes sit on the player's own plot in workspace.  They have a "Carry"
--- ProximityPrompt while on the ground; after firing it they equip as a Tool
--- with structure Tool.Handle.Box.
---
--- findOneCarryPromptOnPlot: search ONLY the player's own plot model so we
--- never accidentally pick up boxes from other players' plots.
 local function findOneCarryInteractionOnPlot()
     local plot = findPlot(Config.PlotNumber)
     if not plot then
@@ -1423,11 +1486,8 @@ local function findOneCarryInteractionOnPlot()
     return nil
 end
 
--- Backwards-compatible name used by older sections of the script.
 local findOneCarryPromptOnPlot = findOneCarryInteractionOnPlot
 
--- findOneBoxToolInCharacter: after equipping, the box lives in Character as
--- a Tool with structure Tool.Handle.Box.  This confirms the equip worked.
 local function findOneBoxToolInCharacter()
     local char = player.Character
     if not char then return nil end
@@ -1451,8 +1511,6 @@ local function isBoxTool(item)
         and not string.find(name, "pack", 1, true)
 end
 
--- Find the static "Sell Card Boxes!" interactable in the world.
--- Checks ProximityPrompts and ClickDetectors on all workspace parts.
 local sellBoxPartCache = nil
 local function findSellBoxPart()
     if sellBoxPartCache and sellBoxPartCache:IsDescendantOf(workspace) then
@@ -1460,9 +1518,6 @@ local function findSellBoxPart()
     end
     sellBoxPartCache = nil
 
-    -- Inner search helper — returns the first sell interaction in a list of
-    -- descendants. Checks ProximityPrompts by text first, then BasePart/Model
-    -- names that contain both "sell" and "box".
     local function searchIn(descendants)
         for _, descendant in ipairs(descendants) do
             if descendant:IsA("ProximityPrompt") then
@@ -1486,8 +1541,6 @@ local function findSellBoxPart()
         return nil
     end
 
-    -- Always search the player's OWN plot first so we never accidentally
-    -- fire another player's sell station when plots share the same workspace.
     local plot = findPlot(Config.PlotNumber)
     if plot then
         local found = searchIn(plot:GetDescendants())
@@ -1497,8 +1550,6 @@ local function findSellBoxPart()
         end
     end
 
-    -- Fallback: global workspace scan (original behaviour, kept for edge cases
-    -- where the sell station is not parented inside the plot model).
     local found = searchIn(workspace:GetDescendants())
     if found then
         sellBoxPartCache = found
@@ -1506,81 +1557,72 @@ local function findSellBoxPart()
     return sellBoxPartCache
 end
 
--- ── Teleport helper ─────────────────────────────────────────
--- Moves the character to within interaction range of a target position.
--- Places the character at the target's XZ position so proximity prompts
--- are always within activation distance.
-local function teleportNear(targetCFrame)
+-- ── Teleport helpers ─────────────────────────────────────────
+local function getCFrameOf(object)
+    if not object then return nil end
+    if object:IsA("BasePart") then return object.CFrame end
+    if object:IsA("Model") then
+        local primary = object.PrimaryPart
+        if primary then return primary.CFrame end
+        for _, child in ipairs(object:GetChildren()) do
+            if child:IsA("BasePart") then return child.CFrame end
+        end
+    end
+    return nil
+end
+
+local function teleportNear(cframe)
+    if not cframe then return end
     local char = player.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
     if not root then return end
-    -- Put the character at the exact XZ position of the target, keeping
-    -- the character's current Y so they don't fall through the floor.
-    local pos = targetCFrame.Position
+    local offset = Vector3.new(0, 0, 3)
     pcall(function()
-        root.CFrame = CFrame.new(pos.X, root.Position.Y, pos.Z)
+        root.CFrame = cframe * CFrame.new(offset)
     end)
-    task.wait(0.2)   -- the game requires a short delay after teleporting
 end
 
--- Get the CFrame of a model or part (PrimaryPart → geometric centre → origin).
-local function getCFrameOf(target)
-    if target:IsA("Model") then
-        if target.PrimaryPart then
-            return target.PrimaryPart.CFrame
-        end
-        -- Fall back to geometric centre
-        local ok, cf = pcall(function() return target:GetBoundingBox() end)
-        if ok then return cf end
-        return target:FindFirstChildOfClass("BasePart") and
-               target:FindFirstChildOfClass("BasePart").CFrame or CFrame.new()
-    end
-    return target.CFrame
-end
-
--- Helper: teleport to sell station and fire its interaction.
 local function doSellAtStation()
-    local part = findSellBoxPart()
-    if not part then
-        warnOnce("SellBox:not-found",
-            "Auto Sell Box: could not find 'Sell Card Boxes!' part in workspace.")
+    local station = findSellBoxPart()
+    if not station then
+        warnOnce("SellBox:no-station", "Sell station not found on your plot.")
         return false
     end
-    local target = part
-    if part:IsA("ProximityPrompt") or part:IsA("ClickDetector") then
-        target = part.Parent
+
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return false end
+
+    teleportNear(getCFrameOf(station))
+    task.wait(0.2)
+
+    if station:IsA("ProximityPrompt") or station:IsA("ClickDetector") then
+        local target = station.Parent
+        if not target then return false end
+        teleportNear(getCFrameOf(target))
+        task.wait(0.1)
+        if station:IsA("ProximityPrompt") then
+            return firePrompt(station)
+        elseif station:IsA("ClickDetector") then
+            return fireClickDetector(station)
+        end
     end
-    if not target then return false end
-    teleportNear(getCFrameOf(target))
-    task.wait(0.1)
-    if part:IsA("ProximityPrompt") then
-        return firePrompt(part)
-    elseif part:IsA("ClickDetector") then
-        return fireClickDetector(part)
-    end
-    local prompt = part:FindFirstChildOfClass("ProximityPrompt")
-                or part:FindFirstChild("ProximityPrompt", true)
+    local prompt = station:FindFirstChildOfClass("ProximityPrompt")
+                or station:FindFirstChild("ProximityPrompt", true)
     if prompt then return firePrompt(prompt) end
-    local click = part:FindFirstChildOfClass("ClickDetector")
-                or part:FindFirstChild("ClickDetector", true)
+    local click = station:FindFirstChildOfClass("ClickDetector")
+               or station:FindFirstChild("ClickDetector", true)
     if click then return fireClickDetector(click) end
-    return fireButton(part)
+    return fireButton(station)
 end
 
 -- Auto Carry + Auto Sell loop.
--- ONE box per interval so the delay slider is always respected:
---   1. Save position.
---   2. If a box is already equipped in the character, sell it first.
---   3. If a box is in the backpack, sell the first one (next cycle handles the rest).
---   4. Otherwise (AutoCarryBox): pick up ONE box from the player's own plot and sell it.
---   5. Teleport back.
 task.spawn(function()
     while true do
         task.wait(math.max(1, Config.AutoSellDelay))
         if not Config.AutoCarryBox and not Config.AutoSellBox then continue end
         if boxHandlingActive then continue end
 
-        -- Box interactions temporarily take priority over conveyor work.
         boxHandlingActive = true
 
         local char = player.Character
@@ -1590,7 +1632,6 @@ task.spawn(function()
             continue
         end
 
-        -- 1. Save position so we can return here at the end.
         local savedCFrame = root.CFrame
 
         local humanoid = char and char:FindFirstChildOfClass("Humanoid")
@@ -1599,7 +1640,6 @@ task.spawn(function()
             continue
         end
 
-        -- Helper: collect all box Tools currently in backpack.
         local function getBackpackBoxes()
             local boxes = {}
             local backpack = player:FindFirstChild("Backpack")
@@ -1616,7 +1656,6 @@ task.spawn(function()
                 and char:FindFirstChildOfClass("Tool") or nil
         end
 
-        -- Helper: equip one box and sell it, then unequip.
         local function equipAndSell(boxTool)
             pcall(function() humanoid:EquipTool(boxTool) end)
             task.wait(0.3)
@@ -1628,7 +1667,6 @@ task.spawn(function()
             task.wait(0.1)
         end
 
-        -- 2. If a box is already equipped in the character, sell it first.
         local charBox = getCharacterBox()
         if charBox then
             if Config.AutoSellBox then
@@ -1639,9 +1677,6 @@ task.spawn(function()
             task.wait(0.1)
         end
 
-        -- 3. Sell ONE box from backpack if any exist.
-        --    Remaining boxes are handled in subsequent cycles so the delay
-        --    is always honoured between each sell operation.
         local existingBoxes = getBackpackBoxes()
         if #existingBoxes > 0 then
             local boxTool = existingBoxes[1]
@@ -1650,7 +1685,6 @@ task.spawn(function()
             end
 
         elseif Config.AutoCarryBox then
-            -- 4. No backpack box → carry ONE box from the player's own plot.
             local carryInteraction = findOneCarryInteractionOnPlot()
             if carryInteraction then
                 local interactParent = carryInteraction.Parent
@@ -1665,7 +1699,6 @@ task.spawn(function()
                 end
                 task.wait(0.4)
 
-                -- Confirm the equip then sell.
                 local acquired = getCharacterBox()
                 if acquired then
                     if Config.AutoSellBox then
@@ -1675,7 +1708,6 @@ task.spawn(function()
                     pcall(function() humanoid:UnequipTools() end)
                     task.wait(0.1)
                 else
-                    -- Pickup may have landed in the backpack instead.
                     local newBoxes = getBackpackBoxes()
                     if #newBoxes > 0 then
                         local b = newBoxes[1]
@@ -1685,7 +1717,6 @@ task.spawn(function()
             end
         end
 
-        -- 5. Return to the original position.
         local r = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
         if r then pcall(function() r.CFrame = savedCFrame end) end
 
@@ -1694,12 +1725,6 @@ task.spawn(function()
 end)
 
 -- ── Card Slot helpers ────────────────────────────────────────
--- Slots are named CardSlot1–CardSlot30 inside the player's plot.
--- The first ten slots are direct children of Plot_N0. The remaining slots
--- are split across the two upper-floor containers used by the game:
--- TOP = CardSlot11..CardSlot20, TOP2 = CardSlot21..CardSlot30.
-
--- Forward declarations used before their definitions.
 local findSlotButton
 local slotIsOccupied
 local findCardSlot
@@ -1759,9 +1784,6 @@ task.spawn(function()
         local backpack = player:FindFirstChild("Backpack")
         if not backpack then continue end
 
-        -- Do not stack a second potion over an active one. The game exposes
-        -- active effects as attributes/ValueBases in different releases, so
-        -- check all replicated player/character effect containers.
         local active = nil
         local function inspect(container, excluded)
             if not container then return end
@@ -1806,8 +1828,6 @@ task.spawn(function()
             local allowed = selectionIncludes(selected, potion)
             if allowed and backpack:FindFirstChild(potion) then
                 if fireRemote("UseItem", potion) then
-                    -- Give the server time to replicate the active effect
-                    -- before the next poll can choose another potion.
                     task.wait(0.75)
                 end
                 break
@@ -1841,8 +1861,7 @@ task.spawn(function()
     end
 end)
 
--- Daily rewards use a separate remote and the client confirms the exact
--- action is simply "Claim" (the current day is selected server-side).
+-- Daily rewards
 task.spawn(function()
     if DailyRewardRE then
         pcall(function() DailyRewardRE:FireServer("RequestState") end)
@@ -1855,8 +1874,7 @@ task.spawn(function()
     end
 end)
 
--- Cash upgrades and boosts share UpgradesRE. The base upgrade id is confirmed
--- by the supplied client trace: UpgradesRE:FireServer("BuyCash", {Id="base"}).
+-- Auto Buy Boost
 task.spawn(function()
     while true do
         task.wait(3)
@@ -1895,9 +1913,6 @@ findCardSlot = function(plot, slotIndex)
     end
     local slot = container and container:FindFirstChild(name)
     if slot then return slot end
-
-    -- Keep a recursive fallback for older map revisions, but never use it
-    -- as the primary lookup because duplicate names can exist on the floors.
     return plot:FindFirstChild(name, true)
 end
 
@@ -1922,13 +1937,10 @@ local function getAllCardSlots()
     return slots
 end
 
--- Find a ClickDetector or ProximityPrompt for a named button
--- ("Place", "Remove", "Open") on or inside a slot model.
 findSlotButton = function(slotModel, buttonName)
     if not slotModel then return nil end
     local lname = string.lower(buttonName)
     for _, desc in ipairs(slotModel:GetDescendants()) do
-        -- Match by part/model name
         if string.find(string.lower(desc.Name), lname, 1, true) then
             local cd = desc:FindFirstChildOfClass("ClickDetector")
                     or desc:FindFirstChildOfClass("ProximityPrompt")
@@ -1937,7 +1949,6 @@ findSlotButton = function(slotModel, buttonName)
                 return desc
             end
         end
-        -- Match ProximityPrompt by ActionText / ObjectText
         if desc:IsA("ProximityPrompt") then
             local action = string.lower(desc.ActionText or "")
             local obj    = string.lower(desc.ObjectText or "")
@@ -1968,8 +1979,6 @@ local function findSlotInteraction(slotModel, names)
     return nil
 end
 
--- Returns true if a slot has a TextLabel/Button containing "skip"
--- (pack on cooldown — do not remove or place here).
 local function slotIsOnCooldown(slotModel)
     if not slotModel then return false end
     for _, desc in ipairs(slotModel:GetDescendants()) do
@@ -1982,7 +1991,6 @@ local function slotIsOnCooldown(slotModel)
     return false
 end
 
--- Returns true if a slot is occupied (has a Remove button).
 slotIsOccupied = function(slotModel)
     if findSlotButton(slotModel, "Remove") ~= nil then return true end
     for _, desc in ipairs(slotModel:GetDescendants()) do
@@ -2000,17 +2008,14 @@ slotIsOccupied = function(slotModel)
     return false
 end
 
--- Pack Tools in backpack that pass the current filter.
 local function getFilteredPacksInBackpack()
     local result = {}
     local backpack = player:FindFirstChild("Backpack")
     if not backpack then return result end
     for _, item in ipairs(backpack:GetChildren()) do
         if not item:IsA("Tool") then continue end
-        -- Skip box tools
         local handle = item:FindFirstChild("Handle")
         if handle and handle:FindFirstChild("Box") then continue end
-        -- Must look like a pack (name contains a known pack name)
         local lname = string.lower(item.Name)
         local isPack = false
         for _, packName in ipairs(PACKS) do
@@ -2019,7 +2024,6 @@ local function getFilteredPacksInBackpack()
             end
         end
         if not isPack then continue end
-        -- Apply filter (reuse same filter as Auto Buy)
         local info = {
             pack     = item.Name,
             rarity   = readBoxValue(item, { "Rarity", "rarity" }),
@@ -2032,8 +2036,6 @@ local function getFilteredPacksInBackpack()
     return result
 end
 
--- Read the card's currency value from the common replicated shapes used by
--- the game.  Attributes are fastest, then ValueBase descendants.
 local function getCardCurrencyValue(item)
     local attributeNames = {
         "CurrencyValue", "Currency", "Income", "CashPerSecond",
@@ -2068,8 +2070,6 @@ local function restoreCharacterPosition(savedCFrame)
     pcall(function()
         root.CFrame = savedCFrame
     end)
-    -- Re-apply once after the character settles so the teleport is not lost
-    -- when the game updates the root position on the same frame.
     task.wait(0.1)
     root = player.Character
         and player.Character:FindFirstChild("HumanoidRootPart")
@@ -2090,19 +2090,14 @@ local function getCardInfo(item)
     }
 end
 
--- Card Tools sorted by strongest mutation, then strongest rarity, then
--- highest currency value. MUTATIONS and RARITIES are ordered weakest to
--- strongest from top to bottom.
 local function getSortedCardsInBackpack()
     local result = {}
     local backpack = player:FindFirstChild("Backpack")
     if not backpack then return result end
     for _, item in ipairs(backpack:GetChildren()) do
         if not item:IsA("Tool") then continue end
-        -- Skip box tools
         local handle = item:FindFirstChild("Handle")
         if handle and handle:FindFirstChild("Box") then continue end
-        -- Skip pack tools
         local lname = string.lower(item.Name)
         local isPack = false
         for _, packName in ipairs(PACKS) do
@@ -2111,7 +2106,6 @@ local function getSortedCardsInBackpack()
             end
         end
         if isPack then continue end
-        -- Must have CardLevel to be a card
         if not item:FindFirstChild("CardLevel")
             and item:GetAttribute("CardLevel") == nil then
             continue
@@ -2164,8 +2158,6 @@ task.spawn(function()
 
             local pack = packs[1]
             pcall(function() humanoid:EquipTool(pack) end)
-            -- EquipTool is asynchronous. On slower/tablet clients the tool
-            -- may still be in Backpack when the place interaction is fired.
             for _ = 1, 12 do
                 if pack.Parent == char then break end
                 task.wait(0.1)
@@ -2177,8 +2169,6 @@ task.spawn(function()
                 fired = fireSlotButton(btn)
             end
 
-            -- Some revisions render the place control but handle it through
-            -- the slot remote instead of a detector/prompt.
             if not fired then
                 local slotIndex = getCardSlotIndex(slot)
                 local cardSlotRE = findRemote("CardSlotRE")
@@ -2232,9 +2222,7 @@ task.spawn(function()
     end
 end)
 
--- ── Equip Best Card (called by button) ───────────────────────
--- Removes all non-cooldown cards from slots, then places the highest-income
--- cards from backpack into the now-empty slots.
+-- ── Equip Best Card ───────────────────────────────────────────
 doEquipBestCards = function(slotLimit)
     local char     = player.Character
     local root     = char and char:FindFirstChild("HumanoidRootPart")
@@ -2243,7 +2231,6 @@ doEquipBestCards = function(slotLimit)
 
     local savedCFrame = root.CFrame
 
-    -- Step 1: remove all cards (skip cooldown slots).
     local slots = getAllCardSlots()
     for _, slot in ipairs(slots) do
         local slotIndex = getCardSlotIndex(slot)
@@ -2258,7 +2245,6 @@ doEquipBestCards = function(slotLimit)
     end
     task.wait(Config.CardActionDelay)
 
-    -- Step 2: place best cards into empty slots.
     local bestCards = getSortedCardsInBackpack()
     local cardIdx   = 1
     slots = getAllCardSlots()
@@ -2276,8 +2262,6 @@ doEquipBestCards = function(slotLimit)
         if placeBtn then
             fireSlotButton(placeBtn)
             task.wait(Config.CardActionDelay)
-            -- Confirm the slot updated before moving to the next card. A
-            -- second attempt handles the occasional delayed Place response.
             if not slotIsOccupied(slot) then
                 local retryPlaceBtn = findSlotButton(slot, "Place")
                 if retryPlaceBtn then
@@ -2293,34 +2277,34 @@ doEquipBestCards = function(slotLimit)
         task.wait(0.1)
     end
 
-    -- Return to original position.
     restoreCharacterPosition(savedCFrame)
     local placedCount = cardIdx - 1
     notify("Equip Best Card", "Done! Placed " .. placedCount .. " card(s).")
     return placedCount
 end
 
--- Remove cards from the player's plot slots. The first four slots are the
--- slots needed by the combat modes; the full button removes every card.
-removeAllCards = function(slotLimit)
-    local char = player.Character
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then return 0 end
+removeAllCards = function(limit)
+    local char     = player.Character
+    local root     = char and char:FindFirstChild("HumanoidRootPart")
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+    if not humanoid or not root then return 0 end
 
     local savedCFrame = root.CFrame
     local removed = 0
-    for _, slot in ipairs(getAllCardSlots()) do
+
+    local slots = getAllCardSlots()
+    for _, slot in ipairs(slots) do
         local slotIndex = getCardSlotIndex(slot)
         if not slotIndex then continue end
-        if slotLimit and slotIndex > slotLimit then continue end
+        if limit and slotIndex > limit then continue end
         if slotIsOnCooldown(slot) then continue end
         local removeBtn = findSlotButton(slot, "Remove")
         if not removeBtn then continue end
         teleportNear(getCFrameOf(slot))
         if fireSlotButton(removeBtn) then
-            removed += 1
-            task.wait(CARD_REMOVAL_DELAY)
+            removed = removed + 1
         end
+        task.wait(CARD_REMOVAL_DELAY)
     end
 
     restoreCharacterPosition(savedCFrame)
@@ -2363,8 +2347,6 @@ end
 
 clickGuiButton = function(button)
     if not button or not button:IsA("GuiButton") then return false end
-    -- Infinity Tower keeps its team controls mounted while the panel is
-    -- hidden.  Try the signal first so EQUIPEBEST still runs in that state.
     if firesignal then
         local ok = pcall(firesignal, button.MouseButton1Click)
         if ok then return true end
@@ -2384,8 +2366,6 @@ local function clickCombatButton(mode, names)
         end
     end
 
-    -- Wrapper names vary between game revisions. Search the complete GUI as
-    -- a fallback instead of silently skipping the tower team button.
     for _, name in ipairs(names) do
         local button = findGuiByName(playerGui, name)
         if button and clickGuiButton(button) then
@@ -2444,8 +2424,6 @@ local function getRaidDifficultyOptions()
     return options
 end
 
--- Keep the user-facing selector stable even if BossRaidConfig has not
--- replicated yet when this script starts.
 local raidDifficultyOptions = { "Easy", "Medium", "Hard", "Nightmare" }
 local raidDifficultySet = {}
 for _, difficulty in ipairs(raidDifficultyOptions) do
@@ -2467,9 +2445,6 @@ local function normalizeRaidDifficulties(value)
     return selected
 end
 
--- Sort the selected difficulties in the canonical order so the loop always
--- processes them Easy → Medium → Hard → Nightmare regardless of the order
--- even if the UI returns selections in the order they were clicked.
 local function getSelectedRaidDifficulties()
     local selected = normalizeRaidDifficulties(Config.RaidDifficulties)
     local selectedSet = {}
@@ -2517,8 +2492,6 @@ local function getRaidRequirement(difficulty)
     return nil
 end
 
--- The game config can change with updates, but these are the player-facing
--- per-card requirements requested for the four raid difficulties.
 local RAID_DIFFICULTY_INFO = {
     Easy = {
         damage = "1.3B",
@@ -2554,8 +2527,6 @@ end
 local function updateRaidInfoDisplay(difficulties)
     if not raidInfoParagraph or not raidInfoParagraph.Set then return end
 
-    -- Use the fixed difficulty order for the description even when the
-    -- multi-select values arrive in the order they were clicked.
     local selected = getSelectedRaidDifficulties()
 
     local lines = {}
@@ -2594,9 +2565,6 @@ if BossRaidRE then
             currentRaidBossId = tostring(payload.BossId or "")
         end
     end)
-    -- The game client requests this state once when its own UI loads. Request
-    -- it again so the difficulty helper also works when this script is loaded
-    -- after the Boss Raid GUI.
     pcall(function() BossRaidRE:FireServer("RequestState") end)
 end
 
@@ -2645,8 +2613,6 @@ local function isBossRaidOpen()
     if not text then return false end
 
     local normalized = string.lower(text)
-    -- The timer has two states: "Open in ..." while closed and "End in ..."
-    -- while the raid is available. Only the latter is allowed to start.
     return string.find(normalized, "end in", 1, true) ~= nil
 end
 
@@ -2667,9 +2633,6 @@ task.spawn(function()
 end)
 
 local function clickBackpackEquipBest()
-    -- Use the synchronous slot flow instead of only clicking the Backpack
-    -- button. This ensures all removals and placements finish before combat
-    -- starts, and doEquipBestCards restores the saved character position.
     return doEquipBestCards(4) ~= nil
 end
 
@@ -2695,9 +2658,6 @@ local function finishAutoRaidIfComplete()
 end
 
 local function waitForBossRaidConfirmation()
-    -- The server can set BossRaidInBattle shortly after the start click.
-    -- Wait for that confirmation before releasing the combat lock and
-    -- disabling the one-shot toggle.
     for _ = 1, 20 do
         if player:GetAttribute("BossRaidInBattle") == true then
             return true
@@ -2718,9 +2678,6 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     end
     if isCombatActive() then return false end
 
-    -- Infinity Tower's client uses EQUIPEBEST to populate its internal
-    -- four-card team. Always invoke it for Auto Infinity Tower, even if the
-    -- optional legacy equip toggle is off.
     if equipBest or mode == "InfinityTower" then
         local names = mode == "BossRaid"
             and { "EQUIPBEST", "EquipBest", "EQUIPEBEST" }
@@ -2762,15 +2719,11 @@ end
 
 local combatBusy = false
 
--- When the team-card cycle is enabled it owns combat starts, so the direct
--- mode loops stay idle and do not race it.
 task.spawn(function()
     while true do
         task.wait(1.5)
         if combatBusy or Config.AutoTeamCardCycle then continue end
         if not Config.AutoInfinityTower then continue end
-        -- Raid is always first when both modes are enabled and the raid is
-        -- open. Tower can run while waiting for the next raid window.
         if Config.AutoRaid and isBossRaidOpen() then
             continue
         end
@@ -2810,9 +2763,6 @@ task.spawn(function()
         if combatBusy or not Config.AutoTeamCardCycle then continue end
         if isCombatActive() then continue end
 
-        -- Do not touch the farming card slots unless a combat mode is
-        -- actually ready to start. In particular, a closed Boss Raid must
-        -- not repeatedly remove and re-equip cards.
         local combatMode
         if Config.AutoRaid and isBossRaidOpen() then
             combatMode = "BossRaid"
@@ -2844,7 +2794,7 @@ end)
 --  Rayfield Window
 -- ══════════════════════════════════════════════════════════════
 local Window = Rayfield:CreateWindow({
-    Name            = "Anime Card Farm",
+    Name            = "Anime Card Farm  |  " .. userRole,
     LoadingTitle    = "Anime Card Farm",
     LoadingSubtitle = "Loading...",
     ConfigurationSaving = {
@@ -2861,7 +2811,6 @@ local Window = Rayfield:CreateWindow({
 -- ══════════════════════════════════════════════════════════════
 local spawnTab = Window:CreateTab("📦 Auto Spawn Pack", 4483362458)
 
--- ── Spawn ────────────────────────────────────────────────────
 spawnTab:CreateSection("Spawn")
 
 spawnTab:CreateToggle({
@@ -2888,7 +2837,6 @@ spawnTab:CreateToggle({
     Callback     = function(v) Config.AutoStopSpawn = v end,
 })
 
--- ── Filters ──────────────────────────────────────────────────
 spawnTab:CreateSection("Filters")
 
 local packOptions = { "Any" }
@@ -2939,7 +2887,6 @@ spawnTab:CreateDropdown({
     end,
 })
 
--- ── Auto Buy ─────────────────────────────────────────────────
 spawnTab:CreateSection("Auto Buy Pack")
 
 spawnTab:CreateToggle({
@@ -2954,7 +2901,6 @@ spawnTab:CreateToggle({
 -- ══════════════════════════════════════════════════════════════
 local cardsTab = Window:CreateTab("⬆️ Cards", 4483362458)
 
--- ── Card Management (top) ─────────────────────────────────────
 cardsTab:CreateSection("Card Management")
 
 cardsTab:CreateToggle({
@@ -2996,7 +2942,6 @@ cardsTab:CreateSlider({
     Callback     = function(v) Config.CardActionDelay = math.max(0.5, v) end,
 })
 
--- ── Upgrade ───────────────────────────────────────────────────
 cardsTab:CreateSection("Upgrade")
 
 cardsTab:CreateToggle({
@@ -3261,8 +3206,16 @@ miscTab:CreateToggle({
 miscTab:CreateSection("Info")
 
 miscTab:CreateParagraph({
+    Title   = "License",
+    Content = "Role:    " .. userRole .. "\n"
+        .. "License: " .. licenseLabel,
+})
+
+miscTab:CreateParagraph({
     Title   = "Config Saving",
-    Content = "All settings save automatically.\nSaved to: workspace/AnimeCardFarm/Config.json\n\nPress [P] to hide/show the UI.",
+    Content = "All settings save automatically.\n"
+        .. "Saved to: workspace/AnimeCardFarm/Config.json\n\n"
+        .. "Press [P] to hide/show the UI.",
 })
 
 miscTab:CreateButton({
@@ -3274,4 +3227,4 @@ miscTab:CreateButton({
 
 -- ── Done ─────────────────────────────────────────────────────
 task.wait(1)
-notify("Anime Card Farm", "Loaded! Config auto-saves on every change.")
+notify("Anime Card Farm", "Loaded! (" .. userRole .. ")  Config auto-saves on every change.")
