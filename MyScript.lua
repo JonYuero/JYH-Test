@@ -672,7 +672,7 @@ local function normalizeFilterSelection(value)
 
     local function add(option)
         local normalized = normalizeFilterValue(option)
-        if normalized and normalized ~= "any" then
+        if normalized and normalized ~= "any" and normalized ~= "all" then
             selected[normalized] = true
         end
     end
@@ -810,23 +810,33 @@ local function getBoxInfo(box)
 end
 
 local function getItemId(container)
-    local value = readBoxValue(container, { "ItemId", "ItemID", "itemId" })
+    local value = readBoxValue(container, {
+        "ItemId", "ItemID", "itemId",
+        "PackId", "PackID", "packId",
+    })
     if value ~= nil then return tonumber(value) or value end
 
     local current = container.Parent
     for _ = 1, 6 do
         if not current or current == workspace then break end
         local parentValue = nil
-        for _, name in ipairs({ "ItemId", "ItemID", "itemId" }) do
+        for _, name in ipairs({
+            "ItemId", "ItemID", "itemId",
+            "PackId", "PackID", "packId",
+        }) do
             parentValue = current:GetAttribute(name)
             if parentValue ~= nil then break end
         end
         if parentValue == nil then
-            local child = current:FindFirstChild("ItemId")
-                       or current:FindFirstChild("ItemID")
-                       or current:FindFirstChild("itemId")
-            if child and child:IsA("ValueBase") then
-                parentValue = child.Value
+            for _, name in ipairs({
+                "ItemId", "ItemID", "itemId",
+                "PackId", "PackID", "packId",
+            }) do
+                local child = current:FindFirstChild(name)
+                if child and child:IsA("ValueBase") then
+                    parentValue = child.Value
+                    break
+                end
             end
         end
         if parentValue ~= nil then return tonumber(parentValue) or parentValue end
@@ -846,7 +856,9 @@ local function isPackContainer(container, info)
         return true
     end
 
-    return getItemId(container) ~= nil
+    local hasConveyorName = string.find(name, "conveyor", 1, true) ~= nil
+    return hasConveyorName
+        or getItemId(container) ~= nil
         or info and info.pack ~= nil
 end
 
@@ -970,7 +982,10 @@ local function hasConveyorAncestor(instance)
     for _ = 1, 10 do
         if not cur then break end
         local lname = string.lower(cur.Name)
-        if lname == "conveyor" or string.find(lname, "conveyor", 1, true) then
+        if lname == "conveyor"
+            or string.find(lname, "conveyor", 1, true)
+            or lname == "conveyorpacks"
+            or string.find(lname, "conveyorpacks", 1, true) then
             return true
         end
         cur = cur.Parent
@@ -983,17 +998,29 @@ local function isConveyorModel(model)
 end
 
 local function isLikelyPackModel(model)
-    if not isConveyorModel(model) then return false end
-    for _, n in ipairs({ "ItemId", "ItemID", "itemId" }) do
+    if not model or not model:IsA("Model") then return false end
+    local modelName = string.lower(model.Name)
+    local inConveyor = isConveyorModel(model)
+    local knownPackName = string.find(modelName, "pack", 1, true) ~= nil
+        or string.find(modelName, "box", 1, true) ~= nil
+    if not inConveyor and not knownPackName then return false end
+
+    for _, n in ipairs({
+        "ItemId", "ItemID", "itemId",
+        "PackId", "PackID", "packId",
+    }) do
         if model:GetAttribute(n) ~= nil then return true end
     end
     if model:FindFirstChildWhichIsA("ProximityPrompt", true) then return true end
     for _, child in ipairs(model:GetChildren()) do
-        if child:IsA("ValueBase") and string.lower(child.Name) == "itemid" then
-            return true
+        if child:IsA("ValueBase") then
+            local childName = string.lower(child.Name)
+            if childName == "itemid" or childName == "packid" then
+                return true
+            end
         end
     end
-    return isPackContainer(model, nil)
+    return knownPackName or isPackContainer(model, nil)
 end
 
 -- ── Buy prompt helpers ────────────────────────────────────────────────
@@ -1145,7 +1172,10 @@ tryBuyRecord = function(record)
                     .. "  pack=" .. tostring(record.info and record.info.pack), 0)
         end
         local ok, err = pcall(function()
-            ConveyorRE:FireServer("TryBuy", { ItemId = itemId })
+            ConveyorRE:FireServer("TryBuy", {
+                ItemId = itemId,
+                PackId  = itemId,
+            })
         end)
         if ok then
             succeeded = true
@@ -1226,7 +1256,10 @@ end
 -- ── ItemId event watcher ──────────────────────────────────────────────
 local function attachItemIdWatcher(record)
     local model = record.model
-    for _, attrName in ipairs({ "ItemId", "ItemID", "itemId" }) do
+    for _, attrName in ipairs({
+        "ItemId", "ItemID", "itemId",
+        "PackId", "PackID", "packId",
+    }) do
         trackConnection(record,
             model:GetAttributeChangedSignal(attrName):Connect(function()
                 local v = model:GetAttribute(attrName)
@@ -1245,7 +1278,8 @@ local function attachItemIdWatcher(record)
     trackConnection(record,
         model.ChildAdded:Connect(function(child)
             if not child:IsA("ValueBase") then return end
-            if string.lower(child.Name) ~= "itemid" then return end
+            local childName = string.lower(child.Name)
+            if childName ~= "itemid" and childName ~= "packid" then return end
             if record.itemId ~= nil then return end
             local v = child.Value
             if v ~= nil then
@@ -1320,6 +1354,8 @@ local function getLocalConveyorContainer()
     if not plot then return nil end
     local lc = plot:FindFirstChild("LocalConveyorModels")
     if lc then return lc end
+    local cp = plot:FindFirstChild("ConveyorPacks", true)
+    if cp then return cp end
     return plot:FindFirstChild("Conveyor", true)
         or plot:FindFirstChild("Conveyors", true)
 end
@@ -3212,6 +3248,8 @@ local function loadConfig(name, isAutoload)
         end
     end
 
+    -- Loaded filter values must invalidate the conveyor filter cache too.
+    markFilterCacheDirty()
     ConfigManager.IsLoading = false
 
     if not isAutoload then
@@ -3373,6 +3411,7 @@ Controls.SelectedPacks = spawnTab:CreateDropdown({
     Flag          = "FilterPack",
     Callback      = function(v)
         Config.SelectedPacks = type(v) == "table" and v or { v }
+        markFilterCacheDirty()
     end,
 })
 
@@ -3389,6 +3428,7 @@ Controls.SelectedRarities = spawnTab:CreateDropdown({
     Flag          = "RarityFilter",
     Callback      = function(v)
         Config.SelectedRarities = type(v) == "table" and v or { v }
+        markFilterCacheDirty()
     end,
 })
 
@@ -3405,6 +3445,7 @@ Controls.SelectedMutations = spawnTab:CreateDropdown({
     Flag          = "MutationFilter",
     Callback      = function(v)
         Config.SelectedMutations = type(v) == "table" and v or { v }
+        markFilterCacheDirty()
     end,
 })
 
