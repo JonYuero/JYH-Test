@@ -379,7 +379,6 @@ local Config = {
     AutoStopSpawn   = false,
     AutoBuyMatching   = false,
     AutoContinueSpawn = false,
-    AutoBuyDebug    = false,
     AutoCarryBox    = false,
     AutoSellBox     = false,
     AutoSellDelay   = 30,
@@ -1150,22 +1149,10 @@ warnOnce = function(key, message)
     warn("[ACF] " .. message)
 end
 
-local function autoBuyDebugInner(message)
-    -- Only builds strings when debug is enabled.
-    if Config.AutoBuyDebug then
-        warn("[ACF][AutoBuy] " .. tostring(message))
-    end
-end
+-- Debug logging removed; keep no-op stubs so call sites compile cleanly.
+local function autoBuyDebugInner() end
 debugAutoBuy = autoBuyDebugInner
-
-local function debugOnce(key, message, cooldown)
-    if not Config.AutoBuyDebug then return end
-    cooldown = cooldown or DEBUG_COOLDOWN
-    local now = os.clock()
-    if DebugCooldowns[key] and now - DebugCooldowns[key] < cooldown then return end
-    DebugCooldowns[key] = now
-    warn("[ACF][AutoBuy] " .. tostring(message))
-end
+local function debugOnce() end
 
 local function rebuildFilterCache()
     FilterCache.Rarities  = normalizeFilterSelection(Config.SelectedRarities)
@@ -1195,16 +1182,6 @@ end
 local function transitionState(record, newState, reason)
     if record.state == newState then return end
     record.state = newState
-    if Config.AutoBuyDebug then
-        debugOnce(
-            "state:" .. tostring(record.model) .. ":" .. newState,
-            "State → " .. newState
-                .. "  pack=" .. tostring(record.info and record.info.pack)
-                .. "  itemId=" .. tostring(record.itemId)
-                .. "  reason=" .. tostring(reason),
-            0
-        )
-    end
 end
 
 -- ── Conveyor topology checks ──────────────────────────────────────────
@@ -1588,27 +1565,11 @@ tryBuyRecord = function(record)
             return true
         end
 
-        if Config.AutoBuyDebug then
-            debugOnce("buy-prompt:" .. tostring(record.model),
-                "Firing ProximityPrompt  pack=" .. tostring(record.packName)
-                    .. "  rarity=" .. tostring(record.rarity)
-                    .. "  mutation=" .. tostring(record.mutation)
-                    .. "  price=" .. tostring(record.priceText)
-                    .. "  cash=" .. tostring(getPlayerCash()),
-                0)
-        end
-
-        local promptOk, promptErr = pcall(fireproximityprompt, prompt)
+        local promptOk, _ = pcall(fireproximityprompt, prompt)
         if promptOk then
             record.promptSent = true
-            debugOnce("prompt-fired:" .. tostring(record.model),
-                "ProximityPrompt fired  pack=" .. tostring(record.packName), 0)
             -- Confirmation comes from model removal or prompt becoming disabled.
             return true
-        else
-            debugOnce("prompt-fire-err:" .. tostring(record.model),
-                "fireproximityprompt failed: " .. tostring(promptErr)
-                    .. " — trying ConveyorRE fallback", 0)
         end
     end
 
@@ -1616,12 +1577,7 @@ tryBuyRecord = function(record)
     -- Only used when fireproximityprompt is unavailable or threw.
     local itemId = record.itemId
     if itemId ~= nil then
-        if Config.AutoBuyDebug then
-            debugOnce("buy-remote-fallback:" .. tostring(itemId),
-                "ConveyorRE fallback  ItemId=" .. tostring(itemId)
-                    .. "  pack=" .. tostring(record.packName), 0)
-        end
-        local ok, err = pcall(function()
+        local ok, _ = pcall(function()
             ConveyorRE:FireServer("TryBuy", { ItemId = itemId })
         end)
         if ok then
@@ -1629,8 +1585,6 @@ tryBuyRecord = function(record)
             return true
         else
             record.remoteFailed = true
-            debugOnce("remote-fallback-err:" .. tostring(record.model),
-                "ConveyorRE fallback failed: " .. tostring(err), 0)
         end
     end
 
@@ -1749,10 +1703,6 @@ local function attachItemIdWatcher(record)
 
         if freshId ~= nil then
             ItemIdIndex[freshId] = model
-            if Config.AutoBuyDebug then
-                debugOnce("itemid-change:" .. tostring(model),
-                    "ItemId updated: " .. tostring(freshId), 0)
-            end
         end
         evaluateRecordReadiness(record)
     end
@@ -1830,13 +1780,6 @@ local function registerPack(packModel)
     transitionState(record, "WaitingForMetadata", "registered")
     if itemId ~= nil then ItemIdIndex[itemId] = packModel end
 
-    if Config.AutoBuyDebug then
-        debugOnce("register:" .. tostring(packModel),
-            "Registered  pack=" .. tostring(info and info.pack)
-                .. "  rarity=" .. tostring(info and info.rarity)
-                .. "  ItemId=" .. tostring(itemId), 0)
-    end
-
     attachItemIdWatcher(record)
     attachPromptsOnPack(record)
 
@@ -1853,10 +1796,6 @@ local function registerPack(packModel)
     trackConnection(record,
         packModel.AncestryChanged:Connect(function()
             if not packModel:IsDescendantOf(workspace) then
-                if Config.AutoBuyDebug then
-                    autoBuyDebugInner("Pack removed  pack="
-                        .. tostring(record.info and record.info.pack))
-                end
                 if record.state == "Buying" or record.remoteSent or record.promptSent then
                     confirmBought(record, "model removed")
                 else
@@ -2146,21 +2085,16 @@ task.spawn(function()
                     if Config.AutoContinueSpawn and Config.AutoBuyMatching then
                         local watchedRecord = spawnedRecord
                         task.spawn(function()
-                            local didAttemptBuy = false
-                            for _ = 1, 50 do
-                                task.wait(0.1)
-                                if watchedRecord.state == "Buying" then
-                                    didAttemptBuy = true
-                                    break
-                                end
-                            end
-                            if not didAttemptBuy then
-                                autoStopHandled = false
-                                return
-                            end
-                            for _ = 1, 150 do
-                                task.wait(0.1)
-                                if not watchedRecord.model:IsDescendantOf(workspace) then
+                            -- Wait up to 30 s for a terminal outcome.
+                            -- We watch record.state instead of trying to catch
+                            -- the transient "Buying" state, which can be missed.
+                            local deadline = os.clock() + 30
+                            while os.clock() < deadline do
+                                task.wait(0.2)
+                                local st = watchedRecord.state
+                                if st == "BoughtAndRemove" or st == "Removed"
+                                    or not watchedRecord.model:IsDescendantOf(workspace) then
+                                    -- Pack was successfully purchased or left workspace.
                                     if Config.AutoContinueSpawn then
                                         Config.AutoSpawnPack = true
                                         pcall(function()
@@ -2177,8 +2111,13 @@ task.spawn(function()
                                     end
                                     autoStopHandled = false
                                     return
+                                elseif st == "FilterRejected" then
+                                    -- The pack didn't actually pass the filter; just unlock.
+                                    autoStopHandled = false
+                                    return
                                 end
                             end
+                            -- Timed out — always unlock so the loop can't get stuck.
                             autoStopHandled = false
                         end)
                     end
@@ -3637,7 +3576,6 @@ local function buildSerializableConfig()
         SpawnDelay        = Config.SpawnDelay,
         AutoStopSpawn     = Config.AutoStopSpawn,
         AutoBuyMatching   = Config.AutoBuyMatching,
-        AutoBuyDebug      = Config.AutoBuyDebug,
         AutoContinueSpawn = Config.AutoContinueSpawn,
         AutoCarryBox      = Config.AutoCarryBox,
         AutoSellBox       = Config.AutoSellBox,
@@ -3786,7 +3724,6 @@ local function loadConfig(name, isAutoload)
 
     local knownKeys = {
         "AutoSpawnPack", "SpawnDelay", "AutoStopSpawn", "AutoBuyMatching",
-        "AutoBuyDebug",
         "AutoCarryBox", "AutoSellBox", "AutoSellDelay",
         "SelectedRarities", "SelectedMutations", "SelectedPacks",
         "AutoUpgrade", "UpgradeDelay", "CardActionDelay", "AutoSell",
@@ -3954,13 +3891,6 @@ Controls.AutoBuyMatching = spawnTab:CreateToggle({
             reevaluateAutoBuy(true)
         end
     end,
-})
-
-Controls.AutoBuyDebug = spawnTab:CreateToggle({
-    Name         = "Auto Buy Debug Logs (Optional)",
-    CurrentValue = Config.AutoBuyDebug,
-    Flag         = "AutoBuyDebug",
-    Callback     = function(v) Config.AutoBuyDebug = v end,
 })
 
 Controls.AutoContinueSpawn = spawnTab:CreateToggle({
