@@ -403,7 +403,7 @@ local Config = {
     AutoSell          = false,
     AutoTraitRoll     = false,
     SelectedRankCards = { "All" },
-    TargetRank        = "UR",
+    TargetRank        = { "UR" },
     RankUseGems       = true,
     RankUseCash       = false,
     AutoRankRoll      = false,
@@ -3193,10 +3193,28 @@ local function getRankTargetOptions()
     return result
 end
 
-local function getRankTarget()
-    local target = tostring(Config.TargetRank or "")
-    if target == "" then return nil end
-    return target
+local function normalizeRankTargets(value)
+    local result = {}
+    local seen = {}
+
+    if type(value) ~= "table" then
+        value = value == nil and {} or { value }
+    end
+
+    for _, rank in ipairs(value) do
+        local normalized = tostring(rank or "")
+        if normalized ~= "" and not seen[normalized] then
+            seen[normalized] = true
+            table.insert(result, normalized)
+        end
+    end
+    return result
+end
+
+local function getRankTargets()
+    local targets = normalizeRankTargets(Config.TargetRank)
+    if #targets == 0 then return nil end
+    return targets
 end
 
 local function getRankCashCost(tool)
@@ -3248,8 +3266,12 @@ local function chooseRankCurrency(tool)
 end
 
 local function rankCardHasTarget(tool)
-    return tool and tostring(tool:GetAttribute("CardGrade") or "")
-        == tostring(getRankTarget() or "")
+    if not tool then return false end
+    local grade = tostring(tool:GetAttribute("CardGrade") or "")
+    for _, target in ipairs(getRankTargets() or {}) do
+        if grade == tostring(target) then return true end
+    end
+    return false
 end
 
 local function stopRankReroll(message)
@@ -3291,9 +3313,9 @@ task.spawn(function()
             continue
         end
 
-        local target = getRankTarget()
-        if not target then
-            stopRankReroll("Select a target ranking first.")
+        local targets = getRankTargets()
+        if not targets then
+            stopRankReroll("Select at least one target ranking first.")
             continue
         end
 
@@ -3368,7 +3390,9 @@ task.spawn(function()
         end
 
         if Config.AutoRankRoll and not cardsRemaining then
-            stopRankReroll("All selected cards reached " .. tostring(target) .. ".")
+            stopRankReroll(
+                "All selected cards reached " .. table.concat(targets, ", ") .. "."
+            )
         elseif Config.AutoRankRoll and not progressed then
             task.wait(0.75)
         end
@@ -4296,6 +4320,11 @@ local function loadConfig(name, isAutoload)
     for _, key in ipairs(knownKeys) do
         if data[key] ~= nil then
             local value = data[key]
+            if key == "TargetRank" then
+                -- Older configs stored one ranking as a string. Upgrade it
+                -- to the multi-select format when loading.
+                value = normalizeRankTargets(value)
+            end
             Config[key] = value
             local control = Controls[key]
             if control and control.Set then
@@ -4731,26 +4760,38 @@ rankCardDropdown = rerollTab:CreateDropdown({
 })
 
 local rankOptions = getRankTargetOptions()
-local configuredTargetRank = tostring(Config.TargetRank or "")
-local targetRankIsValid = false
+local validRankOptions = {}
 for _, rank in ipairs(rankOptions) do
-    if rank == configuredTargetRank then
-        targetRankIsValid = true
-        break
+    validRankOptions[tostring(rank)] = true
+end
+
+local configuredTargetRanks = normalizeRankTargets(Config.TargetRank)
+local validConfiguredTargets = {}
+for _, rank in ipairs(configuredTargetRanks) do
+    if validRankOptions[rank] then
+        table.insert(validConfiguredTargets, rank)
     end
 end
-if not targetRankIsValid then
-    Config.TargetRank = rankOptions[1] or "UR"
+if #validConfiguredTargets == 0 then
+    validConfiguredTargets = { rankOptions[1] or "UR" }
 end
+Config.TargetRank = validConfiguredTargets
+
 Controls.TargetRank = rerollTab:CreateDropdown({
     Name            = "Target Ranking",
     Options         = rankOptions,
     CurrentOption   = Config.TargetRank,
-    MultipleOptions = false,
+    MultipleOptions = true,
     Flag            = "TargetRank",
     Callback        = function(v)
-        if type(v) == "table" then v = v[1] end
-        Config.TargetRank = tostring(v or rankOptions[1] or "UR")
+        local selected = normalizeRankTargets(v)
+        local validSelected = {}
+        for _, rank in ipairs(selected) do
+            if validRankOptions[rank] then
+                table.insert(validSelected, rank)
+            end
+        end
+        Config.TargetRank = validSelected
     end,
 })
 
@@ -4786,7 +4827,7 @@ Controls.AutoRankRoll = rerollTab:CreateToggle({
 
 rerollTab:CreateParagraph({
     Title   = "Card Ranking behavior",
-    Content = "Selected cards are rerolled one at a time until they reach the target ranking. Gems are used first; cash is used only after gems reach zero.",
+    Content = "Selected cards are rerolled one at a time until they reach any selected target ranking. Gems are used first; cash is used only after gems reach zero.",
 })
 
 rerollTab:CreateSection("Traits")
