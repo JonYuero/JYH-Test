@@ -1,7 +1,6 @@
 -- ============================================================
 --  Anime Card Farm  –  Rayfield Edition
---  JonYueroHub  ·  Config auto-saves via Rayfield's built-in
---  ConfigurationSaving.
+--  JonYueroHub  ·  Config managed via custom Settings tab.
 --
 --  SECURITY NOTE
 --  This direct-execution check prevents simple bypasses such as
@@ -219,7 +218,7 @@ end
 --    • Rayfield now loads here (after validation) instead of at line 1.
 --    • The Rayfield window name includes the membership role.
 --    • The `notify` helper is defined early (before setPlotNumber).
---    • The Misc tab Info section shows the current membership status.
+--    • Rayfield built-in saving is disabled; the Settings tab handles it.
 -- ════════════════════════════════════════════════════════════════
 
 -- ── Load Rayfield ─────────────────────────────────────────────
@@ -418,6 +417,9 @@ local Config = {
     SelectedBoosts = {},
     AntiAfk    = true,
 }
+
+-- ── Controls table (Rayfield control references for config loading) ──
+local Controls = {}
 
 -- Playtime state is pushed by the game's client remote.
 local playtimeReadyRewards = {}
@@ -2791,16 +2793,293 @@ task.spawn(function()
 end)
 
 -- ══════════════════════════════════════════════════════════════
+--  Config Manager State & Helper Functions
+-- ══════════════════════════════════════════════════════════════
+local ConfigManager = {
+    ConfigName        = "",
+    SelectedConfig    = nil,
+    CurrentAutoload   = nil,
+    IsLoading         = false,
+    Dropdown          = nil,
+    AutoloadParagraph = nil,
+}
+
+local CONFIG_ROOT   = "JonYueroHub/AnimeCardFarm"
+local CONFIG_FOLDER = CONFIG_ROOT .. "/Configs"
+local AUTOLOAD_FILE = CONFIG_ROOT .. "/autoload.json"
+
+-- Check file system support
+local FS_SUPPORTED = (
+    type(makefolder) == "function" and
+    type(isfolder)   == "function" and
+    type(writefile)  == "function" and
+    type(readfile)   == "function" and
+    type(isfile)     == "function" and
+    type(listfiles)  == "function" and
+    type(delfile)    == "function"
+)
+
+local function sanitizeConfigName(name)
+    name = tostring(name)
+    name = name:gsub("^%s+", ""):gsub("%s+$", "")
+    name = name:gsub('[\\/:*?"<>|]', "_")
+    name = name:gsub("%.%.", "_")
+    name = name:gsub("^%.", ""):gsub("%.$", "")
+    if #name > 40 then name = name:sub(1, 40) end
+    return name
+end
+
+local function ensureConfigFolders()
+    if not FS_SUPPORTED then return false end
+    pcall(function()
+        if not isfolder(CONFIG_ROOT)   then makefolder(CONFIG_ROOT)   end
+        if not isfolder(CONFIG_FOLDER) then makefolder(CONFIG_FOLDER) end
+    end)
+    return true
+end
+
+local function buildSerializableConfig()
+    return {
+        AutoSpawnPack     = Config.AutoSpawnPack,
+        SpawnDelay        = Config.SpawnDelay,
+        AutoStopSpawn     = Config.AutoStopSpawn,
+        AutoBuyMatching   = Config.AutoBuyMatching,
+        AutoCarryBox      = Config.AutoCarryBox,
+        AutoSellBox       = Config.AutoSellBox,
+        AutoSellDelay     = Config.AutoSellDelay,
+        SelectedRarities  = Config.SelectedRarities,
+        SelectedMutations = Config.SelectedMutations,
+        SelectedPacks     = Config.SelectedPacks,
+        AutoUpgrade       = Config.AutoUpgrade,
+        UpgradeDelay      = Config.UpgradeDelay,
+        CardActionDelay   = Config.CardActionDelay,
+        AutoSell          = Config.AutoSell,
+        AutoTraitRoll     = Config.AutoTraitRoll,
+        AutoClaimPlaytime = Config.AutoClaimPlaytime,
+        AutoClaimDaily    = Config.AutoClaimDaily,
+        AutoPlacePack     = Config.AutoPlacePack,
+        AutoOpenPack      = Config.AutoOpenPack,
+        AutoBuyBoost      = Config.AutoBuyBoost,
+        AutoInfinityEquip = Config.AutoInfinityEquip,
+        AutoInfinityTower = Config.AutoInfinityTower,
+        AutoInfinityHide  = Config.AutoInfinityHide,
+        RaidDifficulties  = Config.RaidDifficulties,
+        AutoRaidEquip     = Config.AutoRaidEquip,
+        AutoRaid          = Config.AutoRaid,
+        AutoRaidHide      = Config.AutoRaidHide,
+        AutoTeamCardCycle = Config.AutoTeamCardCycle,
+        AutoPotion        = Config.AutoPotion,
+        SelectedPotions   = Config.SelectedPotions,
+        SelectedBoosts    = Config.SelectedBoosts,
+        AntiAfk           = Config.AntiAfk,
+    }
+end
+
+local function saveConfig(name)
+    if not FS_SUPPORTED then
+        Rayfield:Notify({
+            Title    = "Unsupported Executor",
+            Content  = "File storage is unavailable in this executor.",
+            Duration = 5,
+        })
+        return false
+    end
+    ensureConfigFolders()
+    local filePath = CONFIG_FOLDER .. "/" .. name .. ".json"
+    local data = buildSerializableConfig()
+    local HttpService = game:GetService("HttpService")
+    local ok, encoded = pcall(HttpService.JSONEncode, HttpService, data)
+    if not ok then return false end
+    pcall(writefile, filePath, encoded)
+    return true
+end
+
+local function normalizeLoadedSelection(value)
+    if type(value) == "table" then return value end
+    if value == nil then return {} end
+    return { tostring(value) }
+end
+
+local function getAutoload()
+    if not FS_SUPPORTED then return nil end
+    if not isfile(AUTOLOAD_FILE) then return nil end
+    local ok, raw = pcall(readfile, AUTOLOAD_FILE)
+    if not ok or not raw or raw == "" then return nil end
+    local HttpService = game:GetService("HttpService")
+    local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not ok2 or type(data) ~= "table" then return nil end
+    local configName = data.config
+    if type(configName) ~= "string" or configName == "" then return nil end
+    return configName
+end
+
+local function refreshConfigList()
+    if not FS_SUPPORTED then return end
+    ensureConfigFolders()
+    local files = {}
+    pcall(function()
+        files = listfiles(CONFIG_FOLDER) or {}
+    end)
+    local names = {}
+    for _, filePath in ipairs(files) do
+        local name = tostring(filePath):match("([^/\\]+)%.json$")
+        if name then table.insert(names, name) end
+    end
+    table.sort(names)
+
+    if ConfigManager.Dropdown then
+        local current = ConfigManager.SelectedConfig
+        pcall(function()
+            ConfigManager.Dropdown:Set(names)
+        end)
+        -- If current selection no longer exists, clear it
+        if current then
+            local found = false
+            for _, n in ipairs(names) do
+                if n == current then found = true ; break end
+            end
+            if not found then
+                ConfigManager.SelectedConfig = nil
+            end
+        end
+    end
+end
+
+local function loadConfig(name, isAutoload)
+    if not FS_SUPPORTED then return false end
+    if not name or name == "" then return false end
+    local filePath = CONFIG_FOLDER .. "/" .. name .. ".json"
+    if not isfile(filePath) then
+        if not isAutoload then
+            Rayfield:Notify({
+                Title    = "Configuration Not Found",
+                Content  = name .. " does not exist.",
+                Duration = 4,
+            })
+        end
+        return false
+    end
+    local ok, raw = pcall(readfile, filePath)
+    if not ok or not raw or raw == "" then return false end
+    local HttpService = game:GetService("HttpService")
+    local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not ok2 or type(data) ~= "table" then return false end
+
+    ConfigManager.IsLoading = true
+
+    local knownKeys = {
+        "AutoSpawnPack", "SpawnDelay", "AutoStopSpawn", "AutoBuyMatching",
+        "AutoCarryBox", "AutoSellBox", "AutoSellDelay",
+        "SelectedRarities", "SelectedMutations", "SelectedPacks",
+        "AutoUpgrade", "UpgradeDelay", "CardActionDelay", "AutoSell",
+        "AutoTraitRoll", "AutoClaimPlaytime", "AutoClaimDaily",
+        "AutoPlacePack", "AutoOpenPack", "AutoBuyBoost",
+        "AutoInfinityEquip", "AutoInfinityTower", "AutoInfinityHide",
+        "RaidDifficulties", "AutoRaidEquip", "AutoRaid", "AutoRaidHide",
+        "AutoTeamCardCycle", "AutoPotion", "SelectedPotions",
+        "SelectedBoosts", "AntiAfk",
+    }
+
+    for _, key in ipairs(knownKeys) do
+        if data[key] ~= nil then
+            local value = data[key]
+            Config[key] = value
+            local control = Controls[key]
+            if control and control.Set then
+                pcall(function() control:Set(value) end)
+            end
+        end
+    end
+
+    ConfigManager.IsLoading = false
+
+    if not isAutoload then
+        Rayfield:Notify({
+            Title    = "Configuration Loaded",
+            Content  = name .. " was loaded successfully.",
+            Duration = 4,
+        })
+    end
+    return true
+end
+
+local function deleteConfig(name)
+    if not FS_SUPPORTED then return false end
+    if not name or name == "" then return false end
+    local filePath = CONFIG_FOLDER .. "/" .. name .. ".json"
+    if not isfile(filePath) then return false end
+    pcall(delfile, filePath)
+
+    local currentAutoload = getAutoload()
+    if currentAutoload == name then
+        pcall(function()
+            if isfile(AUTOLOAD_FILE) then
+                delfile(AUTOLOAD_FILE)
+            end
+        end)
+        ConfigManager.CurrentAutoload = nil
+        if ConfigManager.AutoloadParagraph then
+            pcall(function()
+                ConfigManager.AutoloadParagraph:Set({
+                    Title   = "Current Autoload",
+                    Content = "None",
+                })
+            end)
+        end
+    end
+    return true
+end
+
+local function setAutoload(name)
+    if not FS_SUPPORTED then return false end
+    if not name or name == "" then return false end
+    local filePath = CONFIG_FOLDER .. "/" .. name .. ".json"
+    if not isfile(filePath) then return false end
+    ensureConfigFolders()
+    local HttpService = game:GetService("HttpService")
+    local ok, encoded = pcall(HttpService.JSONEncode, HttpService, { config = name })
+    if not ok then return false end
+    pcall(writefile, AUTOLOAD_FILE, encoded)
+    ConfigManager.CurrentAutoload = name
+    if ConfigManager.AutoloadParagraph then
+        pcall(function()
+            ConfigManager.AutoloadParagraph:Set({
+                Title   = "Current Autoload",
+                Content = name,
+            })
+        end)
+    end
+    return true
+end
+
+local function resetAutoload()
+    if not FS_SUPPORTED then return end
+    pcall(function()
+        if isfile(AUTOLOAD_FILE) then
+            delfile(AUTOLOAD_FILE)
+        end
+    end)
+    ConfigManager.CurrentAutoload = nil
+    if ConfigManager.AutoloadParagraph then
+        pcall(function()
+            ConfigManager.AutoloadParagraph:Set({
+                Title   = "Current Autoload",
+                Content = "None",
+            })
+        end)
+    end
+end
+
+-- ══════════════════════════════════════════════════════════════
 --  Rayfield Window
 -- ══════════════════════════════════════════════════════════════
 local Window = Rayfield:CreateWindow({
     Name            = "Anime Card Farm  |  " .. userRole,
     LoadingTitle    = "Anime Card Farm",
     LoadingSubtitle = "Loading...",
+    Icon            = 0,
     ConfigurationSaving = {
-        Enabled    = true,
-        FolderName = "AnimeCardFarm",
-        FileName   = "Config",
+        Enabled = false,
     },
     Discord   = { Enabled = false },
     KeySystem = false,
@@ -2809,18 +3088,18 @@ local Window = Rayfield:CreateWindow({
 -- ══════════════════════════════════════════════════════════════
 --  TAB 1 – Auto Spawn Pack
 -- ══════════════════════════════════════════════════════════════
-local spawnTab = Window:CreateTab("📦 Auto Spawn Pack", 4483362458)
+local spawnTab = Window:CreateTab("🃏 Auto Spawn Pack", 4483362458)
 
 spawnTab:CreateSection("Spawn")
 
-spawnTab:CreateToggle({
+Controls.AutoSpawnPack = spawnTab:CreateToggle({
     Name         = "Auto Spawn Pack",
     CurrentValue = Config.AutoSpawnPack,
     Flag         = "AutoSpawnPack",
     Callback     = function(v) Config.AutoSpawnPack = v end,
 })
 
-spawnTab:CreateSlider({
+Controls.SpawnDelay = spawnTab:CreateSlider({
     Name         = "How Fast to Spawn (s)",
     Range        = { 0.05, 10 },
     Increment    = 0.05,
@@ -2830,7 +3109,7 @@ spawnTab:CreateSlider({
     Callback     = function(v) Config.SpawnDelay = v end,
 })
 
-spawnTab:CreateToggle({
+Controls.AutoStopSpawn = spawnTab:CreateToggle({
     Name         = "Auto Stop Spawn (on Filter Match)",
     CurrentValue = Config.AutoStopSpawn,
     Flag         = "AutoStopSpawn",
@@ -2842,7 +3121,7 @@ spawnTab:CreateSection("Filters")
 local packOptions = { "Any" }
 for _, p in ipairs(PACKS) do table.insert(packOptions, p) end
 
-spawnTab:CreateDropdown({
+Controls.SelectedPacks = spawnTab:CreateDropdown({
     Name          = "Pack",
     Options       = packOptions,
     CurrentOption = #Config.SelectedPacks > 0
@@ -2858,7 +3137,7 @@ spawnTab:CreateDropdown({
 local rarityOptions = { "Any" }
 for _, rarity in ipairs(RARITIES) do table.insert(rarityOptions, rarity) end
 
-spawnTab:CreateDropdown({
+Controls.SelectedRarities = spawnTab:CreateDropdown({
     Name          = "Rarity",
     Options       = rarityOptions,
     CurrentOption = #Config.SelectedRarities > 0
@@ -2874,7 +3153,7 @@ spawnTab:CreateDropdown({
 local mutationOptions = { "Any" }
 for _, mutation in ipairs(MUTATIONS) do table.insert(mutationOptions, mutation) end
 
-spawnTab:CreateDropdown({
+Controls.SelectedMutations = spawnTab:CreateDropdown({
     Name          = "Mutation",
     Options       = mutationOptions,
     CurrentOption = #Config.SelectedMutations > 0
@@ -2889,7 +3168,7 @@ spawnTab:CreateDropdown({
 
 spawnTab:CreateSection("Auto Buy Pack")
 
-spawnTab:CreateToggle({
+Controls.AutoBuyMatching = spawnTab:CreateToggle({
     Name         = "Auto Buy Pack (Using Filter)",
     CurrentValue = Config.AutoBuyMatching,
     Flag         = "AutoBuyMatching",
@@ -2944,14 +3223,14 @@ cardsTab:CreateSlider({
 
 cardsTab:CreateSection("Upgrade")
 
-cardsTab:CreateToggle({
+Controls.AutoUpgrade = cardsTab:CreateToggle({
     Name         = "Auto Upgrade Cards",
     CurrentValue = Config.AutoUpgrade,
     Flag         = "AutoUpgrade",
     Callback     = function(v) Config.AutoUpgrade = v end,
 })
 
-cardsTab:CreateSlider({
+Controls.UpgradeDelay = cardsTab:CreateSlider({
     Name         = "Upgrade Delay (s)",
     Range        = { 0, 5 },
     Increment    = 0.05,
@@ -2968,21 +3247,21 @@ local autoSellTab = Window:CreateTab("📦 Auto Sell", 4483362458)
 
 autoSellTab:CreateSection("Box Handling")
 
-autoSellTab:CreateToggle({
+Controls.AutoCarryBox = autoSellTab:CreateToggle({
     Name         = "Auto Carry Box",
     CurrentValue = Config.AutoCarryBox,
     Flag         = "AutoCarryBox",
     Callback     = function(v) Config.AutoCarryBox = v end,
 })
 
-autoSellTab:CreateToggle({
+Controls.AutoSellBox = autoSellTab:CreateToggle({
     Name         = "Auto Sell Box",
     CurrentValue = Config.AutoSellBox,
     Flag         = "AutoSellBox",
     Callback     = function(v) Config.AutoSellBox = v end,
 })
 
-autoSellTab:CreateSlider({
+Controls.AutoSellDelay = autoSellTab:CreateSlider({
     Name         = "Carry & Sell Interval (s)",
     Range        = { 1, 60 },
     Increment    = 1,
@@ -3015,7 +3294,7 @@ combatTab:CreateToggle({
     Callback     = function(v) Config.AutoInfinityEquip = v end,
 })
 
-combatTab:CreateToggle({
+Controls.AutoInfinityTower = combatTab:CreateToggle({
     Name         = "Auto Infinity Tower",
     CurrentValue = Config.AutoInfinityTower,
     Flag         = "AutoInfinityTower",
@@ -3037,7 +3316,7 @@ raidInfoParagraph = combatTab:CreateParagraph({
 })
 updateRaidInfoDisplay(Config.RaidDifficulties)
 
-combatTab:CreateDropdown({
+Controls.RaidDifficulties = combatTab:CreateDropdown({
     Name          = "Select Difficulty",
     Options       = raidDifficultyOptions,
     CurrentOption = Config.RaidDifficulties,
@@ -3061,7 +3340,7 @@ combatTab:CreateToggle({
     Callback     = function(v) Config.AutoRaidEquip = v end,
 })
 
-combatTab:CreateToggle({
+Controls.AutoRaid = combatTab:CreateToggle({
     Name         = "Auto Boss Raid",
     CurrentValue = Config.AutoRaid,
     Flag         = "AutoRaid",
@@ -3101,7 +3380,7 @@ local rerollTab = Window:CreateTab("🔄 Reroll", 4483362458)
 
 rerollTab:CreateSection("Traits")
 
-rerollTab:CreateToggle({
+Controls.AutoTraitRoll = rerollTab:CreateToggle({
     Name         = "Auto Trait Roll",
     CurrentValue = Config.AutoTraitRoll,
     Flag         = "AutoTraitRoll",
@@ -3109,7 +3388,7 @@ rerollTab:CreateToggle({
 })
 
 -- ══════════════════════════════════════════════════════════════
---  TAB 6 – Misc (last)
+--  TAB 6 – Misc
 -- ══════════════════════════════════════════════════════════════
 local miscTab = Window:CreateTab("🧪 Misc", 4483362458)
 
@@ -3120,7 +3399,7 @@ for _, potion in ipairs(POTIONS) do
     table.insert(potionOptions, potion)
 end
 
-miscTab:CreateDropdown({
+Controls.SelectedPotions = miscTab:CreateDropdown({
     Name            = "Owned Potions",
     Options         = potionOptions,
     CurrentOption   = collapseFullSelection(Config.SelectedPotions, POTIONS),
@@ -3131,7 +3410,7 @@ miscTab:CreateDropdown({
     end,
 })
 
-miscTab:CreateToggle({
+Controls.AutoPotion = miscTab:CreateToggle({
     Name         = "Auto Use Potions",
     CurrentValue = Config.AutoPotion,
     Flag         = "AutoPotion",
@@ -3151,7 +3430,7 @@ for _, boost in ipairs(BOOSTS) do
     table.insert(boostOptions, boost.label)
 end
 
-miscTab:CreateDropdown({
+Controls.SelectedBoosts = miscTab:CreateDropdown({
     Name            = "Boosts to Buy",
     Options         = boostOptions,
     CurrentOption   = collapseFullSelection(Config.SelectedBoosts, {
@@ -3180,7 +3459,7 @@ miscTab:CreateParagraph({
 
 miscTab:CreateSection("Anti-AFK")
 
-miscTab:CreateToggle({
+Controls.AntiAfk = miscTab:CreateToggle({
     Name         = "Anti-AFK",
     CurrentValue = Config.AntiAfk,
     Flag         = "AntiAfk",
@@ -3203,28 +3482,196 @@ miscTab:CreateToggle({
     Callback     = function(v) Config.AutoClaimDaily = v end,
 })
 
-miscTab:CreateSection("Info")
+-- ══════════════════════════════════════════════════════════════
+--  TAB 7 – Settings
+-- ══════════════════════════════════════════════════════════════
+local settingsTab = Window:CreateTab("Settings", 4483362458)
 
-miscTab:CreateParagraph({
-    Title   = "License",
-    Content = "Role:    " .. userRole .. "\n"
-        .. "License: " .. licenseLabel,
-})
+settingsTab:CreateSection("Configuration Manager")
 
-miscTab:CreateParagraph({
-    Title   = "Config Saving",
-    Content = "All settings save automatically.\n"
-        .. "Saved to: workspace/AnimeCardFarm/Config.json\n\n"
-        .. "Press [P] to hide/show the UI.",
-})
-
-miscTab:CreateButton({
-    Name     = "Test Notify",
-    Callback = function()
-        notify("Anime Card Farm", "Script is running!")
+-- Config Name input
+settingsTab:CreateInput({
+    Name                     = "Config Name",
+    PlaceholderText          = "Enter configuration name...",
+    RemoveTextAfterFocusLost = false,
+    Flag                     = "ConfigManagerName",
+    Callback                 = function(v)
+        v = tostring(v):gsub("^%s+", ""):gsub("%s+$", "")
+        ConfigManager.ConfigName = v
     end,
 })
 
+-- Save button
+settingsTab:CreateButton({
+    Name     = "Save",
+    Callback = function()
+        local rawName = ConfigManager.ConfigName or ""
+        rawName = rawName:gsub("^%s+", ""):gsub("%s+$", "")
+        local name = sanitizeConfigName(rawName)
+        if name == "" then
+            Rayfield:Notify({
+                Title    = "Invalid Name",
+                Content  = "Enter a valid configuration name.",
+                Duration = 4,
+            })
+            return
+        end
+        if not FS_SUPPORTED then
+            Rayfield:Notify({
+                Title    = "Unsupported Executor",
+                Content  = "File storage is unavailable in this executor.",
+                Duration = 5,
+            })
+            return
+        end
+        if saveConfig(name) then
+            refreshConfigList()
+            ConfigManager.SelectedConfig = name
+            Rayfield:Notify({
+                Title    = "Configuration Saved",
+                Content  = name .. " was saved successfully.",
+                Duration = 4,
+            })
+        end
+    end,
+})
+
+-- Saved Configurations dropdown
+ConfigManager.Dropdown = settingsTab:CreateDropdown({
+    Name            = "Saved Configurations",
+    Options         = {},
+    CurrentOption   = {},
+    MultipleOptions = false,
+    Flag            = "ConfigManagerSelected",
+    Callback        = function(v)
+        ConfigManager.SelectedConfig = v
+    end,
+})
+
+-- Load button
+settingsTab:CreateButton({
+    Name     = "Load",
+    Callback = function()
+        local name = ConfigManager.SelectedConfig
+        if not name or name == "" then
+            Rayfield:Notify({
+                Title    = "No Configuration Selected",
+                Content  = "Select a saved configuration first.",
+                Duration = 4,
+            })
+            return
+        end
+        loadConfig(name, false)
+    end,
+})
+
+-- Delete button
+settingsTab:CreateButton({
+    Name     = "Delete",
+    Callback = function()
+        local name = ConfigManager.SelectedConfig
+        if not name or name == "" then
+            Rayfield:Notify({
+                Title    = "No Configuration Selected",
+                Content  = "Select a saved configuration first.",
+                Duration = 4,
+            })
+            return
+        end
+        if deleteConfig(name) then
+            local deletedName = name
+            ConfigManager.SelectedConfig = nil
+            refreshConfigList()
+            Rayfield:Notify({
+                Title    = "Configuration Deleted",
+                Content  = deletedName .. " was deleted.",
+                Duration = 4,
+            })
+        end
+    end,
+})
+
+-- Set as Autoload button
+settingsTab:CreateButton({
+    Name     = "Set as Autoload",
+    Callback = function()
+        local name = ConfigManager.SelectedConfig
+        if not name or name == "" then
+            Rayfield:Notify({
+                Title    = "No Configuration Selected",
+                Content  = "Select a saved configuration first.",
+                Duration = 4,
+            })
+            return
+        end
+        if not FS_SUPPORTED then
+            Rayfield:Notify({
+                Title    = "Unsupported Executor",
+                Content  = "File storage is unavailable in this executor.",
+                Duration = 5,
+            })
+            return
+        end
+        if setAutoload(name) then
+            Rayfield:Notify({
+                Title    = "Autoload Enabled",
+                Content  = name .. " will load automatically.",
+                Duration = 4,
+            })
+        end
+    end,
+})
+
+-- Reset Autoload button
+settingsTab:CreateButton({
+    Name     = "Reset Autoload",
+    Callback = function()
+        resetAutoload()
+        Rayfield:Notify({
+            Title    = "Autoload Reset",
+            Content  = "No configuration will load automatically.",
+            Duration = 4,
+        })
+    end,
+})
+
+-- Current Autoload paragraph
+ConfigManager.AutoloadParagraph = settingsTab:CreateParagraph({
+    Title   = "Current Autoload",
+    Content = "None",
+})
+
+-- ── Post-UI startup: refresh config list and run autoload ─────
+task.spawn(function()
+    if not FS_SUPPORTED then
+        Rayfield:Notify({
+            Title    = "Unsupported Executor",
+            Content  = "File storage is unavailable. Config saving is disabled.",
+            Duration = 6,
+        })
+        return
+    end
+
+    refreshConfigList()
+
+    local autoloadName = getAutoload()
+    if autoloadName and autoloadName ~= "" then
+        ConfigManager.CurrentAutoload = autoloadName
+        if ConfigManager.AutoloadParagraph then
+            pcall(function()
+                ConfigManager.AutoloadParagraph:Set({
+                    Title   = "Current Autoload",
+                    Content = autoloadName,
+                })
+            end)
+        end
+        task.wait(1)
+        if loadConfig(autoloadName, true) then
+            notify("Configuration Loaded", autoloadName .. " loaded automatically.")
+        end
+    end
+end)
+
 -- ── Done ─────────────────────────────────────────────────────
 task.wait(1)
-notify("Anime Card Farm", "Loaded! (" .. userRole .. ")  Config auto-saves on every change.")
+notify("Anime Card Farm", "Loaded! (" .. userRole .. ")")
