@@ -813,17 +813,18 @@ end
 local function getItemId(container)
     local value = readBoxValue(container, {
         "ItemId", "ItemID", "itemId",
-        "PackId", "PackID", "packId",
     })
     if value ~= nil then return tonumber(value) or value end
 
     local current = container.Parent
     for _ = 1, 6 do
         if not current or current == workspace then break end
+        -- The reference pack objects can expose ItemId on a holder above
+        -- the visible model. Only inspect that holder itself here: scanning
+        -- all descendants of an ancestor could borrow a sibling pack's ID.
         local parentValue = nil
         for _, name in ipairs({
             "ItemId", "ItemID", "itemId",
-            "PackId", "PackID", "packId",
         }) do
             parentValue = current:GetAttribute(name)
             if parentValue ~= nil then break end
@@ -831,7 +832,6 @@ local function getItemId(container)
         if parentValue == nil then
             for _, name in ipairs({
                 "ItemId", "ItemID", "itemId",
-                "PackId", "PackID", "packId",
             }) do
                 local child = current:FindFirstChild(name)
                 if child and child:IsA("ValueBase") then
@@ -847,6 +847,22 @@ local function getItemId(container)
     return nil
 end
 
+local function getPackId(container)
+    if not container then return nil end
+    local value = readBoxValue(container, {
+        "PackId", "PackID", "packId",
+    })
+    if value ~= nil then return tonumber(value) or value end
+    return nil
+end
+
+-- PackId is useful for recognizing a conveyor object, but the purchase
+-- endpoint uses ItemId. Keep it separate so PackId can never be sent as
+-- ItemId by mistake.
+local function hasPackId(container)
+    return getPackId(container) ~= nil
+end
+
 local function isPackContainer(container, info)
     if not container then return false end
 
@@ -860,6 +876,7 @@ local function isPackContainer(container, info)
     local hasConveyorName = string.find(name, "conveyor", 1, true) ~= nil
     return hasConveyorName
         or getItemId(container) ~= nil
+        or hasPackId(container)
         or info and info.pack ~= nil
 end
 
@@ -989,6 +1006,13 @@ local function hasConveyorAncestor(instance)
             or string.find(lname, "conveyorpacks", 1, true) then
             return true
         end
+        -- Some versions keep the live objects below LocalConveyorModels
+        -- or PackAtB without naming the intermediate model "Conveyor".
+        if lname == "localconveyormodels"
+            or string.find(lname, "localconveyor", 1, true)
+            or lname == "packatb" then
+            return true
+        end
         cur = cur.Parent
     end
     return false
@@ -1008,10 +1032,10 @@ local function isLikelyPackModel(model)
 
     for _, n in ipairs({
         "ItemId", "ItemID", "itemId",
-        "PackId", "PackID", "packId",
     }) do
         if model:GetAttribute(n) ~= nil then return true end
     end
+    if hasPackId(model) then return true end
     if model:FindFirstChildWhichIsA("ProximityPrompt", true) then return true end
     for _, child in ipairs(model:GetChildren()) do
         if child:IsA("ValueBase") then
@@ -1021,7 +1045,13 @@ local function isLikelyPackModel(model)
             end
         end
     end
-    return knownPackName or isPackContainer(model, nil)
+    -- Do not treat every model named "Box" in the entire workspace as a
+    -- conveyor purchase candidate. When the scan falls back to workspace,
+    -- require conveyor topology or one of the identifiers used by the
+    -- reference implementation.
+    return inConveyor
+        or getItemId(model) ~= nil
+        or hasPackId(model)
 end
 
 -- ── Buy prompt helpers ────────────────────────────────────────────────
@@ -1092,15 +1122,19 @@ refreshRecordMetadata = function(record, force)
     end
     record.lastMetadataRefresh = now
     record.info = getBoxInfo(record.model)
-    if record.itemId == nil then
-        local freshId = getItemId(record.model)
+    local freshId = getItemId(record.model)
+    if freshId ~= record.itemId then
+        local oldId = record.itemId
+        if oldId ~= nil and ItemIdIndex[oldId] == record.model then
+            ItemIdIndex[oldId] = nil
+        end
+        record.itemId = freshId
         if freshId ~= nil then
-            record.itemId = freshId
             ItemIdIndex[freshId] = record.model
             if Config.AutoBuyDebug then
                 debugOnce(
                     "itemid-fallback:" .. tostring(record.model),
-                    "ItemId found via fallback: " .. tostring(freshId)
+                    "ItemId updated via fallback: " .. tostring(freshId)
                         .. "  pack=" .. tostring(record.info and record.info.pack),
                     0
                 )
@@ -1122,10 +1156,10 @@ evaluateRecordReadiness = function(record)
     local hasId     = record.itemId ~= nil
     local hasPrompt = record.buyPrompt ~= nil and record.buyPrompt.Enabled ~= false
 
-    -- A valid PackId can be bought through ConveyorRE even if the prompt
-    -- has not appeared yet. Conversely, the working reference can buy via
-    -- fireproximityprompt without an exposed ID. Either path is actionable.
-    if hasId or hasPrompt then
+    -- The game's actual purchase endpoint requires the ItemId request path.
+    -- A prompt alone is only a fallback, so do not queue a pack before it
+    -- has an ItemId. This matches the old working script's contract.
+    if hasId and hasPrompt then
         if st ~= "ReadyToBuy" then transitionState(record, "ReadyToBuy") end
         if Config.AutoBuyMatching and not boxHandlingActive then
             if passesFilter(record.info) then
@@ -1170,6 +1204,14 @@ tryBuyRecord = function(record)
         cleanupRecord(record)
         return false
     end
+    -- Re-read the live conveyor metadata before sending a queued request.
+    -- This keeps a stale queue entry from buying after the pack changes or
+    -- after its identifier is removed by the game.
+    refreshRecordMetadata(record, true)
+    if record.itemId == nil or not passesFilter(record.info) then
+        transitionState(record, "ReadyToBuy")
+        return false
+    end
     local now = os.clock()
     if now - record.lastBuyAttempt < BUY_RETRY_DELAY then return false end
     record.lastBuyAttempt = now
@@ -1183,38 +1225,16 @@ tryBuyRecord = function(record)
     local itemId    = record.itemId
     local succeeded = false
 
-    -- The reference implementation buys through the live prompt. Prefer
-    -- that path because the game's client code supplies the exact remote
-    -- arguments and validates the current pack state.
-    if record.buyPrompt and record.buyPrompt.Enabled ~= false then
-        local promptOk, promptErr = firePrompt(record.buyPrompt)
-        if promptOk then
-            succeeded = true
-            debugOnce(
-                "prompt-buy:" .. tostring(record.model),
-                "Purchase prompt activated for pack="
-                    .. tostring(record.info and record.info.pack),
-                0
-            )
-        elseif Config.AutoBuyDebug then
-            debugOnce(
-                "prompt-buy-failed:" .. tostring(record.model),
-                "Purchase prompt failed: " .. tostring(promptErr),
-                0
-            )
-        end
-    end
-
-    -- Remote fallback for executors without a working prompt primitive.
-    if not succeeded and itemId ~= nil then
+    -- This is the proven purchase path from the user's old working script.
+    -- Do not add PackId: the game endpoint expects exactly ItemId here.
+    if itemId ~= nil then
         if Config.AutoBuyDebug then
             debugOnce("buy:" .. tostring(itemId),
-                "Remote purchase request  PackId=" .. tostring(itemId)
+                "TryBuy remote request  ItemId=" .. tostring(itemId)
                     .. "  pack=" .. tostring(record.info and record.info.pack), 0)
         end
         local ok, err = pcall(function()
             ConveyorRE:FireServer("TryBuy", {
-                PackId  = itemId,
                 ItemId  = itemId,
             })
         end)
@@ -1222,16 +1242,69 @@ tryBuyRecord = function(record)
             succeeded = true
             debugOnce(
                 "remote-buy:" .. tostring(itemId),
-                "TryBuy remote invoked for PackId=" .. tostring(itemId),
+                "TryBuy sent  ItemId=" .. tostring(itemId),
                 0
             )
+
+            -- Preserve the old working script's complete sequence:
+            -- TryBuy(ItemId) first, then activate the live prompt shortly
+            -- afterward while the pack is still present.
+            if record.model:IsDescendantOf(workspace)
+                and record.buyPrompt
+                and record.buyPrompt.Enabled then
+                task.wait(0.12)
+                if record.model:IsDescendantOf(workspace) then
+                    local promptOk, promptErr = firePrompt(record.buyPrompt)
+                    if promptOk then
+                        debugOnce(
+                            "prompt-after-buy:" .. tostring(record.model),
+                            "Prompt activated after TryBuy",
+                            0
+                        )
+                    elseif Config.AutoBuyDebug then
+                        debugOnce(
+                            "prompt-after-buy-failed:" .. tostring(record.model),
+                            "Prompt activation after TryBuy failed: "
+                                .. tostring(promptErr),
+                            0
+                        )
+                    end
+                end
+            end
         else
-            warn("[ACF][AutoBuy] TryBuy remote failed: " .. tostring(err))
+            warn("[ACF][AutoBuy] TryBuy failed  ItemId="
+                .. tostring(itemId) .. "  err=" .. tostring(err))
+
+            -- The old script only uses the live prompt after the remote
+            -- throws. Keep that fallback behavior instead of treating a
+            -- prompt activation as proof that the purchase succeeded.
+            if record.model:IsDescendantOf(workspace)
+                and record.buyPrompt
+                and record.buyPrompt.Enabled ~= false then
+                task.wait(0.12)
+                if record.model:IsDescendantOf(workspace) then
+                    local promptOk, promptErr = firePrompt(record.buyPrompt)
+                    if promptOk then
+                        succeeded = true
+                        debugOnce(
+                            "prompt-fallback:" .. tostring(record.model),
+                            "Prompt fallback activated after TryBuy failure",
+                            0
+                        )
+                    elseif Config.AutoBuyDebug then
+                        debugOnce(
+                            "prompt-fallback-failed:" .. tostring(record.model),
+                            "Prompt fallback failed: " .. tostring(promptErr),
+                            0
+                        )
+                    end
+                end
+            end
         end
-    elseif not succeeded and Config.AutoBuyDebug then
+    elseif Config.AutoBuyDebug then
         debugOnce(
-            "no-buy-path:" .. tostring(record.model),
-            "No usable purchase prompt or PackId for pack="
+            "no-itemid-buy:" .. tostring(record.model),
+            "Cannot send TryBuy: ItemId is not available for pack="
                 .. tostring(record.info and record.info.pack),
             0
         )
@@ -1279,46 +1352,66 @@ end
 -- ── ItemId event watcher ──────────────────────────────────────────────
 local function attachItemIdWatcher(record)
     local model = record.model
-    for _, attrName in ipairs({
-        "ItemId", "ItemID", "itemId",
-        "PackId", "PackID", "packId",
-    }) do
-        trackConnection(record,
-            model:GetAttributeChangedSignal(attrName):Connect(function()
-                local v = model:GetAttribute(attrName)
-                if v ~= nil and record.itemId == nil then
-                    record.itemId = v
-                    ItemIdIndex[v] = model
-                    if Config.AutoBuyDebug then
-                        debugOnce("itemid-attr:" .. tostring(model),
-                            "ItemId attribute set: " .. tostring(v), 0)
-                    end
-                    evaluateRecordReadiness(record)
-                end
-            end)
-        )
+    local itemIdNames = { "ItemId", "ItemID", "itemId" }
+    local watchedSources = setmetatable({}, { __mode = "k" })
+
+    local function refreshItemId()
+        if record.state == "Purchased" or record.state == "Removed" then return end
+
+        -- readBoxValue caches ValueBase lookups; a conveyor can add or
+        -- replace its holder after registration, so invalidate that cache
+        -- before resolving the current identifier.
+        metadataCache[model] = nil
+        local freshId = getItemId(model)
+        if freshId == record.itemId then
+            evaluateRecordReadiness(record)
+            return
+        end
+
+        local oldId = record.itemId
+        if oldId ~= nil and ItemIdIndex[oldId] == model then
+            ItemIdIndex[oldId] = nil
+        end
+        record.itemId = freshId
+
+        if freshId ~= nil then
+            ItemIdIndex[freshId] = model
+            if Config.AutoBuyDebug then
+                debugOnce("itemid-change:" .. tostring(model),
+                    "ItemId updated: " .. tostring(freshId), 0)
+            end
+        end
+        evaluateRecordReadiness(record)
+    end
+
+    local function watchSource(source)
+        if not source or watchedSources[source] then return end
+        watchedSources[source] = true
+
+        for _, attrName in ipairs(itemIdNames) do
+            trackConnection(record,
+                source:GetAttributeChangedSignal(attrName):Connect(refreshItemId)
+            )
+        end
+
+        if source:IsA("ValueBase") then
+            trackConnection(record, source.Changed:Connect(refreshItemId))
+        end
+    end
+
+    -- The reference uses live conveyor objects, where the ID may be placed
+    -- on a holder/child after the pack model is first observed.
+    watchSource(model)
+    for _, desc in ipairs(model:GetDescendants()) do
+        watchSource(desc)
     end
     trackConnection(record,
-        model.ChildAdded:Connect(function(child)
-            if not child:IsA("ValueBase") then return end
-            local childName = string.lower(child.Name)
-            if childName ~= "itemid" and childName ~= "packid" then return end
-            if record.itemId ~= nil then return end
-            local v = child.Value
-            if v ~= nil then
-                record.itemId = v
-                ItemIdIndex[v] = model
-                evaluateRecordReadiness(record)
-            end
-            child.Changed:Connect(function(newV)
-                if newV ~= nil and record.itemId == nil then
-                    record.itemId = newV
-                    ItemIdIndex[newV] = model
-                    evaluateRecordReadiness(record)
-                end
-            end)
+        model.DescendantAdded:Connect(function(desc)
+            watchSource(desc)
+            refreshItemId()
         end)
     )
+    refreshItemId()
 end
 
 -- ── Pack registration (idempotent) ────────────────────────────────────
@@ -1465,6 +1558,13 @@ task.spawn(function()
                     table.remove(PurchaseQueue, i)
                 else
                     if tryBuyRecord(record) then
+                        PurchaseQueued[record] = nil
+                        table.remove(PurchaseQueue, i)
+                    elseif record.state == "ReadyToBuy"
+                        and (record.itemId == nil or not passesFilter(record.info)) then
+                        -- The record was queued under an older ID/filter
+                        -- snapshot. Drop it so a later live update can
+                        -- enqueue it again instead of leaving it stuck.
                         PurchaseQueued[record] = nil
                         table.remove(PurchaseQueue, i)
                     else
