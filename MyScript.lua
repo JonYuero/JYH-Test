@@ -392,7 +392,7 @@ local Config = {
     -- Cards
     AutoUpgrade       = false,
     UpgradeDelay      = 0.15,
-    CardActionDelay   = 0.5,
+    CardActionDelay   = 0.6,
     AutoSell          = false,
     AutoTraitRoll     = false,
     AutoClaimPlaytime = false,
@@ -2499,60 +2499,66 @@ end)
 
 -- Auto Potions
 task.spawn(function()
+    local ItemsRE = Remotes:FindFirstChild("ItemsRE")
+
+    -- Locate ScrollingFrameItems where potions are listed as ObjectFrame_<PotionId>
+    local function getScrollingFrame()
+        local guiMidObj = playerGui:FindFirstChild("GuiMid")
+        if not guiMidObj then return nil end
+        local itemsGuiObj = guiMidObj:FindFirstChild("Items")
+        if not itemsGuiObj then return nil end
+        local itemsFrameObj = itemsGuiObj:FindFirstChild("ItemsFrame")
+        if not itemsFrameObj then return nil end
+        return itemsFrameObj:FindFirstChild("ScrollingFrameItems")
+    end
+
+    -- Check if a boost is already active via the InfoGui Boost HUD
+    -- (each stat gets a Frame child that turns Visible when active)
+    local function anyBoostActive()
+        local ig = playerGui:FindFirstChild("InfoGui")
+        if not ig then return false end
+        local boostHud = ig:FindFirstChild("Boost")
+        if not boostHud then return false end
+        for _, child in ipairs(boostHud:GetChildren()) do
+            if child:IsA("Frame") and child.Visible then
+                return true
+            end
+        end
+        return false
+    end
+
     while true do
         task.wait(1)
         if not Config.AutoPotion then continue end
-        local backpack = player:FindFirstChild("Backpack")
-        if not backpack then continue end
 
-        local active = nil
-        local function inspect(container, excluded)
-            if not container then return end
-            for _, attributeName in ipairs({
-                "ActivePotion", "ActivePotionName", "PotionActive",
-                "ActiveEffect", "ActiveEffectName",
-            }) do
-                local value = container:GetAttribute(attributeName)
-                if value ~= nil and value ~= false and tostring(value) ~= "" then
-                    active = tostring(value)
-                    return
-                end
-            end
-            for _, desc in ipairs(container:GetDescendants()) do
-                if excluded and desc:IsDescendantOf(excluded) then continue end
-                local name = tostring(desc.Name)
-                local key = string.lower(name)
-                if string.find(key, "potion", 1, true)
-                    or string.find(key, "boost", 1, true)
-                    or string.find(key, "effect", 1, true) then
-                    if desc:IsA("ValueBase") then
-                        local value = desc.Value
-                        if value == true or (tonumber(value) or 0) > 0
-                            or (type(value) == "string" and value ~= "") then
-                            active = name
-                            return
-                        end
-                    elseif desc:GetAttribute("Active") == true
-                        or desc:GetAttribute("Enabled") == true then
-                        active = name
-                        return
-                    end
-                end
-            end
+        -- Refresh remote reference if it wasn't ready at startup
+        if not ItemsRE then
+            ItemsRE = Remotes:FindFirstChild("ItemsRE")
+            if not ItemsRE then continue end
         end
-        inspect(player, backpack)
-        if not active then inspect(player.Character) end
-        if active then continue end
+
+        -- Skip while any stat boost is currently active
+        if anyBoostActive() then continue end
+
+        local scrollingFrame = getScrollingFrame()
+        if not scrollingFrame then continue end
 
         local selected = Config.SelectedPotions
         for _, potion in ipairs(POTIONS) do
-            local allowed = selectionIncludes(selected, potion)
-            if allowed and backpack:FindFirstChild(potion) then
-                if fireRemote("UseItem", potion) then
-                    task.wait(0.75)
-                end
-                break
-            end
+            if not selectionIncludes(selected, potion) then continue end
+            -- Ownership check: frame exists and is visible in the items list
+            local frame = scrollingFrame:FindFirstChild("ObjectFrame_" .. potion)
+            if not (frame and frame.Visible) then continue end
+            -- Quantity sanity check via the label inside the frame
+            local qLabel = frame:FindFirstChild("Quantity", true)
+            local qty = qLabel and tonumber(tostring(qLabel.Text):match("%d+")) or 0
+            if qty <= 0 then continue end
+            -- Fire the Items remote with the correct format
+            pcall(function()
+                ItemsRE:FireServer("UseItem", { ItemId = potion, Amount = 1 })
+            end)
+            task.wait(0.75)
+            break
         end
     end
 end)
@@ -4210,7 +4216,7 @@ for _, potion in ipairs(POTIONS) do
 end
 
 Controls.SelectedPotions = miscTab:CreateDropdown({
-    Name            = "Owned Potions",
+    Name            = "Select Potion",
     Options         = potionOptions,
     CurrentOption   = collapseFullSelection(Config.SelectedPotions, POTIONS),
     MultipleOptions = true,
