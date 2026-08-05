@@ -496,8 +496,9 @@ end
 local function firePrompt(prompt)
     if not prompt then return false end
     if fireproximityprompt then
-        local ok = pcall(fireproximityprompt, prompt)
+        local ok, err = pcall(fireproximityprompt, prompt)
         if ok then return true end
+        return false, err
     end
     local remote = prompt:FindFirstChild("Remote")
         or prompt:FindFirstChild("RemoteEvent")
@@ -508,7 +509,7 @@ local function firePrompt(prompt)
         end
         return pcall(remote.InvokeServer, remote)
     end
-    return false
+    return false, "No prompt firing primitive or prompt remote available"
 end
 
 local function fireClickDetector(detector)
@@ -1038,6 +1039,9 @@ local function isBuyPrompt(prompt)
     return string.find(n, "buy", 1, true) ~= nil
         or string.find(a, "buy", 1, true) ~= nil
         or string.find(o, "buy", 1, true) ~= nil
+        or string.find(n, "purchase", 1, true) ~= nil
+        or string.find(a, "purchase", 1, true) ~= nil
+        or string.find(o, "purchase", 1, true) ~= nil
 end
 
 local function findBestBuyPrompt(packModel)
@@ -1118,10 +1122,23 @@ evaluateRecordReadiness = function(record)
     local hasId     = record.itemId ~= nil
     local hasPrompt = record.buyPrompt ~= nil and record.buyPrompt.Enabled ~= false
 
-    if hasId and hasPrompt then
+    -- A valid PackId can be bought through ConveyorRE even if the prompt
+    -- has not appeared yet. Conversely, the working reference can buy via
+    -- fireproximityprompt without an exposed ID. Either path is actionable.
+    if hasId or hasPrompt then
         if st ~= "ReadyToBuy" then transitionState(record, "ReadyToBuy") end
         if Config.AutoBuyMatching and not boxHandlingActive then
-            if passesFilter(record.info) then queuePurchase(record) end
+            if passesFilter(record.info) then
+                queuePurchase(record)
+            elseif Config.AutoBuyDebug then
+                debugOnce(
+                    "filter-miss:" .. tostring(record.model),
+                    "Filter rejected pack=" .. tostring(record.info and record.info.pack)
+                        .. " rarity=" .. tostring(record.info and record.info.rarity)
+                        .. " mutation=" .. tostring(record.info and record.info.mutation),
+                    1
+                )
+            end
         end
     elseif not hasId then
         if st ~= "WaitingForItemId" then transitionState(record, "WaitingForItemId") end
@@ -1136,6 +1153,14 @@ queuePurchase = function(record)
     if PurchaseQueued[record] then return end
     PurchaseQueued[record] = true
     table.insert(PurchaseQueue, record)
+    debugOnce(
+        "queued:" .. tostring(record.model),
+        "Queued matching pack=" .. tostring(record.info and record.info.pack)
+            .. " rarity=" .. tostring(record.info and record.info.rarity)
+            .. " mutation=" .. tostring(record.info and record.info.mutation)
+            .. " PackId=" .. tostring(record.itemId),
+        0
+    )
 end
 
 -- ── Buy attempt ───────────────────────────────────────────────────────
@@ -1153,65 +1178,63 @@ tryBuyRecord = function(record)
     if not record.buyPrompt or not record.buyPrompt.Enabled then
         record.buyPrompt = findBestBuyPrompt(record.model)
     end
-    if not record.buyPrompt then
-        debugOnce("noprompt:" .. tostring(record.model),
-            "No enabled buy prompt — waiting for prompt to appear")
-        transitionState(record, "WaitingForPrompt")
-        return false
-    end
-
     transitionState(record, "Buying")
 
     local itemId    = record.itemId
     local succeeded = false
 
-    if itemId ~= nil then
+    -- The reference implementation buys through the live prompt. Prefer
+    -- that path because the game's client code supplies the exact remote
+    -- arguments and validates the current pack state.
+    if record.buyPrompt and record.buyPrompt.Enabled ~= false then
+        local promptOk, promptErr = firePrompt(record.buyPrompt)
+        if promptOk then
+            succeeded = true
+            debugOnce(
+                "prompt-buy:" .. tostring(record.model),
+                "Purchase prompt activated for pack="
+                    .. tostring(record.info and record.info.pack),
+                0
+            )
+        elseif Config.AutoBuyDebug then
+            debugOnce(
+                "prompt-buy-failed:" .. tostring(record.model),
+                "Purchase prompt failed: " .. tostring(promptErr),
+                0
+            )
+        end
+    end
+
+    -- Remote fallback for executors without a working prompt primitive.
+    if not succeeded and itemId ~= nil then
         if Config.AutoBuyDebug then
             debugOnce("buy:" .. tostring(itemId),
-                "Purchase request  ItemId=" .. tostring(itemId)
+                "Remote purchase request  PackId=" .. tostring(itemId)
                     .. "  pack=" .. tostring(record.info and record.info.pack), 0)
         end
         local ok, err = pcall(function()
             ConveyorRE:FireServer("TryBuy", {
-                ItemId = itemId,
                 PackId  = itemId,
+                ItemId  = itemId,
             })
         end)
         if ok then
             succeeded = true
+            debugOnce(
+                "remote-buy:" .. tostring(itemId),
+                "TryBuy remote invoked for PackId=" .. tostring(itemId),
+                0
+            )
         else
             warn("[ACF][AutoBuy] TryBuy remote failed: " .. tostring(err))
-            -- Prompt fallback ONLY when the remote fails
-            if fireproximityprompt then
-                task.wait(0.12)
-                if record.model:IsDescendantOf(workspace)
-                    and record.buyPrompt and record.buyPrompt.Enabled then
-                    pcall(fireproximityprompt, record.buyPrompt)
-                    succeeded = true
-                    if Config.AutoBuyDebug then
-                        autoBuyDebugInner("Prompt fallback after remote failure")
-                    end
-                end
-            end
         end
-    else
-        -- No ItemId: use prompt only
-        if Config.AutoBuyDebug then
-            debugOnce("buy-prompt:" .. tostring(record.model),
-                "Purchase via prompt (no ItemId)  pack="
-                    .. tostring(record.info and record.info.pack), 0)
-        end
-        if fireproximityprompt then
-            local ok, err = pcall(fireproximityprompt, record.buyPrompt)
-            if ok then
-                succeeded = true
-            elseif Config.AutoBuyDebug then
-                autoBuyDebugInner("Prompt activation failed: " .. tostring(err))
-            end
-        else
-            warnOnce("AutoBuy:no-fireproximityprompt",
-                "No ItemId and fireproximityprompt unavailable — cannot buy.")
-        end
+    elseif not succeeded and Config.AutoBuyDebug then
+        debugOnce(
+            "no-buy-path:" .. tostring(record.model),
+            "No usable purchase prompt or PackId for pack="
+                .. tostring(record.info and record.info.pack),
+            0
+        )
     end
 
     if not succeeded then transitionState(record, "ReadyToBuy") end
@@ -1455,7 +1478,7 @@ task.spawn(function()
         for _, record in pairs(ConveyorRecords) do
             local st = record.state
             if st == "Detected" or st == "WaitingForItemId"
-                or st == "WaitingForPrompt" then
+                or st == "WaitingForPrompt" or st == "ReadyToBuy" then
                 refreshRecordMetadata(record, false)
                 evaluateRecordReadiness(record)
             elseif st == "Buying" then
@@ -3080,6 +3103,7 @@ local function buildSerializableConfig()
         SpawnDelay        = Config.SpawnDelay,
         AutoStopSpawn     = Config.AutoStopSpawn,
         AutoBuyMatching   = Config.AutoBuyMatching,
+        AutoBuyDebug      = Config.AutoBuyDebug,
         AutoContinueSpawn = Config.AutoContinueSpawn,
         AutoCarryBox      = Config.AutoCarryBox,
         AutoSellBox       = Config.AutoSellBox,
@@ -3226,6 +3250,7 @@ local function loadConfig(name, isAutoload)
 
     local knownKeys = {
         "AutoSpawnPack", "SpawnDelay", "AutoStopSpawn", "AutoBuyMatching",
+        "AutoBuyDebug",
         "AutoCarryBox", "AutoSellBox", "AutoSellDelay",
         "SelectedRarities", "SelectedMutations", "SelectedPacks",
         "AutoUpgrade", "UpgradeDelay", "CardActionDelay", "AutoSell",
@@ -3387,6 +3412,13 @@ Controls.AutoBuyMatching = spawnTab:CreateToggle({
     CurrentValue = Config.AutoBuyMatching,
     Flag         = "AutoBuyMatching",
     Callback     = function(v) Config.AutoBuyMatching = v end,
+})
+
+Controls.AutoBuyDebug = spawnTab:CreateToggle({
+    Name         = "Auto Buy Diagnostics",
+    CurrentValue = Config.AutoBuyDebug,
+    Flag         = "AutoBuyDebug",
+    Callback     = function(v) Config.AutoBuyDebug = v end,
 })
 
 Controls.AutoContinueSpawn = spawnTab:CreateToggle({
