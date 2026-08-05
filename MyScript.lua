@@ -403,7 +403,7 @@ local Config = {
     AutoSell          = false,
     AutoTraitRoll     = false,
     SelectedRankCards = { "All" },
-    TargetRank        = { "UR" },
+    TargetRank        = "UR",
     RankUseGems       = true,
     RankUseCash       = false,
     AutoRankRoll      = false,
@@ -1143,8 +1143,7 @@ local WatchedPrompts  = setmetatable({}, { __mode = "k" })
 local BUY_RETRY_DELAY  = 0.75   -- min seconds between buy attempts per record
 local BUY_CONFIRM_TIMEOUT = 2.0 -- wait for removal/disable confirmation
 local MAX_BUY_ATTEMPTS = 4
-local PROMPT_FALLBACK_DELAY = 1.0
-local BUYING_TIMEOUT   = BUY_CONFIRM_TIMEOUT
+
 local METADATA_TTL     = 1.5    -- seconds between metadata refreshes per record
 local ITEMID_FALLBACK_INTERVAL = 2.0
 local RETRY_BACKOFF    = 3.0
@@ -2134,8 +2133,8 @@ task.spawn(function()
                 autoStopHandled = true
 
                 Config.AutoSpawnPack = false
-                if Rayfield and Rayfield.Flags and Rayfield.Flags["AutoSpawnPack"] then
-                    Rayfield.Flags["AutoSpawnPack"]:Set(false)
+                if Controls.AutoSpawnPack and Controls.AutoSpawnPack.Set then
+                    pcall(function() Controls.AutoSpawnPack:Set(false) end)
                 end
                 notify("Auto Spawn Pack", "Stopped — filter match found!")
 
@@ -2153,15 +2152,8 @@ task.spawn(function()
                                 -- Pack was purchased or left workspace — resume spawning.
                                 if Config.AutoContinueSpawn then
                                     Config.AutoSpawnPack = true
-                                    pcall(function()
-                                        if Controls.AutoSpawnPack
-                                            and Controls.AutoSpawnPack.Set then
-                                            Controls.AutoSpawnPack:Set(true)
-                                        end
-                                    end)
-                                    if Rayfield.Flags
-                                        and Rayfield.Flags["AutoSpawnPack"] then
-                                        Rayfield.Flags["AutoSpawnPack"]:Set(true)
+                                    if Controls.AutoSpawnPack and Controls.AutoSpawnPack.Set then
+                                        pcall(function() Controls.AutoSpawnPack:Set(true) end)
                                     end
                                     notify("Spawn Manager", "Resumed — pack purchased!")
                                 end
@@ -3079,11 +3071,6 @@ local rankCardRefreshQueued = false
 local rankRollPending = false
 local rankRollPendingTool
 local rankRollResponse
-local RANK_ROLL_LOOP_DELAY = 0.05
-local RANK_ROLL_RESPONSE_POLL = 0.03
-local RANK_ROLL_SUCCESS_DELAY = 0.05
-local RANK_ROLL_FAILURE_DELAY = 0.25
-local RANK_ROLL_IDLE_DELAY = 0.25
 
 local function getRankCardsInBackpack()
     local result = {}
@@ -3198,28 +3185,10 @@ local function getRankTargetOptions()
     return result
 end
 
-local function normalizeRankTargets(value)
-    local result = {}
-    local seen = {}
-
-    if type(value) ~= "table" then
-        value = value == nil and {} or { value }
-    end
-
-    for _, rank in ipairs(value) do
-        local normalized = tostring(rank or "")
-        if normalized ~= "" and not seen[normalized] then
-            seen[normalized] = true
-            table.insert(result, normalized)
-        end
-    end
-    return result
-end
-
-local function getRankTargets()
-    local targets = normalizeRankTargets(Config.TargetRank)
-    if #targets == 0 then return nil end
-    return targets
+local function getRankTarget()
+    local target = tostring(Config.TargetRank or "")
+    if target == "" then return nil end
+    return target
 end
 
 local function getRankCashCost(tool)
@@ -3271,12 +3240,8 @@ local function chooseRankCurrency(tool)
 end
 
 local function rankCardHasTarget(tool)
-    if not tool then return false end
-    local grade = tostring(tool:GetAttribute("CardGrade") or "")
-    for _, target in ipairs(getRankTargets() or {}) do
-        if grade == tostring(target) then return true end
-    end
-    return false
+    return tool and tostring(tool:GetAttribute("CardGrade") or "")
+        == tostring(getRankTarget() or "")
 end
 
 local function stopRankReroll(message)
@@ -3311,16 +3276,16 @@ end)
 
 task.spawn(function()
     while true do
-        task.wait(RANK_ROLL_LOOP_DELAY)
+        task.wait(0.15)
         if not Config.AutoRankRoll then continue end
         if not GradeRollRE then
             stopRankReroll("GradeRollRE was not found.")
             continue
         end
 
-        local targets = getRankTargets()
-        if not targets then
-            stopRankReroll("Select at least one target ranking first.")
+        local target = getRankTarget()
+        if not target then
+            stopRankReroll("Select a target ranking first.")
             continue
         end
 
@@ -3362,7 +3327,7 @@ task.spawn(function()
                 local deadline = os.clock() + 8
                 while Config.AutoRankRoll and rankRollPending
                     and not rankRollResponse and os.clock() < deadline do
-                    task.wait(RANK_ROLL_RESPONSE_POLL)
+                    task.wait(0.1)
                 end
 
                 local response = rankRollResponse
@@ -3383,10 +3348,10 @@ task.spawn(function()
                         stopRankReroll("The selected currency is no longer available.")
                         break
                     end
-                    task.wait(RANK_ROLL_FAILURE_DELAY)
+                    task.wait(0.8)
                 else
                     progressed = true
-                    task.wait(RANK_ROLL_SUCCESS_DELAY)
+                    task.wait(0.2)
                 end
             end
             if tool.Parent and not rankCardHasTarget(tool) then
@@ -3395,11 +3360,9 @@ task.spawn(function()
         end
 
         if Config.AutoRankRoll and not cardsRemaining then
-            stopRankReroll(
-                "All selected cards reached " .. table.concat(targets, ", ") .. "."
-            )
+            stopRankReroll("All selected cards reached " .. tostring(target) .. ".")
         elseif Config.AutoRankRoll and not progressed then
-            task.wait(RANK_ROLL_IDLE_DELAY)
+            task.wait(0.75)
         end
     end
 end)
@@ -3944,10 +3907,8 @@ end
 local function finishAutoRaidIfComplete()
     if getNextRaidDifficulty() then return false end
     Config.AutoRaid = false
-    if Rayfield and Rayfield.Flags and Rayfield.Flags["AutoRaid"] then
-        pcall(function()
-            Rayfield.Flags["AutoRaid"]:Set(false)
-        end)
+    if Controls.AutoRaid and Controls.AutoRaid.Set then
+        pcall(function() Controls.AutoRaid:Set(false) end)
     end
 end
 
@@ -4325,11 +4286,6 @@ local function loadConfig(name, isAutoload)
     for _, key in ipairs(knownKeys) do
         if data[key] ~= nil then
             local value = data[key]
-            if key == "TargetRank" then
-                -- Older configs stored one ranking as a string. Upgrade it
-                -- to the multi-select format when loading.
-                value = normalizeRankTargets(value)
-            end
             Config[key] = value
             local control = Controls[key]
             if control and control.Set then
@@ -4423,8 +4379,8 @@ end
 --  Rayfield Window
 -- ══════════════════════════════════════════════════════════════
 local windowTitle = isPremium
-    and "👑 Jon Yuero Hub | Anime Card Farm v 1.0"
-    or  "Jon Yuero Hub | Anime Card Farm v 1.0"
+    and "👑 Jon Yuero Hub | Anime Card Farm"
+    or  "Jon Yuero Hub | Anime Card Farm"
 
 local Window = Rayfield:CreateWindow({
     Name            = windowTitle,
@@ -4747,11 +4703,6 @@ combatTab:CreateToggle({
 -- ══════════════════════════════════════════════════════════════
 local rerollTab = Window:CreateTab("🔄 Reroll", 0)
 
-rerollTab:CreateParagraph({
-    Title   = "Reroll Note",
-    Content = "Unequip the card before starting a reroll. Cards being held are not detected in the backpack, so they cannot be processed.",
-})
-
 rerollTab:CreateSection("Card Ranking")
 
 local initialRankCardOptions, initialRankCardMap = buildRankCardOptions()
@@ -4770,38 +4721,26 @@ rankCardDropdown = rerollTab:CreateDropdown({
 })
 
 local rankOptions = getRankTargetOptions()
-local validRankOptions = {}
+local configuredTargetRank = tostring(Config.TargetRank or "")
+local targetRankIsValid = false
 for _, rank in ipairs(rankOptions) do
-    validRankOptions[tostring(rank)] = true
-end
-
-local configuredTargetRanks = normalizeRankTargets(Config.TargetRank)
-local validConfiguredTargets = {}
-for _, rank in ipairs(configuredTargetRanks) do
-    if validRankOptions[rank] then
-        table.insert(validConfiguredTargets, rank)
+    if rank == configuredTargetRank then
+        targetRankIsValid = true
+        break
     end
 end
-if #validConfiguredTargets == 0 then
-    validConfiguredTargets = { rankOptions[1] or "UR" }
+if not targetRankIsValid then
+    Config.TargetRank = rankOptions[1] or "UR"
 end
-Config.TargetRank = validConfiguredTargets
-
 Controls.TargetRank = rerollTab:CreateDropdown({
     Name            = "Target Ranking",
     Options         = rankOptions,
     CurrentOption   = Config.TargetRank,
-    MultipleOptions = true,
+    MultipleOptions = false,
     Flag            = "TargetRank",
     Callback        = function(v)
-        local selected = normalizeRankTargets(v)
-        local validSelected = {}
-        for _, rank in ipairs(selected) do
-            if validRankOptions[rank] then
-                table.insert(validSelected, rank)
-            end
-        end
-        Config.TargetRank = validSelected
+        if type(v) == "table" then v = v[1] end
+        Config.TargetRank = tostring(v or rankOptions[1] or "UR")
     end,
 })
 
@@ -4837,7 +4776,7 @@ Controls.AutoRankRoll = rerollTab:CreateToggle({
 
 rerollTab:CreateParagraph({
     Title   = "Card Ranking behavior",
-    Content = "Selected cards are rerolled one at a time until they reach any selected target ranking. Gems are used first; cash is used only after gems reach zero.",
+    Content = "Selected cards are rerolled one at a time until they reach the target ranking. Gems are used first; cash is used only after gems reach zero.",
 })
 
 rerollTab:CreateSection("Traits")
