@@ -287,9 +287,9 @@ local RARITIES = {
 }
 
 local MUTATIONS = {
-    "Normal", "Golden", "Venomous", "Diamond", "Unknown",
+    "Normal", "Golden", "Venomous", "Diamond",
     "Rainbow", "Sakura", "Candy", "Blessed",
-    "Radioactive", "Glitch", "Starfallen", "Admin",
+    "Radioactive", "Glitch", "Starfallen", "Admin", "Unknown",
 }
 
 local PACKS = {
@@ -2060,70 +2060,93 @@ task.spawn(function()
             task.spawn(function()
                 if autoStopHandled then return end
 
-                local spawnedRecord
+                -- ── Step 1: collect ALL new packs (up to 3 s) ───────────
+                -- With admin events two packs can spawn at once; we must
+                -- check every new pack for a filter match, not just the first.
+                local newRecords = {}
                 for _ = 1, 30 do
+                    newRecords = {}
                     for _, record in ipairs(getConveyorPacks()) do
                         if not capturedIds[getPackKey(record)] then
+                            table.insert(newRecords, record)
+                        end
+                    end
+                    if #newRecords > 0 then break end
+                    task.wait(0.1)
+                end
+
+                if #newRecords == 0 then
+                    warnOnce("AutoStop:no-new-pack",
+                        "Auto Stop did not detect a new conveyor pack after spawning.")
+                    return
+                end
+
+                -- ── Step 2: wait for metadata to replicate, find a match ─
+                -- Rarity/mutation may not be replicated yet the moment the
+                -- model appears. Poll up to 2 s so the filter sees real data.
+                local spawnedRecord = nil
+                for _ = 1, 20 do
+                    task.wait(0.1)
+                    for _, record in ipairs(newRecords) do
+                        if not record.model:IsDescendantOf(workspace) then continue end
+                        refreshRecordMetadata(record, true)
+                        if passesFilter(record.info) then
                             spawnedRecord = record
                             break
                         end
                     end
                     if spawnedRecord then break end
-                    task.wait(0.1)
                 end
 
-                if spawnedRecord and passesFilter(spawnedRecord.info) then
-                    if autoStopHandled then return end
-                    autoStopHandled = true
+                if not spawnedRecord then return end  -- no match among new packs
 
-                    Config.AutoSpawnPack = false
-                    if Rayfield and Rayfield.Flags and Rayfield.Flags["AutoSpawnPack"] then
-                        Rayfield.Flags["AutoSpawnPack"]:Set(false)
-                    end
-                    notify("Auto Spawn Pack", "Stopped — filter match found!")
+                -- ── Step 3: stop spawning ────────────────────────────────
+                if autoStopHandled then return end
+                autoStopHandled = true
 
-                    if Config.AutoContinueSpawn and Config.AutoBuyMatching then
-                        local watchedRecord = spawnedRecord
-                        task.spawn(function()
-                            -- Wait up to 30 s for a terminal outcome.
-                            -- We watch record.state instead of trying to catch
-                            -- the transient "Buying" state, which can be missed.
-                            local deadline = os.clock() + 30
-                            while os.clock() < deadline do
-                                task.wait(0.2)
-                                local st = watchedRecord.state
-                                if st == "BoughtAndRemove" or st == "Removed"
-                                    or not watchedRecord.model:IsDescendantOf(workspace) then
-                                    -- Pack was successfully purchased or left workspace.
-                                    if Config.AutoContinueSpawn then
-                                        Config.AutoSpawnPack = true
-                                        pcall(function()
-                                            if Controls.AutoSpawnPack
-                                                and Controls.AutoSpawnPack.Set then
-                                                Controls.AutoSpawnPack:Set(true)
-                                            end
-                                        end)
-                                        if Rayfield.Flags
-                                            and Rayfield.Flags["AutoSpawnPack"] then
-                                            Rayfield.Flags["AutoSpawnPack"]:Set(true)
+                Config.AutoSpawnPack = false
+                if Rayfield and Rayfield.Flags and Rayfield.Flags["AutoSpawnPack"] then
+                    Rayfield.Flags["AutoSpawnPack"]:Set(false)
+                end
+                notify("Auto Spawn Pack", "Stopped — filter match found!")
+
+                -- ── Step 4: Auto Continue watcher ───────────────────────
+                if Config.AutoContinueSpawn and Config.AutoBuyMatching then
+                    local watchedRecord = spawnedRecord
+                    task.spawn(function()
+                        -- Wait up to 30 s for a terminal outcome.
+                        local deadline = os.clock() + 30
+                        while os.clock() < deadline do
+                            task.wait(0.2)
+                            local st = watchedRecord.state
+                            if st == "BoughtAndRemove" or st == "Removed"
+                                or not watchedRecord.model:IsDescendantOf(workspace) then
+                                -- Pack was purchased or left workspace — resume spawning.
+                                if Config.AutoContinueSpawn then
+                                    Config.AutoSpawnPack = true
+                                    pcall(function()
+                                        if Controls.AutoSpawnPack
+                                            and Controls.AutoSpawnPack.Set then
+                                            Controls.AutoSpawnPack:Set(true)
                                         end
-                                        notify("Spawn Manager", "Resumed — pack purchased!")
+                                    end)
+                                    if Rayfield.Flags
+                                        and Rayfield.Flags["AutoSpawnPack"] then
+                                        Rayfield.Flags["AutoSpawnPack"]:Set(true)
                                     end
-                                    autoStopHandled = false
-                                    return
-                                elseif st == "FilterRejected" then
-                                    -- The pack didn't actually pass the filter; just unlock.
-                                    autoStopHandled = false
-                                    return
+                                    notify("Spawn Manager", "Resumed — pack purchased!")
                                 end
+                                autoStopHandled = false
+                                return
+                            elseif st == "FilterRejected" then
+                                -- Pack didn't pass; unlock without announcing.
+                                autoStopHandled = false
+                                return
                             end
-                            -- Timed out — always unlock so the loop can't get stuck.
-                            autoStopHandled = false
-                        end)
-                    end
-                elseif not spawnedRecord then
-                    warnOnce("AutoStop:no-new-pack",
-                        "Auto Stop did not detect a new conveyor pack after spawning.")
+                        end
+                        -- Hard timeout — never leave the lock stuck.
+                        autoStopHandled = false
+                    end)
                 end
             end)
         end
