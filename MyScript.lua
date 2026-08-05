@@ -266,11 +266,18 @@ local PlayTimeRewardRE = Remotes:FindFirstChild("PlayTimeRewardRE")
 local DailyRewardRE    = Remotes:FindFirstChild("DailyRewardRE")
 local UpgradesRE       = Remotes:FindFirstChild("UpgradesRE")
 local BossRaidRE = Remotes:FindFirstChild("BossRaidRE")
+local GradeRollRE      = Remotes:FindFirstChild("GradeRollRE")
 local Modules    = ReplicatedStorage:FindFirstChild("Modules")
 local BossRaidConfig
 if Modules and Modules:FindFirstChild("BossRaidConfig") then
     pcall(function()
         BossRaidConfig = require(Modules.BossRaidConfig)
+    end)
+end
+local RankGradeRollConfig
+if Modules and Modules:FindFirstChild("GradeRollConfig") then
+    pcall(function()
+        RankGradeRollConfig = require(Modules.GradeRollConfig)
     end)
 end
 local currentRaidBossId = ""
@@ -395,6 +402,11 @@ local Config = {
     CardActionDelay   = 0.6,
     AutoSell          = false,
     AutoTraitRoll     = false,
+    SelectedRankCards = { "All" },
+    TargetRank        = "UR",
+    RankUseGems       = true,
+    RankUseCash       = false,
+    AutoRankRoll      = false,
     AutoClaimPlaytime = false,
     AutoClaimDaily    = false,
     AutoPlacePack     = false,
@@ -795,6 +807,14 @@ local function getPlayerCash()
         if parsed then return parsed end
     end
     return nil
+end
+
+local function getPlayerGems()
+    local gv = player:FindFirstChild("GemsValue")
+    if gv and (gv:IsA("NumberValue") or gv:IsA("IntValue")) then
+        return tonumber(gv.Value) or 0
+    end
+    return 0
 end
 
 -- CONFIRMED GAME STRUCTURE (from screenshots):
@@ -3048,6 +3068,313 @@ local function getSortedCardsInBackpack()
     return result
 end
 
+-- ── Card Ranking reroll ──────────────────────────────────────
+-- GradeRollClient uses card Tools directly and sends:
+-- GradeRollRE:FireServer("RollGrade", { Tool = tool, Currency = "gems"|"cash" })
+local rankCardDropdown
+local rankCardOptionMap = {}
+local rankCardOptionsSignature = ""
+local rankCardOptions = { "All" }
+local rankCardRefreshQueued = false
+local rankRollPending = false
+local rankRollPendingTool
+local rankRollResponse
+
+local function getRankCardsInBackpack()
+    local result = {}
+    local backpack = player:FindFirstChild("Backpack")
+    if not backpack then return result end
+
+    for _, item in ipairs(backpack:GetChildren()) do
+        if item:IsA("Tool") and item:GetAttribute("CardName") ~= nil then
+            table.insert(result, item)
+        end
+    end
+
+    table.sort(result, function(a, b)
+        local aName = tostring(a:GetAttribute("CardName") or a.Name)
+        local bName = tostring(b:GetAttribute("CardName") or b.Name)
+        if aName ~= bName then return aName < bName end
+        return a.Name < b.Name
+    end)
+    return result
+end
+
+local function buildRankCardOptions()
+    local options = { "All" }
+    local map = {}
+    local seen = {}
+
+    for _, tool in ipairs(getRankCardsInBackpack()) do
+        local baseName = tostring(tool:GetAttribute("CardName") or tool.Name)
+        seen[baseName] = (seen[baseName] or 0) + 1
+        local label = baseName
+        if seen[baseName] > 1 then
+            label = baseName .. " #" .. tostring(seen[baseName])
+        end
+        table.insert(options, label)
+        map[label] = tool
+    end
+
+    return options, map
+end
+
+local function selectedRankCardTools()
+    local cards = getRankCardsInBackpack()
+    local selected = Config.SelectedRankCards
+    if type(selected) ~= "table" or #selected == 0 then
+        return cards
+    end
+
+    for _, value in ipairs(selected) do
+        if tostring(value) == "All" then return cards end
+    end
+
+    local byTool = {}
+    for _, value in ipairs(selected) do
+        local tool = rankCardOptionMap[tostring(value)]
+        if tool and tool.Parent == player:FindFirstChild("Backpack") then
+            byTool[tool] = true
+        end
+    end
+
+    local result = {}
+    for _, tool in ipairs(cards) do
+        if byTool[tool] then table.insert(result, tool) end
+    end
+    return result
+end
+
+local function refreshRankCardDropdown()
+    if not rankCardDropdown then return end
+    local options, map = buildRankCardOptions()
+    rankCardOptionMap = map
+    rankCardOptions = options
+    local signature = table.concat(options, "\0")
+    if signature == rankCardOptionsSignature then return end
+    rankCardOptionsSignature = signature
+
+    local selected = Config.SelectedRankCards or { "All" }
+    local refreshed = pcall(function()
+        rankCardDropdown:Refresh(options, selected)
+    end)
+    if not refreshed then
+        pcall(function() rankCardDropdown:Set(options) end)
+    end
+end
+
+local function queueRankCardDropdownRefresh()
+    if rankCardRefreshQueued then return end
+    rankCardRefreshQueued = true
+    task.delay(0.2, function()
+        rankCardRefreshQueued = false
+        refreshRankCardDropdown()
+    end)
+end
+
+local function getRankTargetOptions()
+    local result = {}
+    if RankGradeRollConfig
+        and type(RankGradeRollConfig.GetGrades) == "function" then
+        local ok, grades = pcall(RankGradeRollConfig.GetGrades)
+        if ok and type(grades) == "table" then
+            for _, entry in ipairs(grades) do
+                local grade = type(entry) == "table" and entry.Grade or entry
+                if grade ~= nil and tostring(grade) ~= "" then
+                    table.insert(result, tostring(grade))
+                end
+            end
+        end
+    end
+
+    if #result == 0 then
+        result = { "C", "B", "A", "S", "SS", "SR", "UR", "LR" }
+    end
+    return result
+end
+
+local function getRankTarget()
+    local target = tostring(Config.TargetRank or "")
+    if target == "" then return nil end
+    return target
+end
+
+local function getRankCashCost(tool)
+    if not tool then return 0 end
+    local cardName = tool:GetAttribute("CardName")
+    local level = tonumber(tool:GetAttribute("CardLevel"))
+        or tonumber(tool:FindFirstChild("CardLevel")
+            and tool.CardLevel.Value) or 1
+    local mutation = tostring(tool:GetAttribute("CardMutation") or "Normal")
+
+    if RankGradeRollConfig
+        and type(RankGradeRollConfig.GetRollCost) == "function" then
+        local ok, cost = pcall(
+            RankGradeRollConfig.GetRollCost,
+            cardName,
+            level,
+            mutation
+        )
+        if ok and tonumber(cost) then return tonumber(cost) end
+    end
+    return 0
+end
+
+local function getRankGemsCost()
+    return GradeRollRE and tonumber(GradeRollRE:GetAttribute("CostGemsPerRoll"))
+        or 1
+end
+
+local function chooseRankCurrency(tool)
+    local gemsEnabled = Config.RankUseGems == true
+    local cashEnabled = Config.RankUseCash == true
+    local gemCost = getRankGemsCost()
+    local gems = getPlayerGems()
+
+    -- When both are enabled, gems are always preferred. Cash becomes
+    -- eligible only after the gem balance reaches zero, as requested.
+    if gemsEnabled and gems >= gemCost then
+        return "gems"
+    end
+
+    if cashEnabled and (not gemsEnabled or gems <= 0) then
+        local cash = getPlayerCash() or 0
+        local cashCost = getRankCashCost(tool)
+        if cashCost <= 0 or cash >= cashCost then
+            return "cash"
+        end
+    end
+    return nil
+end
+
+local function rankCardHasTarget(tool)
+    return tool and tostring(tool:GetAttribute("CardGrade") or "")
+        == tostring(getRankTarget() or "")
+end
+
+local function stopRankReroll(message)
+    Config.AutoRankRoll = false
+    if Controls.AutoRankRoll and Controls.AutoRankRoll.Set then
+        pcall(function() Controls.AutoRankRoll:Set(false) end)
+    end
+    if message then notify("Card Ranking", message) end
+end
+
+if GradeRollRE then
+    GradeRollRE.OnClientEvent:Connect(function(action, data)
+        if not rankRollPending or type(data) ~= "table" then return end
+        if data.Tool and data.Tool ~= rankRollPendingTool then return end
+        if action == "RollResult" or action == "RollFailed" then
+            rankRollResponse = {
+                action = action,
+                data = data,
+            }
+        end
+    end)
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.4)
+        if rankCardDropdown then
+            queueRankCardDropdownRefresh()
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+        if not Config.AutoRankRoll then continue end
+        if not GradeRollRE then
+            stopRankReroll("GradeRollRE was not found.")
+            continue
+        end
+
+        local target = getRankTarget()
+        if not target then
+            stopRankReroll("Select a target ranking first.")
+            continue
+        end
+
+        local cards = selectedRankCardTools()
+        if #cards == 0 then
+            stopRankReroll("No selected cards are currently in your backpack.")
+            continue
+        end
+
+        local progressed = false
+        local cardsRemaining = false
+        for _, tool in ipairs(cards) do
+            if not Config.AutoRankRoll then break end
+            if not tool.Parent then continue end
+            while Config.AutoRankRoll and tool.Parent
+                and not rankCardHasTarget(tool) do
+                cardsRemaining = true
+                local currency = chooseRankCurrency(tool)
+                if not currency then
+                    stopRankReroll(
+                        "Not enough " ..
+                        (Config.RankUseGems and Config.RankUseCash
+                            and "gems or cash."
+                            or "currency.")
+                    )
+                    break
+                end
+
+                rankRollPending = true
+                rankRollPendingTool = tool
+                rankRollResponse = nil
+                pcall(function()
+                    GradeRollRE:FireServer("RollGrade", {
+                        Tool = tool,
+                        Currency = currency,
+                    })
+                end)
+
+                local deadline = os.clock() + 8
+                while Config.AutoRankRoll and rankRollPending
+                    and not rankRollResponse and os.clock() < deadline do
+                    task.wait(0.1)
+                end
+
+                local response = rankRollResponse
+                rankRollPending = false
+                rankRollPendingTool = nil
+                rankRollResponse = nil
+
+                if not response then
+                    stopRankReroll("Rank roll timed out; reroll stopped safely.")
+                    break
+                end
+
+                if response.action == "RollFailed" then
+                    local reason = tostring(response.data.Reason or "UNKNOWN")
+                    if reason == "NOT_ENOUGH_GEMS"
+                        or reason == "NOT_ENOUGH_CASH"
+                        or reason == "PAYMENT_FAILED" then
+                        stopRankReroll("The selected currency is no longer available.")
+                        break
+                    end
+                    task.wait(0.8)
+                else
+                    progressed = true
+                    task.wait(0.2)
+                end
+            end
+            if tool.Parent and not rankCardHasTarget(tool) then
+                cardsRemaining = true
+            end
+        end
+
+        if Config.AutoRankRoll and not cardsRemaining then
+            stopRankReroll("All selected cards reached " .. tostring(target) .. ".")
+        elseif Config.AutoRankRoll and not progressed then
+            task.wait(0.75)
+        end
+    end
+end)
+
 -- ── Auto Place Pack loop ──────────────────────────────────────
 task.spawn(function()
     while true do
@@ -3811,6 +4138,11 @@ local function buildSerializableConfig()
         CardActionDelay   = Config.CardActionDelay,
         AutoSell          = Config.AutoSell,
         AutoTraitRoll     = Config.AutoTraitRoll,
+        SelectedRankCards  = Config.SelectedRankCards,
+        TargetRank         = Config.TargetRank,
+        RankUseGems        = Config.RankUseGems,
+        RankUseCash        = Config.RankUseCash,
+        AutoRankRoll       = Config.AutoRankRoll,
         AutoClaimPlaytime = Config.AutoClaimPlaytime,
         AutoClaimDaily    = Config.AutoClaimDaily,
         AutoPlacePack     = Config.AutoPlacePack,
@@ -3950,7 +4282,9 @@ local function loadConfig(name, isAutoload)
         "AutoCarryBox", "AutoSellBox", "AutoSellDelay",
         "SelectedRarities", "SelectedMutations", "SelectedPacks",
         "AutoUpgrade", "UpgradeDelay", "CardActionDelay", "AutoSell",
-        "AutoTraitRoll", "AutoClaimPlaytime", "AutoClaimDaily",
+        "AutoTraitRoll", "SelectedRankCards", "TargetRank",
+        "RankUseGems", "RankUseCash", "AutoRankRoll",
+        "AutoClaimPlaytime", "AutoClaimDaily",
         "AutoPlacePack", "AutoOpenPack", "AutoBuyBoost",
         "AutoInfinityEquip", "AutoInfinityTower", "AutoInfinityHide",
         "RaidDifficulties", "AutoRaidEquip", "AutoRaid", "AutoRaidHide",
@@ -4378,6 +4712,82 @@ combatTab:CreateToggle({
 --  TAB 5 – Reroll
 -- ══════════════════════════════════════════════════════════════
 local rerollTab = Window:CreateTab("🔄 Reroll", 0)
+
+rerollTab:CreateSection("Card Ranking")
+
+local initialRankCardOptions, initialRankCardMap = buildRankCardOptions()
+rankCardOptionMap = initialRankCardMap
+rankCardOptions = initialRankCardOptions
+
+rankCardDropdown = rerollTab:CreateDropdown({
+    Name            = "Select Card",
+    Options         = initialRankCardOptions,
+    CurrentOption   = Config.SelectedRankCards,
+    MultipleOptions = true,
+    Flag            = "SelectedRankCards",
+    Callback        = function(v)
+        Config.SelectedRankCards = collapseFullSelection(v, rankCardOptions)
+    end,
+})
+
+local rankOptions = getRankTargetOptions()
+local configuredTargetRank = tostring(Config.TargetRank or "")
+local targetRankIsValid = false
+for _, rank in ipairs(rankOptions) do
+    if rank == configuredTargetRank then
+        targetRankIsValid = true
+        break
+    end
+end
+if not targetRankIsValid then
+    Config.TargetRank = rankOptions[1] or "UR"
+end
+Controls.TargetRank = rerollTab:CreateDropdown({
+    Name            = "Target Ranking",
+    Options         = rankOptions,
+    CurrentOption   = Config.TargetRank,
+    MultipleOptions = false,
+    Flag            = "TargetRank",
+    Callback        = function(v)
+        if type(v) == "table" then v = v[1] end
+        Config.TargetRank = tostring(v or rankOptions[1] or "UR")
+    end,
+})
+
+Controls.RankUseGems = rerollTab:CreateToggle({
+    Name         = "Use Gems",
+    CurrentValue = Config.RankUseGems,
+    Flag         = "RankUseGems",
+    Callback     = function(v) Config.RankUseGems = v end,
+})
+
+Controls.RankUseCash = rerollTab:CreateToggle({
+    Name         = "Use Cash",
+    CurrentValue = Config.RankUseCash,
+    Flag         = "RankUseCash",
+    Callback     = function(v) Config.RankUseCash = v end,
+})
+
+Controls.AutoRankRoll = rerollTab:CreateToggle({
+    Name         = "Start Reroll",
+    CurrentValue = Config.AutoRankRoll,
+    Flag         = "AutoRankRoll",
+    Callback     = function(v)
+        Config.AutoRankRoll = v
+        if v and not GradeRollRE then
+            Config.AutoRankRoll = false
+            if Controls.AutoRankRoll and Controls.AutoRankRoll.Set then
+                pcall(function() Controls.AutoRankRoll:Set(false) end)
+            end
+            notify("Card Ranking", "GradeRollRE was not found.")
+        end
+    end,
+})
+
+rerollTab:CreateParagraph({
+    Title   = "Card Ranking behavior",
+    Content = "Selected cards are rerolled one at a time until they reach the target ranking. Gems are used first; cash is used only after gems reach zero.",
+})
 
 rerollTab:CreateSection("Traits")
 
