@@ -3019,7 +3019,7 @@ removeAllCards = function(limit)
         if didRemove then
             removed = removed + 1
         end
-        task.wait(CARD_REMOVAL_DELAY)
+        task.wait(math.max(0.1, Config.CardActionDelay))
     end
 
     restoreCharacterPosition(savedCFrame)
