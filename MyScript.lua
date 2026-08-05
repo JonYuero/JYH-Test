@@ -289,7 +289,8 @@ local RARITIES = {
 local MUTATIONS = {
     "Normal", "Golden", "Venomous", "Diamond",
     "Rainbow", "Sakura", "Candy", "Blessed",
-    "Radioactive", "Glitch", "Starfallen", "Admin",
+    "Radioactive", "Glitch", "Starfallen", "Admin", 
+    "Unknown",
 }
 
 local PACKS = {
