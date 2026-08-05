@@ -40,8 +40,8 @@ local function coreNotify(title, text)
 end
 
 -- ── Auth constants ────────────────────────────────────────────
-local AUTH_ENDPOINT = "https://animecardfarm-api.jonyuerohub-api.workers.dev/api/v1/key/authenticate"
-local GET_KEY_URL   = "https://animecardfarm-api.jonyuerohub-api.workers.dev/get-key"
+local AUTH_ENDPOINT = "https://api.jonyuerohub-api.workers.dev/api/v1/key/authenticate"
+local GET_KEY_URL   = "https://api.jonyuerohub-api.workers.dev/get-key"
 -- clientId is derived from the Roblox user ID — never entered by the user.
 local CLIENT_ID     = "ROBLOX-USER-" .. tostring(player.UserId)
 
