@@ -1205,10 +1205,8 @@ evaluateRecordReadiness = function(record)
         transitionState(record, "WaitingForPurchaseWindow", "metadata ready")
     end
 
-    if Config.AutoBuyMatching
-        and record.state == "WaitingForPurchaseWindow"
-        and os.clock() >= (record.retryNotBefore or 0)
-        and (hasId or (record.buyPrompt and record.buyPrompt.Enabled)) then
+    local purchaseWindowOpen = record.state == "WaitingForPurchaseWindow" and os.clock() >= (record.retryNotBefore or 0) and (hasId or (record.buyPrompt and record.buyPrompt.Enabled))
+    if Config.AutoBuyMatching and purchaseWindowOpen then
         queuePurchase(record)
     end
 end
