@@ -69,7 +69,7 @@ local function returnToLoader(reason)
 
     local msg = tostring(reason or "Session validation failed")
     warn("[MyScript] Returning to Loader. Reason: " .. msg)
-    coreNotify("JonYueroHub", msg .. "\nReturning to Loader…")
+    coreNotify("JonYueroHub", msg .. "\nGet key first...")
 
     local fn, fetchErr = fetchLua(LOADER_URL)
     if not fn then
@@ -99,7 +99,7 @@ end
 local function validateSession(session)
     -- 1. Must be a table
     if type(session) ~= "table" then
-        return false, "No valid session found. Run Loader.lua first."
+        return false, "No valid key"
     end
 
     -- 2. authenticated must be exactly true
@@ -3180,7 +3180,7 @@ local Window = Rayfield:CreateWindow({
 -- ══════════════════════════════════════════════════════════════
 --  TAB 1 – Auto Spawn Pack
 -- ══════════════════════════════════════════════════════════════
-local spawnTab = Window:CreateTab("🃏 Auto Spawn Pack", 4483362458)
+local spawnTab = Window:CreateTab("🃏 Auto Spawn Pack", 0)
 
 spawnTab:CreateSection("Spawn Manager")
 
@@ -3278,7 +3278,7 @@ Controls.SelectedMutations = spawnTab:CreateDropdown({
 -- ══════════════════════════════════════════════════════════════
 --  TAB 2 – Cards
 -- ══════════════════════════════════════════════════════════════
-local cardsTab = Window:CreateTab("⬆️ Cards", 4483362458)
+local cardsTab = Window:CreateTab("⬆️ Cards", 0)
 
 cardsTab:CreateSection("Card Management")
 
@@ -3343,7 +3343,7 @@ Controls.UpgradeDelay = cardsTab:CreateSlider({
 -- ══════════════════════════════════════════════════════════════
 --  TAB 3 – Auto Sell
 -- ══════════════════════════════════════════════════════════════
-local autoSellTab = Window:CreateTab("📦 Auto Sell", 4483362458)
+local autoSellTab = Window:CreateTab("📦 Auto Sell", 0)
 
 autoSellTab:CreateSection("Box Handling")
 
@@ -3383,7 +3383,7 @@ autoSellTab:CreateToggle({
 -- ══════════════════════════════════════════════════════════════
 --  TAB 4 – Combat
 -- ══════════════════════════════════════════════════════════════
-local combatTab = Window:CreateTab("⚔️ Combat", 4483362458)
+local combatTab = Window:CreateTab("⚔️ Combat", 0)
 
 combatTab:CreateSection("Infinity Tower")
 
@@ -3476,7 +3476,7 @@ combatTab:CreateToggle({
 -- ══════════════════════════════════════════════════════════════
 --  TAB 5 – Reroll
 -- ══════════════════════════════════════════════════════════════
-local rerollTab = Window:CreateTab("🔄 Reroll", 4483362458)
+local rerollTab = Window:CreateTab("🔄 Reroll", 0)
 
 rerollTab:CreateSection("Traits")
 
@@ -3490,7 +3490,7 @@ Controls.AutoTraitRoll = rerollTab:CreateToggle({
 -- ══════════════════════════════════════════════════════════════
 --  TAB 6 – Misc
 -- ══════════════════════════════════════════════════════════════
-local miscTab = Window:CreateTab("🧪 Misc", 4483362458)
+local miscTab = Window:CreateTab("🧪 Misc", 0)
 
 miscTab:CreateSection("Potions")
 
