@@ -4423,8 +4423,8 @@ end
 --  Rayfield Window
 -- ══════════════════════════════════════════════════════════════
 local windowTitle = isPremium
-    and "👑 Jon Yuero Hub | Anime Card Farm"
-    or  "Jon Yuero Hub | Anime Card Farm"
+    and "👑 Jon Yuero Hub | Anime Card Farm v 1.0"
+    or  "Jon Yuero Hub | Anime Card Farm v 1.0"
 
 local Window = Rayfield:CreateWindow({
     Name            = windowTitle,
