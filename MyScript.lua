@@ -904,6 +904,7 @@ local diagnosticState = {}
 -- These upvalues are assigned inside the do block below.
 local warnOnce, passesFilter, debugAutoBuy, markFilterCacheDirty
 local getConveyorPacks, getPackKey, indexPackIds
+local reevaluateAutoBuy
 
 do -- ════ CONVEYOR INTERNALS (isolated scope — frees ~38 registers on exit) ════
 
@@ -1045,13 +1046,12 @@ local function isLikelyPackModel(model)
             end
         end
     end
-    -- Do not treat every model named "Box" in the entire workspace as a
-    -- conveyor purchase candidate. When the scan falls back to workspace,
-    -- require conveyor topology or one of the identifiers used by the
-    -- reference implementation.
-    return inConveyor
-        or getItemId(model) ~= nil
-        or hasPackId(model)
+
+    -- A workspace fallback must have an identifier, PackId, or prompt.
+    -- Inside the live conveyor hierarchy, a pack-like model may be observed
+    -- before its ItemId holder is created, so retain it for the watcher.
+    if not inConveyor then return false end
+    return knownPackName
 end
 
 -- ── Buy prompt helpers ────────────────────────────────────────────────
@@ -1153,13 +1153,12 @@ evaluateRecordReadiness = function(record)
         record.buyPrompt = findBestBuyPrompt(record.model)
     end
 
-    local hasId     = record.itemId ~= nil
-    local hasPrompt = record.buyPrompt ~= nil and record.buyPrompt.Enabled ~= false
+    local hasId = record.itemId ~= nil
 
-    -- The game's actual purchase endpoint requires the ItemId request path.
-    -- A prompt alone is only a fallback, so do not queue a pack before it
-    -- has an ItemId. This matches the old working script's contract.
-    if hasId and hasPrompt then
+    -- The remote purchase path only requires a live ItemId. A ProximityPrompt
+    -- is optional UI state and must not prevent the remote request from being
+    -- queued; it is used only for the guarded post-request/fallback action.
+    if hasId then
         if st ~= "ReadyToBuy" then transitionState(record, "ReadyToBuy") end
         if Config.AutoBuyMatching and not boxHandlingActive then
             if passesFilter(record.info) then
@@ -1176,8 +1175,6 @@ evaluateRecordReadiness = function(record)
         end
     elseif not hasId then
         if st ~= "WaitingForItemId" then transitionState(record, "WaitingForItemId") end
-    else
-        if st ~= "WaitingForPrompt" then transitionState(record, "WaitingForPrompt") end
     end
 end
 
@@ -1192,7 +1189,7 @@ queuePurchase = function(record)
         "Queued matching pack=" .. tostring(record.info and record.info.pack)
             .. " rarity=" .. tostring(record.info and record.info.rarity)
             .. " mutation=" .. tostring(record.info and record.info.mutation)
-            .. " PackId=" .. tostring(record.itemId),
+            .. " ItemId=" .. tostring(record.itemId),
         0
     )
 end
@@ -1508,6 +1505,14 @@ local function handleContainerAdded(desc)
                 registerPack(ownerModel)
             end
         end
+    else
+        -- ItemId/PackId holders can be added before their containing Model
+        -- receives a prompt. Resolve the nearest model so delayed IDs still
+        -- cause the actual pack to be registered.
+        local ownerModel = desc:FindFirstAncestorOfClass("Model")
+        if ownerModel and isLikelyPackModel(ownerModel) then
+            registerPack(ownerModel)
+        end
     end
 end
 
@@ -1597,6 +1602,24 @@ task.spawn(function()
         end
     end
 end)
+
+-- Re-arm the purchase path when the user enables the toggle after startup.
+-- Packs may already exist by the time the UI is switched on, so relying only
+-- on future DescendantAdded events leaves the queue empty.
+reevaluateAutoBuy = function(enabled)
+    if not enabled then return end
+    task.spawn(function()
+        doInitialConveyorScan()
+        for _, record in pairs(ConveyorRecords) do
+            if record.model:IsDescendantOf(workspace)
+                and record.state ~= "Purchased"
+                and record.state ~= "Removed" then
+                refreshRecordMetadata(record, true)
+                evaluateRecordReadiness(record)
+            end
+        end
+    end)
+end
 
 -- ── Compatibility shims assigned to outer upvalues ────────────────────
 
@@ -3508,14 +3531,19 @@ Controls.AutoStopSpawn = spawnTab:CreateToggle({
 })
 
 Controls.AutoBuyMatching = spawnTab:CreateToggle({
-    Name         = "Auto Buy Pack (Using Filter)",
+    Name         = "Auto Buy Pack",
     CurrentValue = Config.AutoBuyMatching,
     Flag         = "AutoBuyMatching",
-    Callback     = function(v) Config.AutoBuyMatching = v end,
+    Callback     = function(v)
+        Config.AutoBuyMatching = v
+        if v and reevaluateAutoBuy then
+            reevaluateAutoBuy(true)
+        end
+    end,
 })
 
 Controls.AutoBuyDebug = spawnTab:CreateToggle({
-    Name         = "Auto Buy Diagnostics",
+    Name         = "Auto Buy Debug Logs (Optional)",
     CurrentValue = Config.AutoBuyDebug,
     Flag         = "AutoBuyDebug",
     Callback     = function(v) Config.AutoBuyDebug = v end,
