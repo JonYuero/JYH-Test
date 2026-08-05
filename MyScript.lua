@@ -3079,6 +3079,11 @@ local rankCardRefreshQueued = false
 local rankRollPending = false
 local rankRollPendingTool
 local rankRollResponse
+local RANK_ROLL_LOOP_DELAY = 0.05
+local RANK_ROLL_RESPONSE_POLL = 0.03
+local RANK_ROLL_SUCCESS_DELAY = 0.05
+local RANK_ROLL_FAILURE_DELAY = 0.25
+local RANK_ROLL_IDLE_DELAY = 0.25
 
 local function getRankCardsInBackpack()
     local result = {}
@@ -3306,7 +3311,7 @@ end)
 
 task.spawn(function()
     while true do
-        task.wait(0.15)
+        task.wait(RANK_ROLL_LOOP_DELAY)
         if not Config.AutoRankRoll then continue end
         if not GradeRollRE then
             stopRankReroll("GradeRollRE was not found.")
@@ -3357,7 +3362,7 @@ task.spawn(function()
                 local deadline = os.clock() + 8
                 while Config.AutoRankRoll and rankRollPending
                     and not rankRollResponse and os.clock() < deadline do
-                    task.wait(0.1)
+                    task.wait(RANK_ROLL_RESPONSE_POLL)
                 end
 
                 local response = rankRollResponse
@@ -3378,10 +3383,10 @@ task.spawn(function()
                         stopRankReroll("The selected currency is no longer available.")
                         break
                     end
-                    task.wait(0.8)
+                    task.wait(RANK_ROLL_FAILURE_DELAY)
                 else
                     progressed = true
-                    task.wait(0.2)
+                    task.wait(RANK_ROLL_SUCCESS_DELAY)
                 end
             end
             if tool.Parent and not rankCardHasTarget(tool) then
@@ -3394,7 +3399,7 @@ task.spawn(function()
                 "All selected cards reached " .. table.concat(targets, ", ") .. "."
             )
         elseif Config.AutoRankRoll and not progressed then
-            task.wait(0.75)
+            task.wait(RANK_ROLL_IDLE_DELAY)
         end
     end
 end)
