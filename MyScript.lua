@@ -403,7 +403,7 @@ local Config = {
     AutoSell          = false,
     AutoTraitRoll     = false,
     SelectedRankCards = { "All" },
-    TargetRank        = "UR",
+    TargetRank        = { "UR" },
     RankUseGems       = true,
     RankUseCash       = false,
     AutoRankRoll      = false,
@@ -2223,7 +2223,11 @@ task.spawn(function()
                 notify("Auto Spawn Pack", "Stopped — filter match found!")
 
                 -- ── Step 4: Auto Continue watcher ───────────────────────
-                if Config.AutoContinueSpawn and Config.AutoBuyMatching then
+                -- Always launch when AutoContinueSpawn is on, regardless of
+                -- whether AutoBuyMatching is on — the pack may be removed by
+                -- the game, expire, or be bought manually, and we still need
+                -- to detect that and resume spawning.
+                if Config.AutoContinueSpawn then
                     local watchedRecord = spawnedRecord
                     task.spawn(function()
                         -- Wait up to 30 s for a terminal outcome.
@@ -2239,17 +2243,28 @@ task.spawn(function()
                                     if Controls.AutoSpawnPack and Controls.AutoSpawnPack.Set then
                                         pcall(function() Controls.AutoSpawnPack:Set(true) end)
                                     end
-                                    notify("Spawn Manager", "Resumed — pack purchased!")
+                                    notify("Spawn Manager", "Resumed — pack purchased or removed!")
                                 end
                                 autoStopHandled = false
                                 return
                             elseif st == "FilterRejected" then
-                                -- Pack didn't pass; unlock without announcing.
+                                -- Pack didn't pass the filter after all; unlock
+                                -- without resuming — let the next spawn decide.
                                 autoStopHandled = false
                                 return
                             end
                         end
-                        -- Hard timeout — never leave the lock stuck.
+                        -- Hard timeout (30 s): pack was never confirmed bought or
+                        -- removed. Re-enable spawning so the user isn't stuck —
+                        -- 30 s is long enough for the belt to have cycled.
+                        warn("[ACF] Auto Continue: 30 s timeout waiting for pack outcome — resuming spawn.")
+                        if Config.AutoContinueSpawn then
+                            Config.AutoSpawnPack = true
+                            if Controls.AutoSpawnPack and Controls.AutoSpawnPack.Set then
+                                pcall(function() Controls.AutoSpawnPack:Set(true) end)
+                            end
+                            notify("Spawn Manager", "Resumed — timeout waiting for pack.")
+                        end
                         autoStopHandled = false
                     end)
                 end
@@ -3270,9 +3285,13 @@ local function getRankTargetOptions()
 end
 
 local function getRankTarget()
-    local target = tostring(Config.TargetRank or "")
-    if target == "" then return nil end
-    return target
+    local targets = Config.TargetRank
+    -- Migrate legacy string value to table on the fly.
+    if type(targets) == "string" then
+        targets = targets ~= "" and { targets } or {}
+    end
+    if type(targets) ~= "table" or #targets == 0 then return nil end
+    return targets
 end
 
 local function getRankCashCost(tool)
@@ -3324,8 +3343,14 @@ local function chooseRankCurrency(tool)
 end
 
 local function rankCardHasTarget(tool)
-    return tool and tostring(tool:GetAttribute("CardGrade") or "")
-        == tostring(getRankTarget() or "")
+    if not tool then return false end
+    local targets = getRankTarget()
+    if not targets then return false end
+    local grade = tostring(tool:GetAttribute("CardGrade") or "")
+    for _, t in ipairs(targets) do
+        if grade == tostring(t) then return true end
+    end
+    return false
 end
 
 local function stopRankReroll(message)
@@ -3444,7 +3469,8 @@ task.spawn(function()
         end
 
         if Config.AutoRankRoll and not cardsRemaining then
-            stopRankReroll("All selected cards reached " .. tostring(target) .. ".")
+            local targetStr = target and table.concat(target, " / ") or "target"
+            stopRankReroll("All selected cards reached " .. targetStr .. ".")
         elseif Config.AutoRankRoll and not progressed then
             task.wait(0.75)
         end
@@ -4787,6 +4813,11 @@ combatTab:CreateToggle({
 -- ══════════════════════════════════════════════════════════════
 local rerollTab = Window:CreateTab("🔄 Reroll", 0)
 
+rerollTab:CreateParagraph({
+    Title   = "⚠️ Before You Reroll",
+    Content = "Do not hold or equip a card while rerolling is active. Held or equipped cards are removed from your backpack, making them invisible to the script — those cards will be skipped entirely until you put them away.",
+})
+
 rerollTab:CreateSection("Card Ranking")
 
 local initialRankCardOptions, initialRankCardMap = buildRankCardOptions()
@@ -4805,26 +4836,28 @@ rankCardDropdown = rerollTab:CreateDropdown({
 })
 
 local rankOptions = getRankTargetOptions()
-local configuredTargetRank = tostring(Config.TargetRank or "")
-local targetRankIsValid = false
-for _, rank in ipairs(rankOptions) do
-    if rank == configuredTargetRank then
-        targetRankIsValid = true
-        break
-    end
+-- Migrate legacy string to table and validate each entry.
+if type(Config.TargetRank) == "string" then
+    Config.TargetRank = Config.TargetRank ~= "" and { Config.TargetRank } or {}
 end
-if not targetRankIsValid then
-    Config.TargetRank = rankOptions[1] or "UR"
+if type(Config.TargetRank) ~= "table" then Config.TargetRank = {} end
+local validRankSet = {}
+for _, r in ipairs(rankOptions) do validRankSet[r] = true end
+local validTargets = {}
+for _, r in ipairs(Config.TargetRank) do
+    if validRankSet[r] then table.insert(validTargets, r) end
 end
+Config.TargetRank = #validTargets > 0 and validTargets or { rankOptions[1] or "UR" }
+
 Controls.TargetRank = rerollTab:CreateDropdown({
     Name            = "Target Ranking",
     Options         = rankOptions,
     CurrentOption   = Config.TargetRank,
-    MultipleOptions = false,
+    MultipleOptions = true,
     Flag            = "TargetRank",
     Callback        = function(v)
-        if type(v) == "table" then v = v[1] end
-        Config.TargetRank = tostring(v or rankOptions[1] or "UR")
+        if type(v) == "string" then v = { v } end
+        Config.TargetRank = (type(v) == "table" and #v > 0) and v or { rankOptions[1] or "UR" }
     end,
 })
 
