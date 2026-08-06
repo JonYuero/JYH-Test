@@ -759,12 +759,16 @@ local function parseCompactCash(text)
         b  = 1e9,  B  = 1e9,
         t  = 1e12, T  = 1e12,
         qa = 1e15, Qa = 1e15, QA = 1e15,
+        qd = 1e15, Qd = 1e15, QD = 1e15,  -- alternate quadrillion spelling used by some games
         qi = 1e18, Qi = 1e18, QI = 1e18,
         sx = 1e21, Sx = 1e21, SX = 1e21,
         sp = 1e24, Sp = 1e24, SP = 1e24,
         oc = 1e27, Oc = 1e27, OC = 1e27,
         no = 1e30, No = 1e30, NO = 1e30,
         dc = 1e33, Dc = 1e33, DC = 1e33,
+        ud = 1e36, Ud = 1e36, UD = 1e36,  -- undecillion
+        dd = 1e39, Dd = 1e39, DD = 1e39,  -- duodecillion
+        td = 1e42, Td = 1e42, TD = 1e42,  -- tredecillion
     }
 
     -- Try two-letter suffix first, then one-letter suffix, then plain number.
@@ -1829,12 +1833,14 @@ local function registerPack(packModel)
 end
 
 -- ── Plot-scoped conveyor container ────────────────────────────────────
+-- Uses the same multi-path fallback logic as findPlot/getPlotButtons so
+-- that the container is found even when MAP is absent or Plot_N0 is missing.
 local function getLocalConveyorContainer()
-    local map = workspace:FindFirstChild("MAP")
-    local plots = map and map:FindFirstChild("Plots")
-    local slot = plots and plots:FindFirstChild(tostring(Config.PlotNumber))
-    local plotN0 = slot and slot:FindFirstChild("Plot_N0")
-    return plotN0 and plotN0:FindFirstChild("LocalConveyorModels") or nil
+    local plot = findPlot(Config.PlotNumber)
+    if not plot then return nil end
+    -- Direct child first, then recursive (handles Plot_N0 vs slot root).
+    return plot:FindFirstChild("LocalConveyorModels")
+        or plot:FindFirstChild("LocalConveyorModels", true)
 end
 
 -- ── Initial local-conveyor scan (direct children only) ────────────────
@@ -1871,9 +1877,10 @@ local function rebindConveyorContainerInner()
 
     boundConveyorContainer = container
     if not container then
-        debugOnce("local-conveyor-missing",
+        warnOnce("local-conveyor-missing",
             "LocalConveyorModels not found for plot "
-                .. tostring(Config.PlotNumber))
+                .. tostring(Config.PlotNumber)
+                .. " — auto buy cannot register packs. Check plot number or game structure.")
         return
     end
 
