@@ -826,7 +826,7 @@ end
 --   packModel.GuiHolder.BillboardGuiInfo.Rarity  → child named after rarity (e.g. "Epic")
 --   packModel.GuiHolder.BillboardGuiInfo.Mutation → child named after mutation (e.g. "Normal")
 
--- Get the raw price text from the pack's billboard GUI.
+-- Get the raw price text from the pack's billboard GUI (used only as last resort).
 local function getPackPriceText(packModel)
     if not packModel then return nil end
     local gui = packModel:FindFirstChild("GuiHolder")
@@ -846,6 +846,81 @@ local function getPackPriceText(packModel)
             if t ~= "" then return t end
         end
     end
+    return nil
+end
+
+-- Get the pack price as an exact number.
+-- Tries three sources in order so suffix parsing is only a last resort:
+--   1. Model attributes  (Price, Cost, CashCost, CashPrice, cash, price)
+--   2. NumberValue / IntValue children anywhere in the model tree
+--      named Price, Cost, CashCost, CashPrice, cash, or price
+--   3. GUI text label parsed through parseCompactCash (suffix-based, may fail)
+-- Returns: number or nil.
+-- Writes a warnOnce if every source fails so the failure is visible in console.
+local PRICE_ATTR_NAMES = { "Price", "Cost", "CashCost", "CashPrice", "cash", "price" }
+
+local function getPackPrice(packModel)
+    if not packModel then return nil end
+
+    -- 1. Model attributes — exact number, no parsing needed.
+    for _, attrName in ipairs(PRICE_ATTR_NAMES) do
+        local v = packModel:GetAttribute(attrName)
+        if type(v) == "number" and v > 0 then
+            return v
+        end
+    end
+
+    -- 2. NumberValue / IntValue children (direct or one level deep).
+    local function searchValueObjects(parent)
+        for _, child in ipairs(parent:GetChildren()) do
+            if child:IsA("NumberValue") or child:IsA("IntValue") then
+                local n = child.Name:lower()
+                for _, attrName in ipairs(PRICE_ATTR_NAMES) do
+                    if n == attrName:lower() then
+                        local v = tonumber(child.Value)
+                        if v and v > 0 then return v end
+                    end
+                end
+            end
+        end
+        -- One level deeper (e.g. values inside a "Values" folder).
+        for _, child in ipairs(parent:GetChildren()) do
+            if child:IsA("Folder") or child:IsA("Model") or child:IsA("Configuration") then
+                for _, grandchild in ipairs(child:GetChildren()) do
+                    if grandchild:IsA("NumberValue") or grandchild:IsA("IntValue") then
+                        local n = grandchild.Name:lower()
+                        for _, attrName in ipairs(PRICE_ATTR_NAMES) do
+                            if n == attrName:lower() then
+                                local v = tonumber(grandchild.Value)
+                                if v and v > 0 then return v end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    local fromValue = searchValueObjects(packModel)
+    if fromValue then return fromValue end
+
+    -- 3. GUI text label — last resort, suffix parsing.
+    local priceText = getPackPriceText(packModel)
+    if priceText then
+        local parsed = parseCompactCash(priceText)
+        if parsed and parsed > 0 then
+            return parsed
+        end
+        -- Text was found but couldn't be parsed — warn so it shows in console.
+        warnOnce("price-parse:" .. tostring(packModel),
+            "[AutoBuy] Pack price text could not be parsed: '"
+                .. tostring(priceText)
+                .. "' — add the suffix to parseCompactCash if this suffix is used in-game.")
+        return nil
+    end
+
+    -- No source found at all (GUI not yet replicated is normal on first tick).
     return nil
 end
 
@@ -1387,23 +1462,19 @@ refreshRecordMetadata = function(record, force)
     record.rarity   = freshRarity
     record.mutation = freshMutation
 
-    -- Price: parse the text label inside BillboardGuiInfo.Price.
-    local priceText = getPackPriceText(record.model)
-    if priceText then
-        local parsed = parseCompactCash(priceText)
-        if parsed and parsed > 0 then
-            record.price     = parsed
-            record.priceText = priceText
-            record.priceState = "Valid"
-        else
-            record.price     = nil
-            record.priceState = "InvalidPrice"
-            debugOnce("price-parse:" .. tostring(record.model),
-                "Could not parse price text: " .. tostring(priceText), 0)
-        end
+    -- Price: try exact numeric sources first, GUI text only as last resort.
+    -- getPackPrice searches attributes → NumberValue children → suffix text.
+    local freshPrice = getPackPrice(record.model)
+    if freshPrice and freshPrice > 0 then
+        record.price      = freshPrice
+        -- Keep priceText for the debug log line; re-read the raw label if possible.
+        record.priceText  = getPackPriceText(record.model) or tostring(freshPrice)
+        record.priceState = "Valid"
     else
-        -- Price GUI not yet replicated; leave existing value in place.
+        -- Could not resolve a price yet.
         if record.price == nil then
+            -- Only overwrite if we never had a valid price (don't erase a
+            -- previously-cached good value just because the GUI is mid-update).
             record.priceState = "Missing"
         end
     end
