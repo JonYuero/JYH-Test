@@ -4810,26 +4810,22 @@ local function isBossRaidOpen()
     return string.find(normalized, "end in", 1, true) ~= nil
 end
 
-local function resetRaidAttemptAfterClosedWindow()
-    if isBossRaidOpen() then
-        raidClosedSince = nil
-        return
-    end
-
-    local now = os.clock()
-    raidClosedSince = raidClosedSince or now
-    -- Require a stable closed state before re-arming. This avoids a brief
-    -- timer/UI replication gap reopening the same hourly attempt.
-    if now - raidClosedSince >= 3 then
-        raidAttemptConsumed = false
-        clearCompletedRaidDifficulties()
-    end
-end
-
 task.spawn(function()
     while true do
         task.wait(0.5)
-        resetRaidAttemptAfterClosedWindow()
+        if isBossRaidOpen() then
+            raidClosedSince = nil
+        else
+            local now = os.clock()
+            raidClosedSince = raidClosedSince or now
+            -- Require a stable closed state before re-arming. This avoids a brief
+            -- timer/UI replication gap reopening the same hourly attempt.
+            if now - raidClosedSince >= 3 then
+                raidAttemptConsumed = false
+                clearCompletedRaidDifficulties()
+            end
+        end
+
         local timer = findBossRaidTimer()
         local text = readRaidTimerText(timer)
         if text and text ~= "" then
@@ -4842,31 +4838,6 @@ task.spawn(function()
         updateRaidInfoDisplay(Config.RaidDifficulties)
     end
 end)
-
-local function clickBackpackEquipBest()
-    return doEquipBestCards(4) ~= nil
-end
-
-local function equipBestCardsWithRetry()
-    for _ = 1, 2 do
-        local placed = doEquipBestCards(4)
-        if placed and placed > 0 then
-            return true
-        end
-        task.wait(CARD_REMOVAL_DELAY)
-    end
-    return false
-end
-
-local function waitForBossRaidConfirmation()
-    for _ = 1, 20 do
-        if player:GetAttribute("BossRaidInBattle") == true then
-            return true
-        end
-        task.wait(0.15)
-    end
-    return false
-end
 
 startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     -- BossRaidRewardClient claims the reward from its CLOSE button. Never
@@ -4922,7 +4893,15 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
         -- Do not wait for the battle attribute: a rejected/failed start must
         -- not cause the polling loop to spam the server repeatedly.
         raidAttemptConsumed = true
-        if waitForBossRaidConfirmation() then
+        local raidConfirmed = false
+        for _ = 1, 20 do
+            if player:GetAttribute("BossRaidInBattle") == true then
+                raidConfirmed = true
+                break
+            end
+            task.wait(0.15)
+        end
+        if raidConfirmed then
             completedRaidDifficulties[raidDifficulty] = true
         else
             return false
@@ -4940,7 +4919,7 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     return true
 end
 
-local combatBusy = false
+combatBusy = false
 
 -- One scheduler owns both modes.  Boss Raid is evaluated first on every
 -- pass, including while Tower is active, so "End in" cannot be missed.
@@ -4972,7 +4951,16 @@ task.spawn(function()
 
             if not isCombatActive() then
                 if Config.AutoTeamCardCycle then
-                    if equipBestCardsWithRetry() then
+                    local cardsEquipped = false
+                    for _ = 1, 2 do
+                        local placed = doEquipBestCards(4)
+                        if placed and placed > 0 then
+                            cardsEquipped = true
+                            break
+                        end
+                        task.wait(CARD_REMOVAL_DELAY)
+                    end
+                    if cardsEquipped then
                         startCombatBattle(
                             "BossRaid",
                             Config.AutoRaidEquip,
@@ -4995,7 +4983,16 @@ task.spawn(function()
         if towerEnabled and not isCombatActive() then
             combatBusy = true
             if Config.AutoTeamCardCycle then
-                if equipBestCardsWithRetry() then
+                local cardsEquipped = false
+                for _ = 1, 2 do
+                    local placed = doEquipBestCards(4)
+                    if placed and placed > 0 then
+                        cardsEquipped = true
+                        break
+                    end
+                    task.wait(CARD_REMOVAL_DELAY)
+                end
+                if cardsEquipped then
                     startCombatBattle(
                         "InfinityTower",
                         Config.AutoInfinityEquip,
@@ -5021,7 +5018,7 @@ end)
 -- Luau limits the number of local registers in the top-level chunk; without
 -- this boundary the many UI controls added below make the whole script fail
 -- during compilation with "Out of local registers".
-local function buildUserInterface()
+function buildUserInterface()
 
 local ConfigManager = {
     ConfigName        = "",
