@@ -5,7 +5,7 @@
 
 -- ── URL constants (single source of truth) ───────────────────
 local LOADER_URL    = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/Loader.lua"
-local MY_SCRIPT_URL = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/MyScript.lua"
+local ANIME_CARD_FARM_URL = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/MyScript.lua"
 local SCRIPT_VERSION = "v 1.0"
 
 -- ── Environment / duplicate-loader guard ─────────────────────
@@ -41,14 +41,12 @@ end
 
 -- ── Auth constants ────────────────────────────────────────────
 local AUTH_ENDPOINT = "https://api.jonyuerohub-api.workers.dev/api/v1/key/authenticate"
-local GET_KEY_URL   = "https://api.jonyuerohub-api.workers.dev/get-key"
--- clientId is derived from the Roblox user ID — never entered by the user.
-local CLIENT_ID     = "ROBLOX-USER-" .. tostring(player.UserId)
+local GET_KEY_URL   = "https://api.jonyuerohub-api.workers.dev/api/v1/key/free-start"
 
 -- ── Game ID → hosted script URL ──────────────────────────────
 -- Add one entry per game the loader should support.
 local GAME_SCRIPTS = {
-    [125039473548047] = MY_SCRIPT_URL,
+    [125039473548047] = ANIME_CARD_FARM_URL,
     -- [PLACE_ID] = "https://...",
 }
 
@@ -57,11 +55,70 @@ local GAME_SCRIPTS = {
 -- It is stored in the same hub folder used by the game script's configs.
 local KEY_ROOT = "Jon Yuero Hub/Anime Card Farm"
 local KEY_FILE = KEY_ROOT .. "/LicenseKey.json"
+
+-- The device ID is global to JonYueroHub, not specific to one game.
+-- This is a persistent device-installation ID, not an unbreakable
+-- hardware fingerprint. Executor file resets or copying this file can
+-- change or imitate the installation identity.
+local DEVICE_ROOT = "Jon Yuero Hub"
+local DEVICE_FILE = DEVICE_ROOT .. "/DeviceId.txt"
+
 local FS_SUPPORTED = (
     type(makefolder) == "function" and type(isfolder) == "function"
     and type(writefile) == "function" and type(readfile) == "function"
     and type(isfile) == "function" and type(delfile) == "function"
 )
+
+local DEVICE_FS_SUPPORTED = (
+    type(makefolder) == "function" and type(isfolder) == "function"
+    and type(writefile) == "function" and type(readfile) == "function"
+    and type(isfile) == "function"
+)
+
+local function getPersistentDeviceId()
+    -- Compatibility fallback for executors without file APIs. This keeps
+    -- the loader from crashing, but remains account-based on that executor.
+    local fallback = "ROBLOX-USER-" .. tostring(player.UserId)
+    if not DEVICE_FS_SUPPORTED then
+        return fallback
+    end
+
+    local folderOk = pcall(function()
+        if not isfolder(DEVICE_ROOT) then
+            makefolder(DEVICE_ROOT)
+        end
+    end)
+    if not folderOk then
+        return fallback
+    end
+
+    local folderExistsOk, folderExists = pcall(isfolder, DEVICE_ROOT)
+    if not folderExistsOk or not folderExists then
+        return fallback
+    end
+
+    local fileExistsOk, fileExists = pcall(isfile, DEVICE_FILE)
+    if fileExistsOk and fileExists then
+        local readOk, raw = pcall(readfile, DEVICE_FILE)
+        if readOk and type(raw) == "string" then
+            local savedId = raw:match("^%s*(.-)%s*$")
+            if #savedId >= 16 and #savedId <= 128 then
+                return savedId
+            end
+        end
+    end
+
+    local guidOk, guid = pcall(HttpService.GenerateGUID, HttpService, false)
+    if not guidOk or type(guid) ~= "string" or guid == "" then
+        return fallback
+    end
+
+    local deviceId = "JYH-DEVICE-" .. guid
+    pcall(writefile, DEVICE_FILE, deviceId)
+    return deviceId
+end
+
+local CLIENT_ID = getPersistentDeviceId()
 
 local function ensureKeyFolder()
     if not FS_SUPPORTED then return false end
@@ -97,7 +154,6 @@ local function loadSavedLicenseKey()
 
     local decodedOk, data = pcall(HttpService.JSONDecode, HttpService, raw)
     if not decodedOk or type(data) ~= "table"
-        or data.userId ~= player.UserId
         or type(data.licenseKey) ~= "string"
         or data.licenseKey == "" then
         return nil
@@ -244,6 +300,7 @@ local function launchScript(Window, licType, expiresAt)
         userId         = player.UserId,
 
         clientId       = CLIENT_ID,
+        deviceId       = CLIENT_ID,
         currentGame    = "Anime Card Farm",
         scriptVersion  = SCRIPT_VERSION,
 
@@ -292,234 +349,344 @@ local Window = Rayfield:CreateWindow({
     KeySystem           = false,
 })
 
-local KeyTab = Window:CreateTab("🔑 Key System", 0)
-
--- ── Status area (one message shown at a time) ─────────────────
-local statusParagraph = KeyTab:CreateParagraph({
-    Title   = "Status",
-    Content = "Enter your license key and click Authenticate.",
-})
-
-local function setStatus(title, content)
-    pcall(function()
-        statusParagraph:Set({ Title = title, Content = content })
-    end)
-end
-
--- ── Authentication section ────────────────────────────────────
-KeyTab:CreateSection("Authentication")
-
 local savedLicenseKey = loadSavedLicenseKey()
-local keyInput = savedLicenseKey or ""
-local authenticationInProgress = false
-
-KeyTab:CreateInput({
-    Name                     = "License Key",
-    PlaceholderText          = "Paste your key here...",
-    RemoveTextAfterFocusLost = false,
-    Flag                     = "LicenseKey",
-    Callback = function(v)
-        keyInput = tostring(v or ""):match("^%s*(.-)%s*$")
-    end,
-})
-
-local function authenticateKey(rawKey, automatic)
-    if authenticationInProgress then return end
-
-    local key = tostring(rawKey or ""):match("^%s*(.-)%s*$")
-
-    if key == "" then
-        setStatus("No Key Entered",
-            "Paste your license key into the input above first.")
-        return
+-- ── Authentication request helper ─────────────────────────────
+-- This runs before the key-system tab is created when a saved key exists.
+local function requestAuthentication(key)
+    local encOk, payloadOrErr = pcall(HttpService.JSONEncode, HttpService, {
+        licenseKey = key,
+        clientId   = CLIENT_ID,
+        deviceId   = CLIENT_ID,
+    })
+    if not encOk then
+        return {
+            ok = false,
+            kind = "internal",
+            title = "Internal Error",
+            content = "Failed to encode request. See output log.",
+            detail = payloadOrErr,
+        }
     end
 
-    authenticationInProgress = true
-    setStatus(
-        automatic and "Checking saved license…" or "Checking license…",
-        "Contacting authentication server — please wait."
-    )
-
-    task.spawn(function()
-        -- Encode payload
-        local payload
-        local encOk, encResult = pcall(HttpService.JSONEncode, HttpService, {
-            licenseKey = key,
-            clientId   = CLIENT_ID,
+    local response
+    local reqOk, reqErr = pcall(function()
+        response = httpRequest({
+            Url     = AUTH_ENDPOINT,
+            Method  = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body    = payloadOrErr,
         })
-        if not encOk then
-            authenticationInProgress = false
-            setStatus("Internal Error",
-                "Failed to encode request. See output log.")
-            warn("[Loader] JSONEncode error: " .. tostring(encResult))
+    end)
+    if not reqOk or not response then
+        return {
+            ok = false,
+            kind = "network",
+            title = "License server unavailable",
+            content = "Could not reach the authentication server.\n"
+                .. "Check executor HTTP permissions and try again.",
+            detail = reqErr,
+        }
+    end
+
+    local data
+    local parseOk, parseErr = pcall(function()
+        data = HttpService:JSONDecode(response.Body or "{}")
+    end)
+    if not parseOk or type(data) ~= "table" then
+        return {
+            ok = false,
+            kind = "response",
+            title = "Invalid server response",
+            content = "The server returned an unexpected response. Try again.",
+            detail = parseErr,
+            response = response,
+        }
+    end
+
+    if data.success ~= true then
+        return {
+            ok = false,
+            kind = "rejected",
+            data = data,
+            response = response,
+        }
+    end
+
+    return { ok = true, data = data, response = response }
+end
+
+local function getRejectedStatus(result, savedKey)
+    local data = result.data or {}
+    local errCode = tostring(data.error or data.message or ""):lower()
+
+    if errCode:find("expired") then
+        return "Key expired",
+            (savedKey and "Your saved FREE key has expired. "
+                or "This key has expired. ")
+            .. "Click 'Get Key' below. Complete Work.ink and the SAME FREE key will be renewed."
+    elseif errCode:find("revok") then
+        return "Key revoked",
+            (savedKey and "Your saved key was revoked. "
+                or "This key was revoked. ")
+            .. "Obtain a new key to continue."
+    elseif errCode:find("device") or errCode:find("bound") then
+        return "Bound to another device",
+            (savedKey and "Your saved key is bound"
+                or "This key is bound")
+            .. " to a different device."
+    end
+
+    return "Invalid key",
+        (savedKey and "The saved key is no longer valid. "
+            or "The key is not valid. ")
+        .. "Enter a new key and try again."
+end
+
+local function getLicenseType(data)
+    local rawType = tostring(data.licenseType or data.type or data.plan or "")
+    local licType = rawType:upper()
+    if licType ~= "FREE" and licType ~= "30D" and licType ~= "LIFETIME" then
+        return nil, rawType
+    end
+    return licType
+end
+
+local function showKeySystem(initialTitle, initialContent)
+    local KeyTab = Window:CreateTab("🔑 Key System", 0)
+
+    local statusParagraph = KeyTab:CreateParagraph({
+        Title   = initialTitle or "Status",
+        Content = initialContent
+            or "Enter your license key and click Authenticate.",
+    })
+
+    local function setStatus(title, content)
+        pcall(function()
+            statusParagraph:Set({ Title = title, Content = content })
+        end)
+    end
+
+    KeyTab:CreateSection("Authentication")
+
+    local keyInput = savedLicenseKey or ""
+    local authenticationInProgress = false
+
+    KeyTab:CreateInput({
+        Name                     = "License Key",
+        PlaceholderText          = "Paste your key here...",
+        RemoveTextAfterFocusLost = false,
+        Flag                     = "LicenseKey",
+        Callback = function(v)
+            keyInput = tostring(v or ""):match("^%s*(.-)%s*$")
+        end,
+    })
+
+    local function authenticateKey(rawKey)
+        if authenticationInProgress then return end
+
+        local key = tostring(rawKey or ""):match("^%s*(.-)%s*$")
+        if key == "" then
+            setStatus("No Key Entered",
+                "Paste your license key into the input above first.")
             return
         end
-        payload = encResult
 
-        -- Send HTTP auth request
-        local response
-        local reqOk, reqErr = pcall(function()
-            response = httpRequest({
-                Url     = AUTH_ENDPOINT,
-                Method  = "POST",
-                Headers = { ["Content-Type"] = "application/json" },
-                Body    = payload,
+        authenticationInProgress = true
+        setStatus("Checking license…",
+            "Contacting authentication server — please wait.")
+
+        task.spawn(function()
+            local result = requestAuthentication(key)
+            if not result.ok then
+                local savedKeyRejected = key == savedLicenseKey
+                local rejectedText = tostring(
+                    result.data and (result.data.error or result.data.message) or ""
+                ):lower()
+
+                -- Keep an expired saved key so /get-key can renew that same key.
+                -- Invalid/revoked/bound keys are still cleared as before.
+                if savedKeyRejected
+                    and result.kind == "rejected"
+                    and not rejectedText:find("expired") then
+                    clearSavedLicenseKey()
+                    savedLicenseKey = nil
+                end
+
+                local title, content
+                if result.kind == "rejected" then
+                    title, content = getRejectedStatus(result, savedKeyRejected)
+                    warn("[Loader] Auth failed — HTTP "
+                        .. tostring(result.response and result.response.StatusCode)
+                        .. "  body=" .. tostring(result.response and result.response.Body))
+                else
+                    title, content = result.title, result.content
+                    warn("[Loader] Authentication error: " .. tostring(result.detail))
+                end
+                setStatus(title, content)
+                authenticationInProgress = false
+                return
+            end
+
+            local data = result.data
+            local licType, rawType = getLicenseType(data)
+            if not licType then
+                if key == savedLicenseKey then
+                    clearSavedLicenseKey()
+                    savedLicenseKey = nil
+                end
+                setStatus("Unknown license type",
+                    "The server returned an unrecognised license type: '"
+                    .. rawType .. "'.\n"
+                    .. "Contact support — the launcher will not start with an unknown type.")
+                warn("[Loader] Auth succeeded but license type is unknown: " .. rawType)
+                authenticationInProgress = false
+                return
+            end
+
+            saveLicenseKey(key)
+            savedLicenseKey = key
+
+            local expiresAt = data.expiresAt or data.expires_at or data.expiry
+            local expiryStr = formatExpiry(expiresAt, licType)
+            local typeLabel = licType == "LIFETIME" and "Lifetime"
+                           or licType == "30D"       and "30-Day"
+                           or "FREE (24h)"
+
+            setStatus("License authenticated",
+                "License: " .. typeLabel .. "\n"
+                .. "Expires: " .. expiryStr)
+
+            Rayfield:Notify({
+                Title    = "Access Granted",
+                Content  = "License: " .. typeLabel .. "  ·  Expires: " .. expiryStr,
+                Duration = 5,
             })
-        end)
 
-        if not reqOk or not response then
-            authenticationInProgress = false
-            setStatus("License server unavailable",
-                "Could not reach the authentication server.\n"
-                .. "Check executor HTTP permissions and try again.")
-            warn("[Loader] HTTP request error: " .. tostring(reqErr))
-            return
-        end
+            warn("[Loader] " .. player.Name .. " authenticated — Type=" .. licType
+                .. "  Expires=" .. expiryStr)
 
-        -- Parse response
-        local data = {}
-        local parseOk, parseErr = pcall(function()
-            data = HttpService:JSONDecode(response.Body or "{}")
-        end)
-        if not parseOk or type(data) ~= "table" then
-            authenticationInProgress = false
-            setStatus("Invalid server response",
-                "The server returned an unexpected response. Try again.")
-            warn("[Loader] JSONDecode failed: " .. tostring(parseErr)
-                .. "\nBody: " .. tostring(response.Body))
-            return
-        end
-
-        -- Strict success check
-        if data.success ~= true then
-            local savedKeyRejected = automatic or key == savedLicenseKey
-            if savedKeyRejected then
-                clearSavedLicenseKey()
+            task.wait(1.5)
+            local ok, err = launchScript(Window, licType, expiresAt)
+            if not ok then
+                warn("[Loader] Launch failed: " .. tostring(err))
             end
-            local errCode = tostring(data.error or data.message or ""):lower()
+            authenticationInProgress = false
+        end)
+    end
 
-            if errCode:find("expired") then
-                setStatus("Key expired",
-                    (savedKeyRejected and "Your saved key has expired. "
-                        or "This key has expired. ")
-                    .. "Click 'Get Key' below to obtain a new one.")
-            elseif errCode:find("revok") then
-                setStatus("Key revoked",
-                    (savedKeyRejected and "Your saved key was revoked. "
-                        or "This key was revoked. ")
-                    .. "Obtain a new key to continue.")
-            elseif errCode:find("device") or errCode:find("bound") then
-                setStatus("Bound to another account",
-                    (savedKeyRejected and "Your saved key is bound"
-                        or "This key is bound")
-                    .. " to a different Roblox account.")
+    KeyTab:CreateButton({
+        Name     = "Authenticate",
+        Callback = function()
+            authenticateKey(keyInput)
+        end,
+    })
+
+    KeyTab:CreateButton({
+        Name     = "Get Key",
+        Callback = function()
+            local keyUrl = GET_KEY_URL
+
+            -- If the loader still has a saved key, pass it to the backend.
+            -- The backend will renew it when it is an existing FREE key.
+            if savedLicenseKey and savedLicenseKey ~= "" then
+                keyUrl = GET_KEY_URL
+                    .. "?key="
+                    .. HttpService:UrlEncode(savedLicenseKey)
+            end
+
+            if setclipboard then
+                pcall(setclipboard, keyUrl)
+                Rayfield:Notify({
+                    Title    = "Link Copied",
+                    Content  = "Key link copied to clipboard.\n"
+                        .. "Open it in a browser to get your key.",
+                    Duration = 6,
+                })
+                setStatus("Key link copied", keyUrl)
             else
-                setStatus("Invalid key",
-                    (savedKeyRejected and "The saved key is no longer valid. "
-                        or "The key is not valid. ")
-                    .. "Enter a new key and try again.")
+                setStatus("Get your key at", keyUrl)
+                Rayfield:Notify({
+                    Title    = "Get Key",
+                    Content  = keyUrl,
+                    Duration = 10,
+                })
             end
+        end,
+    })
+end
 
-            warn("[Loader] Auth failed — HTTP " .. tostring(response.StatusCode)
-                .. "  body=" .. tostring(response.Body))
-            authenticationInProgress = false
+local function validateSavedKeyBeforeShowingTab()
+    coreNotify("JonYueroHub", "Checking saved license…")
+    task.spawn(function()
+        local result = requestAuthentication(savedLicenseKey)
+        if not result.ok then
+            local title, content
+            if result.kind == "rejected" then
+                title, content = getRejectedStatus(result, true)
+
+                local rejectedText = tostring(
+                    result.data and (result.data.error or result.data.message) or ""
+                ):lower()
+
+                -- Do not delete an expired FREE key. It is needed by Get Key
+                -- so Work.ink can renew the same database key.
+                if not rejectedText:find("expired") then
+                    clearSavedLicenseKey()
+                    savedLicenseKey = nil
+                end
+
+                warn("[Loader] Saved key rejected — HTTP "
+                    .. tostring(result.response and result.response.StatusCode)
+                    .. "  body=" .. tostring(result.response and result.response.Body))
+            else
+                title, content = result.title, result.content
+                warn("[Loader] Saved-key check failed: " .. tostring(result.detail))
+            end
+            showKeySystem(title, content)
             return
         end
 
-        -- ── Auth success ──────────────────────────────────────────
-
-        -- Normalize and validate license type.
-        -- Only FREE, 30D, and LIFETIME are accepted.
-        -- Unknown types are rejected rather than silently defaulting to FREE.
-        local rawType = tostring(data.licenseType or data.type or data.plan or "")
-        local licType = rawType:upper()
-
-        if licType ~= "FREE" and licType ~= "30D" and licType ~= "LIFETIME" then
-            if automatic or key == savedLicenseKey then
-                clearSavedLicenseKey()
-            end
-            authenticationInProgress = false
-            setStatus("Unknown license type",
+        local data = result.data
+        local licType, rawType = getLicenseType(data)
+        if not licType then
+            clearSavedLicenseKey()
+            savedLicenseKey = nil
+            showKeySystem("Unknown license type",
                 "The server returned an unrecognised license type: '"
                 .. rawType .. "'.\n"
                 .. "Contact support — the launcher will not start with an unknown type.")
-            warn("[Loader] Auth succeeded but license type is unknown: " .. rawType)
+            warn("[Loader] Saved key returned unknown license type: " .. rawType)
             return
         end
 
-        -- Persist only a key that the authentication server accepted.
-        saveLicenseKey(key)
-        savedLicenseKey = key
-
         local expiresAt = data.expiresAt or data.expires_at or data.expiry
         local expiryStr = formatExpiry(expiresAt, licType)
-
         local typeLabel = licType == "LIFETIME" and "Lifetime"
                        or licType == "30D"       and "30-Day"
                        or "FREE (24h)"
 
-        setStatus("License authenticated",
-            "License: " .. typeLabel .. "\n"
-            .. "Expires: " .. expiryStr
-            .. (automatic and "\nSaved key loaded automatically." or ""))
-
+        saveLicenseKey(savedLicenseKey)
         Rayfield:Notify({
             Title    = "Access Granted",
             Content  = "License: " .. typeLabel .. "  ·  Expires: " .. expiryStr,
             Duration = 5,
         })
-
-        warn("[Loader] " .. player.Name .. " authenticated — Type=" .. licType
+        warn("[Loader] Saved key authenticated — Type=" .. licType
             .. "  Expires=" .. expiryStr)
 
-        task.wait(1.5)
-
-        -- ── Launch sequence ───────────────────────────────────────
-        -- launchScript handles: fetch → compile → session → close → run
+        task.wait(0.3)
         local ok, err = launchScript(Window, licType, expiresAt)
         if not ok then
             warn("[Loader] Launch failed: " .. tostring(err))
-            -- launchScript already notified the user and cleared flags.
         end
-        authenticationInProgress = false
     end)
 end
 
-KeyTab:CreateButton({
-    Name     = "Authenticate",
-    Callback = function()
-        authenticateKey(keyInput, false)
-    end,
-})
-
--- Automatically validate a previously accepted key on loader startup.
+-- Check the saved key before creating the key-system tab. A valid key
+-- goes directly to the configured game script; invalid or missing keys
+-- receive the normal authentication and Get Key controls.
 if savedLicenseKey then
-    task.spawn(function()
-        task.wait(0.2)
-        authenticateKey(savedLicenseKey, true)
-    end)
+    validateSavedKeyBeforeShowingTab()
+else
+    showKeySystem()
 end
-
--- ── Get Key button ────────────────────────────────────────────
-KeyTab:CreateButton({
-    Name     = "Get Key",
-    Callback = function()
-        if setclipboard then
-            pcall(setclipboard, GET_KEY_URL)
-            Rayfield:Notify({
-                Title    = "Link Copied",
-                Content  = "Key link copied to clipboard.\n"
-                    .. "Open it in a browser to get your key.",
-                Duration = 6,
-            })
-            setStatus("Key link copied", GET_KEY_URL)
-        else
-            setStatus("Get your key at", GET_KEY_URL)
-            Rayfield:Notify({
-                Title    = "Get Key",
-                Content  = GET_KEY_URL,
-                Duration = 10,
-            })
-        end
-    end,
-})
