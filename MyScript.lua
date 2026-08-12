@@ -16,12 +16,69 @@
 
 -- ── URL constants (single source of truth) ───────────────────
 local LOADER_URL    = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/Loader.lua"
-local MY_SCRIPT_URL = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/MyScript.lua"
+local ANIME_CARD_FARM_URL = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/MyScript.lua"
 
 local VALID_LICENSE_TYPES = { FREE = true, ["30D"] = true, LIFETIME = true }
 
 -- ── Environment ───────────────────────────────────────────────
 local ENV = getgenv()
+local HttpService = game:GetService("HttpService")
+
+-- The device ID must use the same global path and validation rules as the
+-- Loader. This is a persistent device-installation ID, not an unbreakable
+-- hardware fingerprint. Executor file resets or copying this file can
+-- change or imitate the installation identity.
+local DEVICE_ROOT = "Jon Yuero Hub"
+local DEVICE_FILE = DEVICE_ROOT .. "/DeviceId.txt"
+
+local function getPersistentDeviceId()
+    local localPlayer = game:GetService("Players").LocalPlayer
+    -- Compatibility fallback for executors without file APIs. This keeps
+    -- ACF from crashing, but remains account-based on that executor.
+    local fallback = "ROBLOX-USER-" .. tostring(localPlayer.UserId)
+    local fileApisSupported = (
+        type(makefolder) == "function" and type(isfolder) == "function"
+        and type(writefile) == "function" and type(readfile) == "function"
+        and type(isfile) == "function"
+    )
+    if not fileApisSupported then
+        return fallback
+    end
+
+    local folderOk = pcall(function()
+        if not isfolder(DEVICE_ROOT) then
+            makefolder(DEVICE_ROOT)
+        end
+    end)
+    if not folderOk then
+        return fallback
+    end
+
+    local folderExistsOk, folderExists = pcall(isfolder, DEVICE_ROOT)
+    if not folderExistsOk or not folderExists then
+        return fallback
+    end
+
+    local fileExistsOk, fileExists = pcall(isfile, DEVICE_FILE)
+    if fileExistsOk and fileExists then
+        local readOk, raw = pcall(readfile, DEVICE_FILE)
+        if readOk and type(raw) == "string" then
+            local savedId = raw:match("^%s*(.-)%s*$")
+            if #savedId >= 16 and #savedId <= 128 then
+                return savedId
+            end
+        end
+    end
+
+    local guidOk, guid = pcall(HttpService.GenerateGUID, HttpService, false)
+    if not guidOk or type(guid) ~= "string" or guid == "" then
+        return fallback
+    end
+
+    local deviceId = "JYH-DEVICE-" .. guid
+    pcall(writefile, DEVICE_FILE, deviceId)
+    return deviceId
+end
 
 -- ── Lightweight notification (available before Rayfield) ──────
 local function coreNotify(title, text)
@@ -123,10 +180,14 @@ local function validateSession(session)
         return false, "Session PlaceId does not match current game"
     end
 
-    -- 6. UserId must match
-    local LocalPlayer = game:GetService("Players").LocalPlayer
-    if session.userId ~= LocalPlayer.UserId then
-        return false, "Session UserId does not match current player"
+    -- 6. The persistent device ID must match. userId remains diagnostic
+    -- metadata only and must not block another Roblox account on this device.
+    local currentDeviceId = getPersistentDeviceId()
+    if type(session.deviceId) ~= "string" or session.deviceId == "" then
+        return false, "Session device ID is missing"
+    end
+    if session.deviceId ~= currentDeviceId then
+        return false, "Session device ID does not match this device"
     end
 
     -- 7. currentGame must be "Anime Card Farm"
@@ -146,7 +207,7 @@ local function validateSession(session)
     end
 
     -- 10. scriptUrl must match the official MyScript URL when present
-    if session.scriptUrl ~= nil and session.scriptUrl ~= MY_SCRIPT_URL then
+    if session.scriptUrl ~= nil and session.scriptUrl ~= ANIME_CARD_FARM_URL then
         return false, "Session scriptUrl does not match the official game script"
     end
 
@@ -184,6 +245,8 @@ ENV.JYH_ACTIVE_SESSION = {
     expiresAt     = ENV.JYH_SESSION.expiresAt,
     issuedAt      = ENV.JYH_SESSION.issuedAt,
     userId        = ENV.JYH_SESSION.userId,
+    clientId      = ENV.JYH_SESSION.clientId,
+    deviceId      = ENV.JYH_SESSION.deviceId,
     placeId       = ENV.JYH_SESSION.placeId,
     currentGame   = ENV.JYH_SESSION.currentGame,
 }
@@ -262,11 +325,13 @@ end
 -- ── Remotes ──────────────────────────────────────────────────
 local Remotes    = ReplicatedStorage:WaitForChild("Remotes")
 local ConveyorRE = Remotes:WaitForChild("ConveyorRE")
+local ItemsREForAutomation = Remotes:FindFirstChild("ItemsRE")
 local PlayTimeRewardRE = Remotes:FindFirstChild("PlayTimeRewardRE")
 local DailyRewardRE    = Remotes:FindFirstChild("DailyRewardRE")
 local UpgradesRE       = Remotes:FindFirstChild("UpgradesRE")
 local BossRaidRE = Remotes:FindFirstChild("BossRaidRE")
 local GradeRollRE      = Remotes:FindFirstChild("GradeRollRE")
+local TraitRollRE      = Remotes:FindFirstChild("TraitRollRE")
 local Modules    = ReplicatedStorage:FindFirstChild("Modules")
 local BossRaidConfig
 if Modules and Modules:FindFirstChild("BossRaidConfig") then
@@ -278,6 +343,18 @@ local RankGradeRollConfig
 if Modules and Modules:FindFirstChild("GradeRollConfig") then
     pcall(function()
         RankGradeRollConfig = require(Modules.GradeRollConfig)
+    end)
+end
+local TraitRollConfig
+if Modules and Modules:FindFirstChild("TraitRollConfig") then
+    pcall(function()
+        TraitRollConfig = require(Modules.TraitRollConfig)
+    end)
+end
+local GuiManager
+if Modules and Modules:FindFirstChild("GuiManager") then
+    pcall(function()
+        GuiManager = require(Modules.GuiManager)
     end)
 end
 local currentRaidBossId = ""
@@ -296,7 +373,7 @@ local RARITIES = {
 local MUTATIONS = {
     "Normal", "Golden", "Venomous", "Diamond",
     "Rainbow", "Sakura", "Candy", "Blessed",
-    "Radioactive", "Glitch", "Starfallen", "Admin", "Unknown",
+    "Radioactive", "Glitch", "Starfallen", "Admin", "Unknow",
 }
 
 local PACKS = {
@@ -316,10 +393,33 @@ local PACKS = {
 local POTIONS = {
     "LuckPotion1", "LuckPotion2", "LuckPotion3",
     "CashPotion1", "CashPotion2", "CashPotion3",
-    "TimePotion1", "TimePotion2",
     "MutationPotion1",
     "ProductionPotion1", "ProductionPotion2",
 }
+
+-- Keep the strongest time potion first so pack automation always spends the
+-- best available skip potion before falling back to a weaker one.
+local TIME_POTIONS = { "TimePotion2", "TimePotion1" }
+
+local function normalizeGeneralPotionSelection(selection)
+    local valid = {}
+    local validSet = {}
+    for _, potion in ipairs(POTIONS) do
+        validSet[potion] = true
+    end
+
+    local values = type(selection) == "table" and selection or { selection }
+    for _, value in ipairs(values) do
+        value = tostring(value or "")
+        if value == "All" then
+            return { "All" }
+        end
+        if validSet[value] then
+            table.insert(valid, value)
+        end
+    end
+    return valid
+end
 
 local BOOSTS = {
     { label = "Base Expansion", id = "base" },
@@ -404,6 +504,8 @@ local Config = {
     AutoTraitRoll     = false,
     SelectedRankCards = { "All" },
     TargetRank        = { "UR" },
+    SelectedTraitCards = { "All" },
+    TargetTraits      = {},
     RankUseGems       = true,
     RankUseCash       = false,
     AutoRankRoll      = false,
@@ -411,6 +513,7 @@ local Config = {
     AutoClaimDaily    = false,
     AutoPlacePack     = false,
     AutoOpenPack      = false,
+    AutoTimePotion    = false,
     AutoBuyBoost      = false,
 
     -- Combat
@@ -440,6 +543,8 @@ local Controls = {}
 -- Playtime state is pushed by the game's client remote.
 local playtimeReadyRewards = {}
 local playtimeStateReceived = false
+local potionInventoryCounts = {}
+local nextTimePotionUse = 0
 
 -- Forward declarations
 local clickGuiButton
@@ -447,6 +552,8 @@ local startCombatBattle
 local removeAllCards
 local removeFirstFourCardSlots
 local doEquipBestCards
+local closeBossRaidReward
+local exitInfinityTowerBattle
 
 -- ── Remote helpers ───────────────────────────────────────────
 local function findRemote(name)
@@ -676,7 +783,13 @@ end
 -- ── Filter logic ─────────────────────────────────────────────
 local function normalizeFilterValue(value)
     if value == nil then return nil end
-    return string.lower(string.gsub(tostring(value), "^%s*(.-)%s*$", "%1"))
+    local normalized = string.lower(string.gsub(tostring(value), "^%s*(.-)%s*$", "%1"))
+    -- The game calls this mutation "Unknow" (without the final n).
+    -- Canonicalize both the UI value and any older/live "Unknown" value.
+    if normalized == "unknown" then
+        return "unknow"
+    end
+    return normalized
 end
 
 local function normalizeFilterSelection(value)
@@ -745,7 +858,8 @@ local function normalizePackName(value)
     return s
 end
 
--- Decode compact cash strings like "$500.0K", "$159.83M", "$2.5B", "$1T".
+-- Decode Anime Card Farm compact cash strings:
+-- K, M, B, T, Qd, Qn, Sx, Sp, O, N, Dc.
 -- Returns a number on success, nil on failure.
 local function parseCompactCash(text)
     if type(text) ~= "string" then return nil end
@@ -754,39 +868,46 @@ local function parseCompactCash(text)
     if text == "" then return nil end
 
     local suffixMap = {
-        k  = 1e3,  K  = 1e3,
-        m  = 1e6,  M  = 1e6,
-        b  = 1e9,  B  = 1e9,
-        t  = 1e12, T  = 1e12,
-        qa = 1e15, Qa = 1e15, QA = 1e15,
-        qd = 1e15, Qd = 1e15, QD = 1e15,  -- alternate quadrillion spelling used by some games
-        qi = 1e18, Qi = 1e18, QI = 1e18,
-        sx = 1e21, Sx = 1e21, SX = 1e21,
-        sp = 1e24, Sp = 1e24, SP = 1e24,
-        oc = 1e27, Oc = 1e27, OC = 1e27,
-        no = 1e30, No = 1e30, NO = 1e30,
-        dc = 1e33, Dc = 1e33, DC = 1e33,
-        ud = 1e36, Ud = 1e36, UD = 1e36,  -- undecillion
-        dd = 1e39, Dd = 1e39, DD = 1e39,  -- duodecillion
-        td = 1e42, Td = 1e42, TD = 1e42,  -- tredecillion
+        k = 1e3,
+        m = 1e6,
+        b = 1e9,
+        t = 1e12,
+        qd = 1e15,
+        qn = 1e18,
+        sx = 1e21,
+        sp = 1e24,
+        o = 1e27,
+        n = 1e30,
+        dc = 1e33,
     }
 
     -- Try two-letter suffix first, then one-letter suffix, then plain number.
     local num, suffix2 = text:match("^([%d%.]+)([A-Za-z][A-Za-z])$")
     if num and suffix2 then
-        local mult = suffixMap[suffix2] or suffixMap[suffix2:lower()]
+        local mult = suffixMap[suffix2:lower()]
         if mult then return (tonumber(num) or 0) * mult end
     end
 
     local num1, suffix1 = text:match("^([%d%.]+)([A-Za-z])$")
     if num1 and suffix1 then
-        local mult = suffixMap[suffix1] or suffixMap[suffix1:lower()]
+        local mult = suffixMap[suffix1:lower()]
         if mult then return (tonumber(num1) or 0) * mult end
     end
 
     -- Plain number with no suffix.
     local plain = text:match("^([%d%.]+)$")
     if plain then return tonumber(plain) end
+
+    -- Also tolerate labels such as "Cash: $4.15N".
+    local embeddedNum, embeddedSuffix =
+        text:match("([%d%.]+)([A-Za-z][A-Za-z]?)")
+    if embeddedNum then
+        local mult = suffixMap[(embeddedSuffix or ""):lower()]
+        if mult then return (tonumber(embeddedNum) or 0) * mult end
+        if not embeddedSuffix or embeddedSuffix == "" then
+            return tonumber(embeddedNum)
+        end
+    end
 
     return nil
 end
@@ -795,21 +916,74 @@ end
 -- Primary source: Players.LocalPlayer.CashValue (NumberValue or IntValue).
 -- Fallback: leaderstats.Cash text parsed through parseCompactCash.
 local function getPlayerCash()
-    local cv = player:FindFirstChild("CashValue")
-    if cv and (cv:IsA("NumberValue") or cv:IsA("IntValue")) then
-        return tonumber(cv.Value)
-    end
-    -- Fallback: try leaderstats.Cash as a numeric attribute or parsed text.
-    local ls = player:FindFirstChild("leaderstats")
-    local cashObj = ls and ls:FindFirstChild("Cash")
-    if cashObj then
-        if cashObj:IsA("NumberValue") or cashObj:IsA("IntValue") then
-            return tonumber(cashObj.Value)
+    local function readCashValue(valueObject)
+        if not valueObject or not valueObject:IsA("ValueBase") then
+            return nil
         end
-        -- Try to parse formatted text like "$159.83M"
-        local parsed = parseCompactCash(tostring(cashObj.Value or ""))
-        if parsed then return parsed end
+        local value = valueObject.Value
+        if type(value) == "number" then
+            return value
+        end
+        return parseCompactCash(tostring(value or ""))
     end
+
+    local function readCashAttribute(instance, attributeName)
+        local value = instance:GetAttribute(attributeName)
+        if type(value) == "number" then
+            return value
+        end
+        if value ~= nil then
+            return parseCompactCash(tostring(value))
+        end
+        return nil
+    end
+
+    for _, name in ipairs({
+        "CashValue", "Cash", "Money", "Currency", "CashAmount", "MoneyValue",
+    }) do
+        local value = readCashValue(player:FindFirstChild(name))
+        if value ~= nil then return value end
+        value = readCashAttribute(player, name)
+        if value ~= nil then return value end
+    end
+
+    -- Fallback: leaderstats may expose cash as a number or compact string.
+    local ls = player:FindFirstChild("leaderstats")
+    if ls then
+        for _, name in ipairs({
+            "Cash", "Money", "Currency", "CashValue", "CashAmount",
+        }) do
+            local cashObj = ls:FindFirstChild(name)
+            local value = readCashValue(cashObj)
+            if value ~= nil then return value end
+            value = readCashAttribute(ls, name)
+            if value ~= nil then return value end
+        end
+    end
+
+    -- Last fallback for versions that place the balance directly on the
+    -- player's attributes.
+    for _, name in ipairs({ "Cash", "Money", "Currency", "CashAmount" }) do
+        local value = readCashAttribute(player, name)
+        if value ~= nil then return value end
+    end
+
+    -- HUD fallback: some game versions expose the balance only as a
+    -- TextLabel. Prefer labels whose instance names identify them as cash,
+    -- money, currency, or balance so pack prices are not mistaken for cash.
+    for _, descendant in ipairs(playerGui:GetDescendants()) do
+        if descendant:IsA("TextLabel") or descendant:IsA("TextButton") then
+            local name = string.lower(descendant.Name)
+            if string.find(name, "cash", 1, true)
+                or string.find(name, "money", 1, true)
+                or string.find(name, "currency", 1, true)
+                or string.find(name, "balance", 1, true) then
+                local value = parseCompactCash(tostring(descendant.Text or ""))
+                if value ~= nil then return value end
+            end
+        end
+    end
+
     return nil
 end
 
@@ -821,6 +995,37 @@ local function getPlayerGems()
     return 0
 end
 
+local function getPlayerTraitGems()
+    for _, name in ipairs({
+        "TraitGemsValue", "TraitGems", "TraitGemValue", "TraitGem",
+    }) do
+        local value = player:FindFirstChild(name)
+        if value and value:IsA("ValueBase") then
+            return tonumber(value.Value) or 0
+        end
+
+        local attribute = player:GetAttribute(name)
+        if attribute ~= nil then
+            local number = tonumber(attribute)
+            if number ~= nil then return number end
+        end
+    end
+
+    local leaderstats = player:FindFirstChild("leaderstats")
+    if leaderstats then
+        for _, name in ipairs({
+            "TraitGemsValue", "TraitGems", "TraitGemValue", "TraitGem",
+        }) do
+            local value = leaderstats:FindFirstChild(name)
+            if value and value:IsA("ValueBase") then
+                return tonumber(value.Value) or 0
+            end
+        end
+    end
+
+    return 0
+end
+
 -- CONFIRMED GAME STRUCTURE (from screenshots):
 --   packModel.GuiHolder.BillboardGuiInfo.Price   → TextLabel with Text "$500.0K"
 --   packModel.GuiHolder.BillboardGuiInfo.Rarity  → child named after rarity (e.g. "Epic")
@@ -829,21 +1034,21 @@ end
 -- Get the raw price text from the pack's billboard GUI (used only as last resort).
 local function getPackPriceText(packModel)
     if not packModel then return nil end
-    local gui = packModel:FindFirstChild("GuiHolder")
-    local info = gui and gui:FindFirstChild("BillboardGuiInfo")
-    local priceContainer = info and info:FindFirstChild("Price")
+    local gui = packModel:FindFirstChild("GuiHolder", true)
+    local info = gui and gui:FindFirstChild("BillboardGuiInfo", true)
+    local priceContainer = info and info:FindFirstChild("Price", true)
     if priceContainer then
         -- Try TextLabel/TextButton text first (confirmed in screenshots).
-        for _, child in ipairs(priceContainer:GetChildren()) do
+        for _, child in ipairs(priceContainer:GetDescendants()) do
             if child:IsA("TextLabel") or child:IsA("TextButton") then
                 local t = tostring(child.Text or ""):gsub("^%s*(.-)%s*$", "%1")
-                if t ~= "" then return t end
+                if t ~= "" and parseCompactCash(t) ~= nil then return t end
             end
         end
         -- The price container itself might be a TextLabel.
         if priceContainer:IsA("TextLabel") or priceContainer:IsA("TextButton") then
             local t = tostring(priceContainer.Text or ""):gsub("^%s*(.-)%s*$", "%1")
-            if t ~= "" then return t end
+            if t ~= "" and parseCompactCash(t) ~= nil then return t end
         end
     end
     return nil
@@ -868,33 +1073,23 @@ local function getPackPrice(packModel)
         if type(v) == "number" and v > 0 then
             return v
         end
+        if type(v) == "string" then
+            local parsed = parseCompactCash(v)
+            if parsed and parsed > 0 then return parsed end
+        end
     end
 
-    -- 2. NumberValue / IntValue children (direct or one level deep).
+    -- 2. Numeric or formatted ValueBase children anywhere in the model.
     local function searchValueObjects(parent)
-        for _, child in ipairs(parent:GetChildren()) do
-            if child:IsA("NumberValue") or child:IsA("IntValue") then
+        for _, child in ipairs(parent:GetDescendants()) do
+            if child:IsA("ValueBase") then
                 local n = child.Name:lower()
                 for _, attrName in ipairs(PRICE_ATTR_NAMES) do
                     if n == attrName:lower() then
-                        local v = tonumber(child.Value)
+                        local v = type(child.Value) == "number"
+                            and child.Value
+                            or parseCompactCash(tostring(child.Value or ""))
                         if v and v > 0 then return v end
-                    end
-                end
-            end
-        end
-        -- One level deeper (e.g. values inside a "Values" folder).
-        for _, child in ipairs(parent:GetChildren()) do
-            if child:IsA("Folder") or child:IsA("Model") or child:IsA("Configuration") then
-                for _, grandchild in ipairs(child:GetChildren()) do
-                    if grandchild:IsA("NumberValue") or grandchild:IsA("IntValue") then
-                        local n = grandchild.Name:lower()
-                        for _, attrName in ipairs(PRICE_ATTR_NAMES) do
-                            if n == attrName:lower() then
-                                local v = tonumber(grandchild.Value)
-                                if v and v > 0 then return v end
-                            end
-                        end
                     end
                 end
             end
@@ -1217,6 +1412,9 @@ local ItemIdIndex     = {}                     -- [itemId]    = packModel
 local PurchaseQueue   = {}                     -- ordered list of records
 local PurchaseQueued  = {}                     -- [record]    = true (dedup)
 local WatchedPrompts  = setmetatable({}, { __mode = "k" })
+-- Keep attempts serialized per record through the state machine. Do not use a
+-- global purchase lock here: packs arrive independently and waiting for one
+-- removal confirmation stalls Auto Buy for every other matching pack.
 
 -- ── Timing constants ──────────────────────────────────────────────────
 local BUY_RETRY_DELAY  = 0.75   -- min seconds between buy attempts per record
@@ -1976,10 +2174,37 @@ local function rebindConveyorContainerInner()
 end
 
 -- ── Conveyor scheduler (0.15 s) ───────────────────────────────────────
+local lastConveyorDiscoveryScan = 0
 task.spawn(function()
     while true do
         task.wait(0.2)
         rebindConveyorContainerInner()
+
+        -- ChildAdded is not reliable during plot rebinding/rapid spawns.
+        -- Periodically scan the live container as a discovery fallback so
+        -- Auto Buy works even when Auto Stop is disabled.
+        if os.clock() - lastConveyorDiscoveryScan >= 0.5 then
+            lastConveyorDiscoveryScan = os.clock()
+            doInitialConveyorScan()
+        end
+
+        -- Auto Buy must remain independent from Auto Stop / Auto Continue.
+        -- Re-check live records here because a pack can receive its prompt,
+        -- ItemId, price, or mutation after the ChildAdded callback fires.
+        -- This is intentionally a cheap TTL-gated refresh, not a blocking
+        -- wait for the spawn manager.
+        if not boxHandlingActive and Config.AutoBuyMatching then
+            for _, record in pairs(ConveyorRecords) do
+                if record.model
+                    and record.model:IsDescendantOf(workspace)
+                    and record.state ~= "Buying"
+                    and record.state ~= "Queued"
+                    and record.state ~= "Removed" then
+                    refreshRecordMetadata(record, false)
+                    evaluateRecordReadiness(record)
+                end
+            end
+        end
 
         -- Process purchase queue
         if not boxHandlingActive and Config.AutoBuyMatching then
@@ -2056,14 +2281,14 @@ reevaluateAutoBuy = function(enabled)
     end)
 end
 
--- Auto Spawn uses this as a coordination gate. A matching pack stays
--- registered while box handling is active, but spawning yields while a
--- purchase is queued or awaiting confirmation.
+-- Auto Stop uses this as a coordination gate. A matching pack only pauses
+-- spawning once the buyer has actually queued it or fired an attempt.
+-- Merely waiting for metadata, price, or a purchase prompt must not stall
+-- the fast spawn loop.
 autoBuyHasPending = function()
     if not Config.AutoBuyMatching then return false end
     for _, record in pairs(ConveyorRecords) do
-        if record.state == "Queued" or record.state == "Buying"
-            or (record.state == "WaitingForPurchaseWindow" and record.filterPassed == true) then
+        if record.state == "Queued" or record.state == "Buying" then
             -- Only block if the pack is still physically on the conveyor.
             -- If ChildRemoved somehow missed it the scheduler will clean it up;
             -- don't let a ghost record freeze spawning forever.
@@ -2125,6 +2350,7 @@ end)
 
 -- Guard preventing multiple concurrent coroutines from firing stop/resume
 local autoStopHandled = false
+local autoStopWatcherActive = false
 
 -- Auto Spawn Pack
 task.spawn(function()
@@ -2132,7 +2358,6 @@ task.spawn(function()
         task.wait(math.max(0.05, Config.SpawnDelay))
         if not Config.AutoSpawnPack then continue end
         if boxHandlingActive then continue end
-        if Config.AutoStopSpawn and autoBuyHasPending and autoBuyHasPending() then continue end
         if autoStopHandled then continue end
 
         local previousIds
@@ -2158,10 +2383,16 @@ task.spawn(function()
         end
         fireButton(spawnBtn)
 
-        if Config.AutoStopSpawn then
+        -- The watcher must be single-instance, but it must not pause the
+        -- actual spawn loop while it waits for the new pack's metadata.
+        if Config.AutoStopSpawn and not autoStopWatcherActive then
             local capturedIds = previousIds
+            autoStopWatcherActive = true
             task.spawn(function()
-                if autoStopHandled then return end
+                if autoStopHandled then
+                    autoStopWatcherActive = false
+                    return
+                end
 
                 -- ── Step 1: collect ALL new packs (up to 3 s) ───────────
                 -- With admin events two packs can spawn at once; we must
@@ -2181,6 +2412,7 @@ task.spawn(function()
                 if #newRecords == 0 then
                     warnOnce("AutoStop:no-new-pack",
                         "Auto Stop did not detect a new conveyor pack after spawning.")
+                    autoStopWatcherActive = false
                     return
                 end
 
@@ -2210,10 +2442,16 @@ task.spawn(function()
                     if spawnedRecord then break end
                 end
 
-                if not spawnedRecord then return end  -- no match among new packs
+                if not spawnedRecord then
+                    autoStopWatcherActive = false
+                    return
+                end  -- no match among new packs
 
                 -- ── Step 3: stop spawning ────────────────────────────────
-                if autoStopHandled then return end
+                if autoStopHandled then
+                    autoStopWatcherActive = false
+                    return
+                end
                 autoStopHandled = true
 
                 Config.AutoSpawnPack = false
@@ -2246,11 +2484,13 @@ task.spawn(function()
                                     notify("Spawn Manager", "Resumed — pack purchased or removed!")
                                 end
                                 autoStopHandled = false
+                                autoStopWatcherActive = false
                                 return
                             elseif st == "FilterRejected" then
                                 -- Pack didn't pass the filter after all; unlock
                                 -- without resuming — let the next spawn decide.
                                 autoStopHandled = false
+                                autoStopWatcherActive = false
                                 return
                             end
                         end
@@ -2266,7 +2506,10 @@ task.spawn(function()
                             notify("Spawn Manager", "Resumed — timeout waiting for pack.")
                         end
                         autoStopHandled = false
+                        autoStopWatcherActive = false
                     end)
+                else
+                    autoStopWatcherActive = false
                 end
             end)
         end
@@ -2616,10 +2859,15 @@ do
     local ItemsRE = Remotes:WaitForChild("ItemsRE", 15)
     if ItemsRE then
         -- potionCounts[itemId] = number owned
-        -- activeBoosts[stat]   = true while that boost is running
-        local potionCounts = {}
+        -- activeBoosts[family] = tier/expiry while that boost is running
+        -- Keep this inventory mirror available to the pack automation below.
+        local potionCounts = potionInventoryCounts
+        -- activeBoosts is indexed by potion family (luck/cash/etc.), not by
+        -- the raw stat key.  That lets CashPotion I/II/III share one timer.
         local activeBoosts = {}
         local confirmationBusy = false
+        local pendingPotion = nil
+        local nextInventorySync = 0
 
         -- When a stronger potion replaces a weaker active potion, the game
         -- opens Items.Confirmation instead of completing UseItem immediately.
@@ -2700,22 +2948,91 @@ do
             return clicked
         end
 
+        -- ItemsClient only creates the replacement warning from the live
+        -- inventory popup's USE button.  Calling ItemsRE directly can use an
+        -- expired potion, but it cannot create that local confirmation.
+        local function findItemsFrame()
+            local direct = playerGui:FindFirstChild("ItemsFrame", true)
+            if direct then return direct end
+            for _, descendant in ipairs(playerGui:GetDescendants()) do
+                if descendant.Name == "ItemsFrame" then
+                    return descendant
+                end
+            end
+            return nil
+        end
+
+        local function usePotionThroughItemsUi(itemId)
+            local itemsFrame = findItemsFrame()
+            if not itemsFrame then return false end
+
+            local objectFrame = itemsFrame:FindFirstChild(
+                "ObjectFrame_" .. tostring(itemId),
+                true
+            )
+            if not objectFrame then
+                return false
+            end
+
+            local objectButton = objectFrame:FindFirstChild("ObjectButton", true)
+            if not objectButton or not clickGuiButton(objectButton) then
+                return false
+            end
+
+            local popup
+            for _ = 1, 10 do
+                task.wait(0.05)
+                popup = itemsFrame:FindFirstChild(
+                    "Info_" .. tostring(itemId),
+                    true
+                )
+                if popup then break end
+            end
+            if not popup then return false end
+
+            local useButton = popup:FindFirstChild("USE", true)
+            if not useButton or not clickGuiButton(useButton) then
+                return false
+            end
+            return true
+        end
+
         local function potionDetails(itemId)
             local name = string.lower(tostring(itemId or ""))
             local family
-            if string.find(name, "luckpotion", 1, true) then
+            if string.find(name, "luckpotion", 1, true)
+                or string.find(name, "luck potion", 1, true) then
                 family = "luck"
-            elseif string.find(name, "cashpotion", 1, true) then
+            elseif string.find(name, "cashpotion", 1, true)
+                or string.find(name, "cash potion", 1, true) then
                 family = "cash"
-            elseif string.find(name, "timepotion", 1, true) then
+            elseif string.find(name, "timepotion", 1, true)
+                or string.find(name, "time potion", 1, true) then
                 family = "time"
-            elseif string.find(name, "mutationpotion", 1, true) then
+            elseif string.find(name, "mutationpotion", 1, true)
+                or string.find(name, "mutation potion", 1, true) then
                 family = "mutation"
-            elseif string.find(name, "productionpotion", 1, true) then
+            elseif string.find(name, "productionpotion", 1, true)
+                or string.find(name, "production potion", 1, true) then
                 family = "production"
             end
             if not family then return nil, nil end
-            return family, tonumber(string.match(name, "(%d+)$"))
+
+            local tier = tonumber(string.match(name, "(%d+)$"))
+            if not tier then
+                local roman = string.match(name, "(iii)$")
+                if roman then
+                    tier = 3
+                else
+                    roman = string.match(name, "(ii)$")
+                    if roman then
+                        tier = 2
+                    elseif string.match(name, "([^iv]|^)i$") then
+                        tier = 1
+                    end
+                end
+            end
+            return family, tier
         end
 
         local function tierFromValue(value)
@@ -2768,59 +3085,72 @@ do
             activeBoosts = {}
             if type(boostTable) ~= "table" then return end
             for stat, info in pairs(boostTable) do
-                if type(info) == "table" and (tonumber(info.Remaining) or 0) > 0 then
+                local remaining = type(info) == "table"
+                    and (tonumber(info.Remaining) or 0)
+                    or 0
+                if remaining > 0 then
                     local family, tier = boostDetails(stat, info)
-                    activeBoosts[stat] = {
-                        family = family,
-                        tier = tier,
-                    }
+                    if family then
+                        activeBoosts[family] = {
+                            tier = tier,
+                            expiresAt = os.clock() + remaining,
+                        }
+                    end
                 end
             end
-        end
-
-        local function isBoostActive()
-            for _, v in pairs(activeBoosts) do
-                if v then return true end
-            end
-            return false
         end
 
         local function canUsePotion(itemId)
             local family, tier = potionDetails(itemId)
             if not family then return false end
 
-            for _, active in pairs(activeBoosts) do
-                -- Preserve the existing one-active-potion behavior for
-                -- unrelated families, but allow a higher tier to replace
-                -- the currently active lower tier in the same family.
-                if active.family ~= family then
-                    return false
-                end
-                if active.tier and tier and active.tier >= tier then
-                    return false
-                end
+            local active = activeBoosts[family]
+            if not active then
+                return true
             end
-            return true
+
+            local remaining = (active.expiresAt or 0) - os.clock()
+            if remaining <= 0 then
+                activeBoosts[family] = nil
+                return true
+            end
+
+            -- A running potion in the same category blocks an equal or
+            -- weaker potion.  A higher tier is allowed through so the live
+            -- game's confirmation dialog can ask whether to replace it.
+            if not tier or not active.tier then
+                return false
+            end
+            return tier > active.tier
         end
 
         -- Mirror the same event the ItemsClient script handles
         ItemsRE.OnClientEvent:Connect(function(action, data)
             if action == "FullInventory" and type(data) == "table" then
-                potionCounts = {}
+                table.clear(potionCounts)
                 if type(data.Items) == "table" then
                     for itemId, qty in pairs(data.Items) do
                         potionCounts[itemId] = qty
                     end
                 end
                 applyBoosts(data.Boosts)
+                pendingPotion = nil
 
             elseif action == "ItemUpdate" and type(data) == "table" then
                 potionCounts[data.ItemId] = data.Quantity or 0
 
             elseif action == "BoostUpdate" then
                 applyBoosts(data)
+                pendingPotion = nil
+            elseif action == "UseOk" or action == "UseFailed" then
+                pendingPotion = nil
             end
         end)
+
+        -- The normal Items window sends this request when it opens.  Auto
+        -- Potion must request the same snapshot even when the user never
+        -- opens the inventory UI.
+        pcall(function() ItemsRE:FireServer("Init") end)
 
         task.spawn(function()
             while true do
@@ -2834,21 +3164,71 @@ do
         task.spawn(function()
             while true do
                 task.wait(1)
-                if not Config.AutoPotion then continue end
+                if not Config.AutoPotion then
+                    pendingPotion = nil
+                    continue
+                end
+
+                local now = os.clock()
+                if now >= nextInventorySync then
+                    pcall(function() ItemsRE:FireServer("Init") end)
+                    nextInventorySync = now + 5
+                end
+
+                if pendingPotion then
+                    if now - pendingPotion.startedAt < 5 then
+                        continue
+                    end
+                    pendingPotion = nil
+                end
 
                 local selected = Config.SelectedPotions
+                local candidates = {}
                 for _, potion in ipairs(POTIONS) do
-                    if not selectionIncludes(selected, potion) then continue end
-                    if (potionCounts[potion] or 0) <= 0 then continue end
+                    if selectionIncludes(selected, potion)
+                        and (potionCounts[potion] or 0) > 0 then
+                        table.insert(candidates, potion)
+                    end
+                end
+                table.sort(candidates, function(left, right)
+                    local _, leftTier = potionDetails(left)
+                    local _, rightTier = potionDetails(right)
+                    return (leftTier or 0) > (rightTier or 0)
+                end)
+
+                for _, potion in ipairs(candidates) do
                     if not canUsePotion(potion) then continue end
-                    pcall(function()
-                        ItemsRE:FireServer("UseItem", { ItemId = potion, Amount = 1 })
-                    end)
+                    local family, tier = potionDetails(potion)
+                    local active = family and activeBoosts[family]
+                    local isTierReplacement = active
+                        and tier
+                        and active.tier
+                        and tier > active.tier
+                    pendingPotion = {
+                        itemId = potion,
+                        startedAt = os.clock(),
+                    }
+                    local submitted = false
+                    if isTierReplacement then
+                        submitted = usePotionThroughItemsUi(potion)
+                    end
+                    if not submitted then
+                        submitted = pcall(function()
+                            ItemsRE:FireServer(
+                                "UseItem",
+                                { ItemId = potion, Amount = 1 }
+                            )
+                        end)
+                    end
                     -- Give the game's ItemsClient time to create the warning,
                     -- then accept it if this was a tier replacement.
-                    for _ = 1, 12 do
-                        task.wait(0.1)
-                        if acceptPotionReplacementConfirmation() then break end
+                    if submitted then
+                        for _ = 1, 12 do
+                            task.wait(0.1)
+                            if acceptPotionReplacementConfirmation() then
+                                break
+                            end
+                        end
                     end
                     break
                 end
@@ -2916,14 +3296,6 @@ task.spawn(function()
     end
 end)
 
--- Auto Trait Roll
-task.spawn(function()
-    while true do
-        task.wait(0.25)
-        if Config.AutoTraitRoll then fireRemote("TraitRollRE", "Roll") end
-    end
-end)
-
 -- ── Card Slot helper implementations ────────────────────────
 findCardSlot = function(plot, slotIndex)
     if not plot or not slotIndex then return nil end
@@ -2958,6 +3330,27 @@ local function getAllCardSlots()
         if slot then table.insert(slots, slot) end
     end
     return slots
+end
+
+local function getAvailableCardSlots()
+    local available = {}
+    for _, slot in ipairs(getAllCardSlots()) do
+        if not slotIsOccupied(slot) then
+            table.insert(available, slot)
+        end
+    end
+    return available
+end
+
+local function areAllCardSlotsOccupied()
+    local slots = getAllCardSlots()
+    if #slots == 0 then return false end
+    for _, slot in ipairs(slots) do
+        if not slotIsOccupied(slot) then
+            return false
+        end
+    end
+    return true
 end
 
 findSlotButton = function(slotModel, buttonName)
@@ -3055,6 +3448,27 @@ local function getFilteredPacksInBackpack()
             }),
         }
         if passesFilter(info) then table.insert(result, item) end
+    end
+    return result
+end
+
+local function getAllPacksInBackpack()
+    local result = {}
+    local backpack = player:FindFirstChild("Backpack")
+    if not backpack then return result end
+
+    for _, item in ipairs(backpack:GetChildren()) do
+        if not item:IsA("Tool") then continue end
+        local handle = item:FindFirstChild("Handle")
+        if handle and handle:FindFirstChild("Box") then continue end
+
+        local name = string.lower(item.Name)
+        for _, packName in ipairs(PACKS) do
+            if string.find(name, string.lower(packName), 1, true) then
+                table.insert(result, item)
+                break
+            end
+        end
     end
     return result
 end
@@ -3374,11 +3788,173 @@ if GradeRollRE then
     end)
 end
 
+-- ── Trait reroll ──────────────────────────────────────────────
+-- TraitRollClient uses the selected card Tool directly and sends:
+-- TraitRollRE:FireServer("RollTrait", { Tool = tool })
+local traitCardDropdown
+local traitCardOptionMap = {}
+local traitCardOptionsSignature = ""
+local traitCardOptions = { "All" }
+local traitRefreshQueued = false
+local traitRollPending = false
+local traitRollPendingTool
+local traitRollResponse
+
+local function getTraitOptions()
+    local result = {}
+    if TraitRollConfig and type(TraitRollConfig.GetTraits) == "function" then
+        local ok, traits = pcall(TraitRollConfig.GetTraits)
+        if ok and type(traits) == "table" then
+            for _, entry in ipairs(traits) do
+                local name = type(entry) == "table" and entry.Trait or entry
+                if name ~= nil and tostring(name) ~= "" then
+                    table.insert(result, tostring(name))
+                end
+            end
+        end
+    end
+
+    -- The live game module is preferred. These are only a compatibility
+    -- fallback for older game revisions that do not expose the config module.
+    if #result == 0 then
+        table.insert(result, "Almighty")
+        table.insert(result, "Sovereign")
+    end
+    return result
+end
+
+local function getTraitGems()
+    return getPlayerTraitGems()
+end
+
+local function getTraitGemsCost()
+    if TraitRollRE then
+        local cost = tonumber(TraitRollRE:GetAttribute("CostGemsPerRoll"))
+        if cost then return cost end
+    end
+    if TraitRollConfig and type(TraitRollConfig.GetCostGems) == "function" then
+        local ok, cost = pcall(TraitRollConfig.GetCostGems)
+        if ok and tonumber(cost) then return tonumber(cost) end
+    end
+    return 1
+end
+
+local function buildTraitCardOptions()
+    local options = { "All" }
+    local map = {}
+    local seen = {}
+
+    for _, tool in ipairs(getRankCardsInBackpack()) do
+        local baseName = tostring(tool:GetAttribute("CardName") or tool.Name)
+        seen[baseName] = (seen[baseName] or 0) + 1
+        local label = baseName
+        if seen[baseName] > 1 then
+            label = baseName .. " #" .. tostring(seen[baseName])
+        end
+        table.insert(options, label)
+        map[label] = tool
+    end
+    return options, map
+end
+
+local function selectedTraitCardTools()
+    local cards = getRankCardsInBackpack()
+    local selected = Config.SelectedTraitCards
+    if type(selected) ~= "table" or #selected == 0 then return cards end
+
+    for _, value in ipairs(selected) do
+        if tostring(value) == "All" then return cards end
+    end
+
+    local byTool = {}
+    for _, value in ipairs(selected) do
+        local tool = traitCardOptionMap[tostring(value)]
+        if tool and tool.Parent == player:FindFirstChild("Backpack") then
+            byTool[tool] = true
+        end
+    end
+
+    local result = {}
+    for _, tool in ipairs(cards) do
+        if byTool[tool] then table.insert(result, tool) end
+    end
+    return result
+end
+
+local function refreshTraitCardDropdown()
+    if not traitCardDropdown then return end
+    local options, map = buildTraitCardOptions()
+    traitCardOptionMap = map
+    traitCardOptions = options
+    local signature = table.concat(options, "\0")
+    if signature == traitCardOptionsSignature then return end
+    traitCardOptionsSignature = signature
+
+    local selected = Config.SelectedTraitCards or { "All" }
+    local refreshed = pcall(function()
+        traitCardDropdown:Refresh(options, selected)
+    end)
+    if not refreshed then
+        pcall(function() traitCardDropdown:Set(options) end)
+    end
+end
+
+local function queueTraitCardDropdownRefresh()
+    if traitRefreshQueued then return end
+    traitRefreshQueued = true
+    task.delay(0.2, function()
+        traitRefreshQueued = false
+        refreshTraitCardDropdown()
+    end)
+end
+
+local function getTraitTarget()
+    local targets = Config.TargetTraits
+    if type(targets) == "string" then
+        targets = targets ~= "" and { targets } or {}
+    end
+    if type(targets) ~= "table" or #targets == 0 then return nil end
+    return targets
+end
+
+local function traitHasTarget(tool)
+    if not tool then return false end
+    local current = tostring(tool:GetAttribute("CardTrait") or "")
+    for _, target in ipairs(getTraitTarget() or {}) do
+        if current == tostring(target) then return true end
+    end
+    return false
+end
+
+local function stopTraitReroll(message)
+    Config.AutoTraitRoll = false
+    if Controls.AutoTraitRoll and Controls.AutoTraitRoll.Set then
+        pcall(function() Controls.AutoTraitRoll:Set(false) end)
+    end
+    if message then notify("Traits", message) end
+end
+
+if TraitRollRE then
+    TraitRollRE.OnClientEvent:Connect(function(action, data)
+        if not traitRollPending or type(data) ~= "table" then return end
+        if data.Tool and data.Tool ~= traitRollPendingTool then return end
+        if action == "RollResult" or action == "RollFailed" then
+            traitRollResponse = {
+                action = action,
+                data = data,
+            }
+        end
+    end)
+end
+
 task.spawn(function()
     while true do
         task.wait(0.4)
         if rankCardDropdown then
             queueRankCardDropdownRefresh()
+        end
+        if traitCardDropdown then
+            queueTraitCardDropdownRefresh()
         end
     end
 end)
@@ -3477,6 +4053,99 @@ task.spawn(function()
     end
 end)
 
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+        -- Card Ranking always owns the reroll worker first. Traits starts
+        -- automatically after ranking has been stopped/completed.
+        if not Config.AutoTraitRoll
+            or Config.AutoRankRoll
+            or rankRollPending then
+            continue
+        end
+        if not TraitRollRE then
+            stopTraitReroll("TraitRollRE was not found.")
+            continue
+        end
+
+        local targets = getTraitTarget()
+        if not targets then
+            stopTraitReroll("Select at least one target trait first.")
+            continue
+        end
+
+        local cards = selectedTraitCardTools()
+        if #cards == 0 then
+            stopTraitReroll("No selected cards are currently in your backpack.")
+            continue
+        end
+
+        local progressed = false
+        local cardsRemaining = false
+        for _, tool in ipairs(cards) do
+            if not Config.AutoTraitRoll or Config.AutoRankRoll then break end
+            if not tool.Parent then continue end
+            while Config.AutoTraitRoll and not Config.AutoRankRoll
+                and tool.Parent and not traitHasTarget(tool) do
+                cardsRemaining = true
+                local gemCost = getTraitGemsCost()
+                if getTraitGems() < gemCost then
+                    stopTraitReroll("Not enough trait gems.")
+                    break
+                end
+
+                traitRollPending = true
+                traitRollPendingTool = tool
+                traitRollResponse = nil
+                pcall(function()
+                    TraitRollRE:FireServer("RollTrait", { Tool = tool })
+                end)
+
+                local deadline = os.clock() + 8
+                while Config.AutoTraitRoll and not Config.AutoRankRoll
+                    and traitRollPending and not traitRollResponse
+                    and os.clock() < deadline do
+                    task.wait(0.1)
+                end
+
+                local response = traitRollResponse
+                traitRollPending = false
+                traitRollPendingTool = nil
+                traitRollResponse = nil
+
+                if not response then
+                    stopTraitReroll("Trait roll timed out; reroll stopped safely.")
+                    break
+                end
+
+                if response.action == "RollFailed" then
+                    local reason = tostring(response.data.Reason or "UNKNOWN")
+                    if reason == "NOT_ENOUGH_GEMS"
+                        or reason == "PAYMENT_FAILED" then
+                        stopTraitReroll("Not enough trait gems.")
+                        break
+                    end
+                    task.wait(0.8)
+                else
+                    progressed = true
+                    task.wait(0.2)
+                end
+            end
+            if tool.Parent and not traitHasTarget(tool) then
+                cardsRemaining = true
+            end
+        end
+
+        if Config.AutoTraitRoll and not cardsRemaining then
+            stopTraitReroll(
+                "All selected cards reached " .. table.concat(targets, " / ") .. "."
+            )
+        elseif Config.AutoTraitRoll and not progressed then
+            task.wait(0.75)
+        end
+    end
+end)
+
 -- ── Auto Place Pack loop ──────────────────────────────────────
 task.spawn(function()
     while true do
@@ -3489,9 +4158,15 @@ task.spawn(function()
         if not humanoid or not root then continue end
 
         local savedCFrame = root.CFrame
-        local slots = getAllCardSlots()
+        local slots = getAvailableCardSlots()
+        if #slots == 0 then
+            pcall(function() humanoid:UnequipTools() end)
+            continue
+        end
         for _, slot in ipairs(slots) do
             if not Config.AutoPlacePack then break end
+            -- Re-check after every placement because the server may replicate
+            -- slot occupancy while this loop is still running.
             if slotIsOccupied(slot) then continue end
 
             local packs = getFilteredPacksInBackpack()
@@ -3534,6 +4209,51 @@ task.spawn(function()
 
         local r = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
         if r then pcall(function() r.CFrame = savedCFrame end) end
+    end
+end)
+
+-- ── Auto Use Time Potion for full plots ───────────────────────
+-- Time potions are not category boosts.  They reduce pack cooldowns, so
+-- they are handled separately from Misc > Auto Use Potions.
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if not Config.AutoTimePotion then continue end
+        if not Config.AutoPlacePack or not Config.AutoOpenPack then continue end
+        if os.clock() < nextTimePotionUse then continue end
+        if not ItemsREForAutomation then continue end
+
+        local packs = getAllPacksInBackpack()
+        if #packs == 0 then continue end
+        if not areAllCardSlotsOccupied() then continue end
+
+        local hasCooldown = false
+        for _, slot in ipairs(getAllCardSlots()) do
+            if slotIsOnCooldown(slot) then
+                hasCooldown = true
+                break
+            end
+        end
+        if not hasCooldown then continue end
+
+        local selectedPotion
+        for _, potion in ipairs(TIME_POTIONS) do
+            if (potionInventoryCounts[potion] or 0) > 0 then
+                selectedPotion = potion
+                break
+            end
+        end
+        if not selectedPotion then continue end
+
+        pcall(function()
+            ItemsREForAutomation:FireServer("UseItem", {
+                ItemId = selectedPotion,
+                Amount = 1,
+            })
+        end)
+        -- Give ItemUpdate/UseOk time to arrive before considering another
+        -- time potion. This prevents remote spam if the server is slow.
+        nextTimePotionUse = os.clock() + 1.5
     end
 end)
 
@@ -3722,6 +4442,66 @@ clickGuiButton = function(button)
     return pcall(function() button:Activate() end)
 end
 
+-- Shared helper: find BossRaidReward root and its CLOSE button.
+local function getRewardCloseButton()
+    local guiMid = playerGui:FindFirstChild("GuiMid")
+    local root = guiMid and guiMid:FindFirstChild("BossRaidReward", true)
+    if not root then
+        root = playerGui:FindFirstChild("BossRaidReward", true)
+    end
+    if not root then return nil, nil end
+    -- Confirmed from BossRaidRewardClient:
+    -- BossRaidReward.RaidFrameReward.TOP.CLOSE
+    local raidFrame = root:FindFirstChild("RaidFrameReward", true)
+    local top = raidFrame and raidFrame:FindFirstChild("TOP", true)
+    local close = top and top:FindFirstChild("CLOSE")
+    if not close then
+        close = findGuiByName(root, "CLOSE")
+    end
+    return root, close
+end
+
+local function isGuiShown(instance)
+    if not instance then return false end
+    if instance:IsA("GuiObject") then return instance.Visible == true end
+    if instance:IsA("LayerCollector") then return instance.Enabled == true end
+    return false
+end
+
+-- Lightweight immediate check used by startCombatBattle as a gate.
+-- The background watcher (below) is the one that actually does the
+-- close + Auto Boss Raid pause/resume flow. This function just detects
+-- whether the panel is currently up and fires the close button right now
+-- so startCombatBattle does not proceed while rewards are showing.
+closeBossRaidReward = function()
+    local rewardRoot, closeButton = getRewardCloseButton()
+    if not isGuiShown(rewardRoot) then
+        return false
+    end
+    -- Panel is visible — click close immediately.
+    if closeButton then
+        clickGuiButton(closeButton)
+    end
+    return true
+end
+
+-- ── Background Raid-Reward Watcher ────────────────────────────────────────
+-- Detects the Raid Rewards panel the instant it becomes visible and closes it
+-- right away.  Combat mode selection is owned by the single priority
+-- scheduler below; this watcher must not toggle either user setting.
+task.spawn(function()
+    while true do
+        task.wait(0.1)
+        if not Config.AutoRaid then continue end
+
+        local rewardRoot, closeButton = getRewardCloseButton()
+        if not isGuiShown(rewardRoot) then continue end
+        if closeButton then
+            clickGuiButton(closeButton)
+        end
+    end
+end)
+
 local function clickCombatButton(mode, names)
     local root = getCombatGui(mode)
     if root then
@@ -3737,6 +4517,48 @@ local function clickCombatButton(mode, names)
         local button = findGuiByName(playerGui, name)
         if button and clickGuiButton(button) then
             return true
+        end
+    end
+    return false
+end
+
+-- Boss Raid has priority over Infinity Tower.  The tower UI exposes an Exit
+-- control while a run is active; use that control instead of trying to start
+-- the raid while the tower attribute is still true.
+exitInfinityTowerBattle = function()
+    if player:GetAttribute("InfinityTowerInBattle") ~= true then
+        return true
+    end
+
+    local roots = {
+        getCombatGui("InfinityTower"),
+        getCombatGui("HideBattle"),
+    }
+    local names = {
+        "Exit", "EXIT", "ExitBattle", "ExitTower",
+        "Leave", "LeaveBattle", "Quit",
+    }
+    for _, root in ipairs(roots) do
+        if root then
+            for _, name in ipairs(names) do
+                local button = findGuiByName(root, name)
+                if button and clickGuiButton(button) then
+                    return true
+                end
+            end
+
+            -- Some versions keep the button's Instance name generic and only
+            -- expose "Exit" through its Text property.
+            for _, descendant in ipairs(root:GetDescendants()) do
+                if descendant:IsA("GuiButton") then
+                    local text = string.lower(tostring(descendant.Text or ""))
+                    if text == "exit" or text == "leave" or text == "quit" then
+                        if clickGuiButton(descendant) then
+                            return true
+                        end
+                    end
+                end
+            end
         end
     end
     return false
@@ -3797,6 +4619,11 @@ for _, difficulty in ipairs(raidDifficultyOptions) do
     raidDifficultySet[difficulty] = true
 end
 local completedRaidDifficulties = {}
+-- Boss Raid grants one attempt per hourly window. Keep the feature enabled
+-- after the first click, but latch the attempt so the polling loops cannot
+-- click again until the next window is detected.
+local raidAttemptConsumed = false
+local raidClosedSince = nil
 
 local function normalizeRaidDifficulties(value)
     local selected = {}
@@ -3983,9 +4810,26 @@ local function isBossRaidOpen()
     return string.find(normalized, "end in", 1, true) ~= nil
 end
 
+local function resetRaidAttemptAfterClosedWindow()
+    if isBossRaidOpen() then
+        raidClosedSince = nil
+        return
+    end
+
+    local now = os.clock()
+    raidClosedSince = raidClosedSince or now
+    -- Require a stable closed state before re-arming. This avoids a brief
+    -- timer/UI replication gap reopening the same hourly attempt.
+    if now - raidClosedSince >= 3 then
+        raidAttemptConsumed = false
+        clearCompletedRaidDifficulties()
+    end
+end
+
 task.spawn(function()
     while true do
         task.wait(0.5)
+        resetRaidAttemptAfterClosedWindow()
         local timer = findBossRaidTimer()
         local text = readRaidTimerText(timer)
         if text and text ~= "" then
@@ -4014,14 +4858,6 @@ local function equipBestCardsWithRetry()
     return false
 end
 
-local function finishAutoRaidIfComplete()
-    if getNextRaidDifficulty() then return false end
-    Config.AutoRaid = false
-    if Controls.AutoRaid and Controls.AutoRaid.Set then
-        pcall(function() Controls.AutoRaid:Set(false) end)
-    end
-end
-
 local function waitForBossRaidConfirmation()
     for _ = 1, 20 do
         if player:GetAttribute("BossRaidInBattle") == true then
@@ -4033,13 +4869,32 @@ local function waitForBossRaidConfirmation()
 end
 
 startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
+    -- BossRaidRewardClient claims the reward from its CLOSE button. Never
+    -- start the next tower/raid battle while that panel is still open.
+    if closeBossRaidReward and closeBossRaidReward() then
+        return false
+    end
     if mode == "BossRaid" and not isBossRaidOpen() then
+        return false
+    end
+    if mode == "BossRaid" and raidAttemptConsumed then
         return false
     end
 
     if mode == "BossRaid"
         and player:GetAttribute("InfinityTowerInBattle") == true then
-        return false
+        if not exitInfinityTowerBattle() then
+            return false
+        end
+        for _ = 1, 30 do
+            if player:GetAttribute("InfinityTowerInBattle") ~= true then
+                break
+            end
+            task.wait(0.1)
+        end
+        if player:GetAttribute("InfinityTowerInBattle") == true then
+            return false
+        end
     end
     if isCombatActive() then return false end
 
@@ -4063,9 +4918,12 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     if not started then return false end
 
     if mode == "BossRaid" then
+        -- Consume the hourly attempt as soon as the battle button is clicked.
+        -- Do not wait for the battle attribute: a rejected/failed start must
+        -- not cause the polling loop to spam the server repeatedly.
+        raidAttemptConsumed = true
         if waitForBossRaidConfirmation() then
             completedRaidDifficulties[raidDifficulty] = true
-            finishAutoRaidIfComplete()
         else
             return false
         end
@@ -4084,74 +4942,75 @@ end
 
 local combatBusy = false
 
+-- One scheduler owns both modes.  Boss Raid is evaluated first on every
+-- pass, including while Tower is active, so "End in" cannot be missed.
 task.spawn(function()
     while true do
-        task.wait(1.5)
-        if combatBusy or Config.AutoTeamCardCycle then continue end
-        if not Config.AutoInfinityTower then continue end
-        if Config.AutoRaid and isBossRaidOpen() then
-            continue
-        end
-        if not isCombatActive() then
+        task.wait(0.5)
+        if combatBusy then continue end
+
+        local raidReady = Config.AutoRaid
+            and isBossRaidOpen()
+            and not raidAttemptConsumed
+            and getNextRaidDifficulty() ~= nil
+        local towerEnabled = Config.AutoInfinityTower
+        local towerActive = player:GetAttribute("InfinityTowerInBattle") == true
+        local raidActive = player:GetAttribute("BossRaidInBattle") == true
+
+        if raidReady and not raidActive then
             combatBusy = true
-            startCombatBattle(
-                "InfinityTower",
-                Config.AutoInfinityEquip,
-                Config.AutoInfinityHide
-            )
-            combatBusy = false
-        end
-    end
-end)
 
-task.spawn(function()
-    while true do
-        task.wait(1.5)
-        if combatBusy or Config.AutoTeamCardCycle then continue end
-        if not Config.AutoRaid then continue end
-        if not isBossRaidOpen() then continue end
-        if not isCombatActive() then
-            combatBusy = true
-            startCombatBattle(
-                "BossRaid",
-                Config.AutoRaidEquip,
-                Config.AutoRaidHide
-            )
-            combatBusy = false
-        end
-    end
-end)
+            if towerActive then
+                exitInfinityTowerBattle()
+                for _ = 1, 30 do
+                    if player:GetAttribute("InfinityTowerInBattle") ~= true then
+                        break
+                    end
+                    task.wait(0.1)
+                end
+            end
 
-task.spawn(function()
-    while true do
-        task.wait(2)
-        if combatBusy or not Config.AutoTeamCardCycle then continue end
-        if isCombatActive() then continue end
+            if not isCombatActive() then
+                if Config.AutoTeamCardCycle then
+                    if equipBestCardsWithRetry() then
+                        startCombatBattle(
+                            "BossRaid",
+                            Config.AutoRaidEquip,
+                            Config.AutoRaidHide
+                        )
+                    end
+                else
+                    startCombatBattle(
+                        "BossRaid",
+                        Config.AutoRaidEquip,
+                        Config.AutoRaidHide
+                    )
+                end
+            end
 
-        local combatMode
-        if Config.AutoRaid and isBossRaidOpen() then
-            combatMode = "BossRaid"
-        elseif Config.AutoInfinityTower then
-            combatMode = "InfinityTower"
-        end
-        if not combatMode then continue end
-
-        combatBusy = true
-        if not equipBestCardsWithRetry() then
             combatBusy = false
             continue
         end
 
-        if combatMode == "BossRaid" then
-            startCombatBattle("BossRaid", Config.AutoRaidEquip, Config.AutoRaidHide)
-        elseif combatMode == "InfinityTower" then
-            startCombatBattle(
-                "InfinityTower",
-                Config.AutoInfinityEquip,
-                Config.AutoInfinityHide
-            )
+        if towerEnabled and not isCombatActive() then
+            combatBusy = true
+            if Config.AutoTeamCardCycle then
+                if equipBestCardsWithRetry() then
+                    startCombatBattle(
+                        "InfinityTower",
+                        Config.AutoInfinityEquip,
+                        Config.AutoInfinityHide
+                    )
+                end
+            else
+                startCombatBattle(
+                    "InfinityTower",
+                    Config.AutoInfinityEquip,
+                    Config.AutoInfinityHide
+                )
+            end
+            combatBusy = false
         end
-        combatBusy = false
     end
 end)
 
@@ -4240,6 +5099,8 @@ local function buildSerializableConfig()
         AutoTraitRoll     = Config.AutoTraitRoll,
         SelectedRankCards  = Config.SelectedRankCards,
         TargetRank         = Config.TargetRank,
+        SelectedTraitCards = Config.SelectedTraitCards,
+        TargetTraits       = Config.TargetTraits,
         RankUseGems        = Config.RankUseGems,
         RankUseCash        = Config.RankUseCash,
         AutoRankRoll       = Config.AutoRankRoll,
@@ -4247,6 +5108,7 @@ local function buildSerializableConfig()
         AutoClaimDaily    = Config.AutoClaimDaily,
         AutoPlacePack     = Config.AutoPlacePack,
         AutoOpenPack      = Config.AutoOpenPack,
+        AutoTimePotion    = Config.AutoTimePotion,
         AutoBuyBoost      = Config.AutoBuyBoost,
         AutoInfinityEquip = Config.AutoInfinityEquip,
         AutoInfinityTower = Config.AutoInfinityTower,
@@ -4383,9 +5245,10 @@ local function loadConfig(name, isAutoload)
         "SelectedRarities", "SelectedMutations", "SelectedPacks",
         "AutoUpgrade", "UpgradeDelay", "CardActionDelay", "AutoSell",
         "AutoTraitRoll", "SelectedRankCards", "TargetRank",
+        "SelectedTraitCards", "TargetTraits",
         "RankUseGems", "RankUseCash", "AutoRankRoll",
         "AutoClaimPlaytime", "AutoClaimDaily",
-        "AutoPlacePack", "AutoOpenPack", "AutoBuyBoost",
+        "AutoPlacePack", "AutoOpenPack", "AutoTimePotion", "AutoBuyBoost",
         "AutoInfinityEquip", "AutoInfinityTower", "AutoInfinityHide",
         "RaidDifficulties", "AutoRaidEquip", "AutoRaid", "AutoRaidHide",
         "AutoTeamCardCycle", "AutoPotion", "SelectedPotions",
@@ -4396,6 +5259,9 @@ local function loadConfig(name, isAutoload)
     for _, key in ipairs(knownKeys) do
         if data[key] ~= nil then
             local value = data[key]
+            if key == "SelectedPotions" then
+                value = normalizeGeneralPotionSelection(value)
+            end
             Config[key] = value
             local control = Controls[key]
             if control and control.Set then
@@ -4634,6 +5500,18 @@ cardsTab:CreateToggle({
     CurrentValue = Config.AutoOpenPack,
     Flag         = "AutoOpenPack",
     Callback     = function(v) Config.AutoOpenPack = v end,
+})
+
+Controls.AutoTimePotion = cardsTab:CreateToggle({
+    Name         = "Auto Use Time Potion",
+    CurrentValue = Config.AutoTimePotion,
+    Flag         = "AutoTimePotion",
+    Callback     = function(v) Config.AutoTimePotion = v end,
+})
+
+cardsTab:CreateParagraph({
+    Title   = "Auto Time Potion behavior",
+    Content = "After all pack slots are occupied, Time Potions are used only while packs remain in your backpack and at least one placed pack is still on cooldown.",
 })
 
 cardsTab:CreateButton({
@@ -4898,11 +5776,76 @@ rerollTab:CreateParagraph({
 
 rerollTab:CreateSection("Traits")
 
+local initialTraitCardOptions, initialTraitCardMap = buildTraitCardOptions()
+traitCardOptionMap = initialTraitCardMap
+traitCardOptions = initialTraitCardOptions
+
+Controls.SelectedTraitCards = rerollTab:CreateDropdown({
+    Name            = "Select Card",
+    Options         = initialTraitCardOptions,
+    CurrentOption   = collapseFullSelection(
+        Config.SelectedTraitCards,
+        initialTraitCardOptions
+    ),
+    MultipleOptions = true,
+    Flag            = "SelectedTraitCards",
+    Callback        = function(v)
+        Config.SelectedTraitCards = collapseFullSelection(
+            v,
+            traitCardOptions
+        )
+    end,
+})
+traitCardDropdown = Controls.SelectedTraitCards
+
+local traitOptions = getTraitOptions()
+if type(Config.TargetTraits) == "string" then
+    Config.TargetTraits = Config.TargetTraits ~= ""
+        and { Config.TargetTraits }
+        or {}
+end
+if type(Config.TargetTraits) ~= "table" then Config.TargetTraits = {} end
+local validTraitSet = {}
+for _, trait in ipairs(traitOptions) do validTraitSet[trait] = true end
+local validTraitTargets = {}
+for _, trait in ipairs(Config.TargetTraits) do
+    if validTraitSet[tostring(trait)] then
+        table.insert(validTraitTargets, tostring(trait))
+    end
+end
+Config.TargetTraits = validTraitTargets
+
+Controls.TargetTraits = rerollTab:CreateDropdown({
+    Name            = "Target Trait",
+    Options         = traitOptions,
+    CurrentOption   = Config.TargetTraits,
+    MultipleOptions = true,
+    Flag            = "TargetTraits",
+    Callback        = function(v)
+        if type(v) == "string" then v = { v } end
+        Config.TargetTraits = type(v) == "table" and v or {}
+    end,
+})
+
 Controls.AutoTraitRoll = rerollTab:CreateToggle({
-    Name         = "Auto Trait Roll",
+    Name         = "Start Reroll",
     CurrentValue = Config.AutoTraitRoll,
     Flag         = "AutoTraitRoll",
-    Callback     = function(v) Config.AutoTraitRoll = v end,
+    Callback     = function(v)
+        Config.AutoTraitRoll = v
+        if v and not TraitRollRE then
+            Config.AutoTraitRoll = false
+            if Controls.AutoTraitRoll and Controls.AutoTraitRoll.Set then
+                pcall(function() Controls.AutoTraitRoll:Set(false) end)
+            end
+            notify("Traits", "TraitRollRE was not found.")
+        end
+    end,
+})
+
+rerollTab:CreateParagraph({
+    Title   = "Traits behavior",
+    Content = "Selected cards are rerolled until they reach one of the selected traits. Trait rerolls use Trait Gems only and stop immediately when no Trait Gems remain. If both rerolls are enabled, Card Ranking runs first.",
 })
 
 -- ══════════════════════════════════════════════════════════════
@@ -4937,7 +5880,7 @@ Controls.AutoPotion = miscTab:CreateToggle({
 
 miscTab:CreateParagraph({
     Title   = "Potion behavior",
-    Content = "Only selected potions that you own are used. The next potion waits until no active potion effect remains.",
+    Content = "Only selected potions that you own are used. A potion waits until its category timer reaches zero; a higher tier can replace a lower tier and its confirmation is accepted automatically.",
 })
 
 miscTab:CreateSection("Auto Buy Boost")
