@@ -393,7 +393,7 @@ local PACKS = {
 local POTIONS = {
     "LuckPotion1", "LuckPotion2", "LuckPotion3",
     "CashPotion1", "CashPotion2", "CashPotion3",
-    "MutationPotion1",
+    "MutationPotion1", "MutationPotion2", "MutationPotion3",
     "ProductionPotion1", "ProductionPotion2",
 }
 
@@ -503,7 +503,7 @@ local Config = {
     AutoSell          = false,
     AutoTraitRoll     = false,
     SelectedRankCards = { "All" },
-    TargetRank        = { "UR" },
+    TargetRank        = {},
     SelectedTraitCards = { "All" },
     TargetTraits      = {},
     RankUseGems       = true,
@@ -5690,7 +5690,7 @@ local rerollTab = Window:CreateTab("🔄 Reroll", 0)
 
 rerollTab:CreateParagraph({
     Title   = "⚠️ Before You Reroll",
-    Content = "Do not hold or equip a card while rerolling is active. Held or equipped cards are removed from your backpack, making them invisible to the script — those cards will be skipped entirely until you put them away.",
+    Content = "Do not hold or equip a card while rerolling is active. Held or equipped cards are skipped entirely.",
 })
 
 rerollTab:CreateSection("Card Ranking")
@@ -5722,7 +5722,7 @@ local validTargets = {}
 for _, r in ipairs(Config.TargetRank) do
     if validRankSet[r] then table.insert(validTargets, r) end
 end
-Config.TargetRank = #validTargets > 0 and validTargets or { rankOptions[1] or "UR" }
+Config.TargetRank = validTargets
 
 Controls.TargetRank = rerollTab:CreateDropdown({
     Name            = "Target Ranking",
@@ -5732,7 +5732,7 @@ Controls.TargetRank = rerollTab:CreateDropdown({
     Flag            = "TargetRank",
     Callback        = function(v)
         if type(v) == "string" then v = { v } end
-        Config.TargetRank = (type(v) == "table" and #v > 0) and v or { rankOptions[1] or "UR" }
+        Config.TargetRank = (type(v) == "table" and #v > 0) and v or {}
     end,
 })
 
@@ -5764,11 +5764,6 @@ Controls.AutoRankRoll = rerollTab:CreateToggle({
             notify("Card Ranking", "GradeRollRE was not found.")
         end
     end,
-})
-
-rerollTab:CreateParagraph({
-    Title   = "Card Ranking behavior",
-    Content = "Selected cards are rerolled one at a time until they reach the target ranking. Gems are used first; cash is used only after gems reach zero.",
 })
 
 rerollTab:CreateSection("Traits")
@@ -5840,11 +5835,6 @@ Controls.AutoTraitRoll = rerollTab:CreateToggle({
     end,
 })
 
-rerollTab:CreateParagraph({
-    Title   = "Traits behavior",
-    Content = "Selected cards are rerolled until they reach one of the selected traits. Trait rerolls use Trait Gems only and stop immediately when no Trait Gems remain. If both rerolls are enabled, Card Ranking runs first.",
-})
-
 -- ══════════════════════════════════════════════════════════════
 --  TAB 6 – Misc
 -- ══════════════════════════════════════════════════════════════
@@ -5873,11 +5863,6 @@ Controls.AutoPotion = miscTab:CreateToggle({
     CurrentValue = Config.AutoPotion,
     Flag         = "AutoPotion",
     Callback     = function(v) Config.AutoPotion = v end,
-})
-
-miscTab:CreateParagraph({
-    Title   = "Potion behavior",
-    Content = "Only selected potions that you own are used. A potion waits until its category timer reaches zero; a higher tier can replace a lower tier and its confirmation is accepted automatically.",
 })
 
 miscTab:CreateSection("Auto Buy Boost")
