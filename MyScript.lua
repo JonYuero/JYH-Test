@@ -544,7 +544,6 @@ local playtimeReadyRewards = {}
 local playtimeStateReceived = false
 local potionInventoryCounts = {}
 local nextTimePotionUse = 0
-local nextTimePotionInventorySync = 0
 
 -- Forward declarations
 local clickGuiButton
@@ -3107,27 +3106,6 @@ do
             return tier > active.tier
         end
 
-        local function updatePotionInventory(data, replaceAll)
-            if type(data) ~= "table" then return end
-
-            local items = data.Items or data.Inventory or data.ItemsData
-            if type(items) ~= "table" then
-                -- Some game versions send the item map directly.
-                items = data
-            end
-
-            if replaceAll then
-                table.clear(potionCounts)
-            end
-
-            for itemId, quantity in pairs(items) do
-                if itemId ~= "Items" and itemId ~= "Inventory"
-                    and itemId ~= "ItemsData" then
-                    potionCounts[itemId] = quantity
-                end
-            end
-        end
-
         -- Mirror the same events the ItemsClient script handles. The game
         -- has used both FullInventory and InventoryUpdate for this snapshot,
         -- so Auto Use Time Potion must understand both versions.
@@ -3139,7 +3117,20 @@ do
                         or data.QuantityValue or data.Amount
                         or data.Count or 0
                 else
-                    updatePotionInventory(data, action == "FullInventory")
+                    local items = data.Items or data.Inventory or data.ItemsData
+                    if type(items) ~= "table" then
+                        -- Some game versions send the item map directly.
+                        items = data
+                    end
+                    if action == "FullInventory" then
+                        table.clear(potionCounts)
+                    end
+                    for itemId, quantity in pairs(items) do
+                        if itemId ~= "Items" and itemId ~= "Inventory"
+                            and itemId ~= "ItemsData" then
+                            potionCounts[itemId] = quantity
+                        end
+                    end
                 end
                 applyBoosts(data.Boosts)
                 pendingPotion = nil
@@ -4271,6 +4262,7 @@ task.spawn(function()
         return nil, 0
     end
 
+    local nextInventorySync = 0
     while true do
         task.wait(1)
         if not Config.AutoTimePotion then continue end
@@ -4280,9 +4272,9 @@ task.spawn(function()
         -- Keep this feature independent from Misc > Auto Use Potions. The
         -- time-potion toggle can be enabled by itself and still receives
         -- current inventory data.
-        if now >= nextTimePotionInventorySync then
+        if now >= nextInventorySync then
             pcall(function() ItemsREForAutomation:FireServer("Init") end)
-            nextTimePotionInventorySync = now + 5
+            nextInventorySync = now + 5
         end
 
         if now < nextTimePotionUse then continue end
@@ -4494,26 +4486,11 @@ local function getCombatGui(mode)
     return root
 end
 
-local function isGuiVisibleInTree(instance)
-    if not instance then return false end
-    local current = instance
-    while current do
-        if current:IsA("GuiObject") and not current.Visible then
-            return false
-        end
-        if current:IsA("LayerCollector") and not current.Enabled then
-            return false
-        end
-        current = current.Parent
-    end
-    return true
-end
-
 clickGuiButton = function(button)
     if not button or not button:IsA("GuiButton") then return false end
     -- Do not fire hidden duplicate buttons. Combat screens keep several
     -- copies of Exit/Battle controls in the hierarchy across UI states.
-    if not isGuiVisibleInTree(button) then return false end
+    if button:IsA("GuiObject") and not button.Visible then return false end
     if firesignal then
         local ok = pcall(firesignal, button.MouseButton1Click)
         if ok then return true end
@@ -4542,11 +4519,9 @@ end
 
 local function isGuiShown(instance)
     if not instance then return false end
-    if not instance:IsA("GuiObject")
-        and not instance:IsA("LayerCollector") then
-        return false
-    end
-    return isGuiVisibleInTree(instance)
+    if instance:IsA("GuiObject") then return instance.Visible == true end
+    if instance:IsA("LayerCollector") then return instance.Enabled == true end
+    return false
 end
 
 -- Lightweight immediate check used by startCombatBattle as a gate.
@@ -4919,7 +4894,7 @@ local function isBossRaidOpen()
     for _, root in ipairs(roots) do
         if root then
             for _, descendant in ipairs(root:GetDescendants()) do
-                if isGuiVisibleInTree(descendant)
+                if (not descendant:IsA("GuiObject") or descendant.Visible)
                     and (descendant:IsA("TextLabel")
                         or descendant:IsA("TextButton")
                         or descendant:IsA("TextBox")) then
