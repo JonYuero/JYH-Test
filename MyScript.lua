@@ -544,6 +544,7 @@ local playtimeReadyRewards = {}
 local playtimeStateReceived = false
 local potionInventoryCounts = {}
 local nextTimePotionUse = 0
+local nextTimePotionInventorySync = 0
 
 -- Forward declarations
 local clickGuiButton
@@ -3106,14 +3107,39 @@ do
             return tier > active.tier
         end
 
-        -- Mirror the same event the ItemsClient script handles
-        ItemsRE.OnClientEvent:Connect(function(action, data)
-            if action == "FullInventory" and type(data) == "table" then
+        local function updatePotionInventory(data, replaceAll)
+            if type(data) ~= "table" then return end
+
+            local items = data.Items or data.Inventory or data.ItemsData
+            if type(items) ~= "table" then
+                -- Some game versions send the item map directly.
+                items = data
+            end
+
+            if replaceAll then
                 table.clear(potionCounts)
-                if type(data.Items) == "table" then
-                    for itemId, qty in pairs(data.Items) do
-                        potionCounts[itemId] = qty
-                    end
+            end
+
+            for itemId, quantity in pairs(items) do
+                if itemId ~= "Items" and itemId ~= "Inventory"
+                    and itemId ~= "ItemsData" then
+                    potionCounts[itemId] = quantity
+                end
+            end
+        end
+
+        -- Mirror the same events the ItemsClient script handles. The game
+        -- has used both FullInventory and InventoryUpdate for this snapshot,
+        -- so Auto Use Time Potion must understand both versions.
+        ItemsRE.OnClientEvent:Connect(function(action, data)
+            if (action == "FullInventory" or action == "InventoryUpdate")
+                and type(data) == "table" then
+                if data.ItemId ~= nil then
+                    potionCounts[data.ItemId] = data.Quantity
+                        or data.QuantityValue or data.Amount
+                        or data.Count or 0
+                else
+                    updatePotionInventory(data, action == "FullInventory")
                 end
                 applyBoosts(data.Boosts)
                 pendingPotion = nil
@@ -4248,12 +4274,18 @@ task.spawn(function()
     while true do
         task.wait(1)
         if not Config.AutoTimePotion then continue end
-        if not Config.AutoPlacePack or not Config.AutoOpenPack then continue end
-        if os.clock() < nextTimePotionUse then continue end
         if not ItemsREForAutomation then continue end
 
-        local packs = getAllPacksInBackpack()
-        if #packs == 0 then continue end
+        local now = os.clock()
+        -- Keep this feature independent from Misc > Auto Use Potions. The
+        -- time-potion toggle can be enabled by itself and still receives
+        -- current inventory data.
+        if now >= nextTimePotionInventorySync then
+            pcall(function() ItemsREForAutomation:FireServer("Init") end)
+            nextTimePotionInventorySync = now + 5
+        end
+
+        if now < nextTimePotionUse then continue end
         if not areAllCardSlotsOccupied() then continue end
 
         local hasCooldown = false
@@ -4283,7 +4315,7 @@ task.spawn(function()
         end)
         -- Give ItemUpdate/UseOk time to arrive before considering another
         -- time potion. This prevents remote spam if the server is slow.
-        nextTimePotionUse = os.clock() + (used and 1.5 or 0.5)
+        nextTimePotionUse = os.clock() + (used and 3 or 1)
     end
 end)
 
@@ -4462,13 +4494,30 @@ local function getCombatGui(mode)
     return root
 end
 
+local function isGuiVisibleInTree(instance)
+    if not instance then return false end
+    local current = instance
+    while current do
+        if current:IsA("GuiObject") and not current.Visible then
+            return false
+        end
+        if current:IsA("LayerCollector") and not current.Enabled then
+            return false
+        end
+        current = current.Parent
+    end
+    return true
+end
+
 clickGuiButton = function(button)
     if not button or not button:IsA("GuiButton") then return false end
+    -- Do not fire hidden duplicate buttons. Combat screens keep several
+    -- copies of Exit/Battle controls in the hierarchy across UI states.
+    if not isGuiVisibleInTree(button) then return false end
     if firesignal then
         local ok = pcall(firesignal, button.MouseButton1Click)
         if ok then return true end
     end
-    if button:IsA("GuiObject") and not button.Visible then return false end
     return pcall(function() button:Activate() end)
 end
 
@@ -4493,9 +4542,11 @@ end
 
 local function isGuiShown(instance)
     if not instance then return false end
-    if instance:IsA("GuiObject") then return instance.Visible == true end
-    if instance:IsA("LayerCollector") then return instance.Enabled == true end
-    return false
+    if not instance:IsA("GuiObject")
+        and not instance:IsA("LayerCollector") then
+        return false
+    end
+    return isGuiVisibleInTree(instance)
 end
 
 -- Lightweight immediate check used by startCombatBattle as a gate.
@@ -4718,16 +4769,16 @@ end
 
 local RAID_DIFFICULTY_INFO = {
     Easy = {
-        damage = "1.3B",
-        description = "At least 1.3B damage per card.",
+        damage = "2.1B",
+        description = "At least 2.1B damage per card.",
     },
     Medium = {
-        damage = "24.4Qn",
-        description = "At least 24.4Qn damage per card.",
+        damage = "412.9Qn",
+        description = "At least 412.9Qn damage per card.",
     },
     Hard = {
-        damage = "4.7O",
-        description = "At least 4.7O damage per card.",
+        damage = "617.7O",
+        description = "At least 617.7O damage per card.",
     },
     Nightmare = {
         damage = "13.1O",
@@ -4824,20 +4875,65 @@ local function readRaidTimerText(timer)
 end
 
 local function findBossRaidTimer()
-    local bossRaidModel = workspace:FindFirstChild("BossRaidModel", true)
-    if not bossRaidModel then
-        bossRaidModel = playerGui:FindFirstChild("BossRaidModel", true)
+    local roots = {
+        workspace:FindFirstChild("BossRaidModel", true),
+        workspace:FindFirstChild("BossRaid", true),
+        playerGui:FindFirstChild("BossRaidModel", true),
+        playerGui:FindFirstChild("BossRaidGui", true),
+        getCombatGui("BossRaid"),
+    }
+    local timerNames = {
+        "Timer", "TimeLeft", "TimeRemaining", "Countdown",
+    }
+
+    for _, root in ipairs(roots) do
+        if root then
+            for _, name in ipairs(timerNames) do
+                local timer = findGuiByName(root, name)
+                    or root:FindFirstChild(name, true)
+                if timer then return timer end
+            end
+        end
     end
-    return bossRaidModel and bossRaidModel:FindFirstChild("Timer", true)
+    return nil
 end
 
 local function isBossRaidOpen()
     local timer = findBossRaidTimer()
     local text = readRaidTimerText(timer)
-    if not text then return false end
+    if text and string.find(
+        string.lower(text),
+        "end in",
+        1,
+        true
+    ) then
+        return true
+    end
 
-    local normalized = string.lower(text)
-    return string.find(normalized, "end in", 1, true) ~= nil
+    -- UI revisions have moved the countdown between the raid model and the
+    -- raid frame. Fall back to visible raid text when no named timer exists.
+    local roots = {
+        playerGui:FindFirstChild("BossRaidGui", true),
+        getCombatGui("BossRaid"),
+    }
+    for _, root in ipairs(roots) do
+        if root then
+            for _, descendant in ipairs(root:GetDescendants()) do
+                if isGuiVisibleInTree(descendant)
+                    and (descendant:IsA("TextLabel")
+                        or descendant:IsA("TextButton")
+                        or descendant:IsA("TextBox")) then
+                    local descendantText = string.lower(
+                        tostring(descendant.Text or "")
+                    )
+                    if string.find(descendantText, "end in", 1, true) then
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    return false
 end
 
 task.spawn(function()
@@ -5585,38 +5681,126 @@ Controls.UpgradeDelay = cardsTab:CreateSlider({
     Callback     = function(v) Config.UpgradeDelay = v end,
 })
 
-local sellConfirmation = {
-    action = nil,
-    expiresAt = 0,
-}
+local sellConfirmationGui
+
+local function closeSellConfirmation()
+    if sellConfirmationGui then
+        pcall(function() sellConfirmationGui:Destroy() end)
+        sellConfirmationGui = nil
+    end
+end
 
 local function confirmSellAction(label, action)
-    local now = os.clock()
-    if sellConfirmation.action == action
-        and now < sellConfirmation.expiresAt then
-        sellConfirmation.action = nil
-        sellConfirmation.expiresAt = 0
+    closeSellConfirmation()
+
+    local messageByAction = {
+        SellAll = "Are you sure you want to sell all?",
+        SellCards = "Are you sure you want to sell all cards?",
+        SellPacks = "Are you sure you want to sell all packs?",
+    }
+
+    local confirmationGui = Instance.new("ScreenGui")
+    confirmationGui.Name = "JYH_SellConfirmation"
+    confirmationGui.DisplayOrder = 10000
+    confirmationGui.ResetOnSpawn = false
+    confirmationGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    confirmationGui.Parent = playerGui
+    sellConfirmationGui = confirmationGui
+
+    local overlay = Instance.new("Frame")
+    overlay.Name = "Overlay"
+    overlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    overlay.BackgroundTransparency = 0.45
+    overlay.BorderSizePixel = 0
+    overlay.Size = UDim2.fromScale(1, 1)
+    overlay.Parent = confirmationGui
+
+    local panel = Instance.new("Frame")
+    panel.Name = "Panel"
+    panel.AnchorPoint = Vector2.new(0.5, 0.5)
+    panel.Position = UDim2.fromScale(0.5, 0.5)
+    panel.Size = UDim2.fromOffset(360, 170)
+    panel.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+    panel.BorderSizePixel = 0
+    panel.Parent = overlay
+
+    local panelCorner = Instance.new("UICorner")
+    panelCorner.CornerRadius = UDim.new(0, 10)
+    panelCorner.Parent = panel
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.fromOffset(20, 16)
+    title.Size = UDim2.new(1, -40, 0, 28)
+    title.Font = Enum.Font.GothamBold
+    title.Text = "Confirm sale"
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.TextSize = 20
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = panel
+
+    local message = Instance.new("TextLabel")
+    message.Name = "Message"
+    message.BackgroundTransparency = 1
+    message.Position = UDim2.fromOffset(20, 52)
+    message.Size = UDim2.new(1, -40, 0, 40)
+    message.Font = Enum.Font.Gotham
+    message.Text = messageByAction[action] or ("Are you sure you want to " .. label .. "?")
+    message.TextColor3 = Color3.fromRGB(220, 220, 225)
+    message.TextSize = 16
+    message.TextWrapped = true
+    message.TextXAlignment = Enum.TextXAlignment.Left
+    message.Parent = panel
+
+    local function makeButton(name, text, color, position)
+        local button = Instance.new("TextButton")
+        button.Name = name
+        button.Position = position
+        button.Size = UDim2.fromOffset(145, 38)
+        button.BackgroundColor3 = color
+        button.BorderSizePixel = 0
+        button.Font = Enum.Font.GothamBold
+        button.Text = text
+        button.TextColor3 = Color3.fromRGB(255, 255, 255)
+        button.TextSize = 16
+        button.Parent = panel
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 7)
+        corner.Parent = button
+        return button
+    end
+
+    local noButton = makeButton(
+        "No",
+        "No",
+        Color3.fromRGB(75, 75, 85),
+        UDim2.new(0, 20, 1, -54)
+    )
+    local yesButton = makeButton(
+        "Yes",
+        "Yes",
+        Color3.fromRGB(205, 65, 75),
+        UDim2.new(1, -165, 1, -54)
+    )
+
+    local finished = false
+    local function finish(confirmed)
+        if finished then return end
+        finished = true
+        closeSellConfirmation()
+        if not confirmed then return end
+
         local ok = fireRemote("SellRE", action)
         notify(
             label,
             ok and "Sell request sent." or "Could not send sell request."
         )
-        return
     end
 
-    sellConfirmation.action = action
-    sellConfirmation.expiresAt = now + 5
-    notify(
-        "Confirm " .. label,
-        "Click the button again within 5 seconds to confirm."
-    )
-    task.delay(5, function()
-        if sellConfirmation.action == action
-            and sellConfirmation.expiresAt <= os.clock() then
-            sellConfirmation.action = nil
-            sellConfirmation.expiresAt = 0
-        end
-    end)
+    yesButton.Activated:Connect(function() finish(true) end)
+    noButton.Activated:Connect(function() finish(false) end)
 end
 
 cardsTab:CreateSection("Sell")
