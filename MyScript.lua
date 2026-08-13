@@ -4849,7 +4849,7 @@ local function readRaidTimerText(timer)
     return nil
 end
 
-local function findBossRaidTimer()
+function findBossRaidTimer()
     local roots = {
         workspace:FindFirstChild("BossRaidModel", true),
         workspace:FindFirstChild("BossRaid", true),
@@ -4873,7 +4873,7 @@ local function findBossRaidTimer()
     return nil
 end
 
-local function isBossRaidOpen()
+function isBossRaidOpen()
     local timer = findBossRaidTimer()
     local text = readRaidTimerText(timer)
     if text and string.find(
