@@ -325,7 +325,7 @@ end
 -- ── Remotes ──────────────────────────────────────────────────
 local Remotes    = ReplicatedStorage:WaitForChild("Remotes")
 local ConveyorRE = Remotes:WaitForChild("ConveyorRE")
-local ItemsREForAutomation = Remotes:FindFirstChild("ItemsRE")
+local ItemsREForAutomation = Remotes:WaitForChild("ItemsRE", 15)
 local PlayTimeRewardRE = Remotes:FindFirstChild("PlayTimeRewardRE")
 local DailyRewardRE    = Remotes:FindFirstChild("DailyRewardRE")
 local UpgradesRE       = Remotes:FindFirstChild("UpgradesRE")
@@ -387,7 +387,7 @@ local PACKS = {
     "Hunter Pack", "Soul Pack", "Swordsman Pack", "Gamer Pack",
     "Revenge Pack", "Chainsaw Pack", "Eternity Pack", "Academy Pack",
     "Dynasty Pack", "Grail Pack", "Conquest Pack", "Blaze Pack",
-    "Devour Pack",
+    "Devour Pack", "Raven Pack", "Arcane Pack", "Nightfall Pack",
 }
 
 local POTIONS = {
@@ -3119,7 +3119,8 @@ do
                 pendingPotion = nil
 
             elseif action == "ItemUpdate" and type(data) == "table" then
-                potionCounts[data.ItemId] = data.Quantity or 0
+                potionCounts[data.ItemId] = data.Quantity or data.QuantityValue
+                or data.Amount or data.Count or 0
 
             elseif action == "BoostUpdate" then
                 applyBoosts(data)
@@ -4038,11 +4039,11 @@ end)
 task.spawn(function()
     while true do
         task.wait(0.15)
-        -- Card Ranking always owns the reroll worker first. Traits starts
-        -- automatically after ranking has been stopped/completed.
-        if not Config.AutoTraitRoll
-            or Config.AutoRankRoll
-            or rankRollPending then
+        -- Trait and ranking rerolls use separate remotes and may run at the
+        -- same time.  Do not use ActiveAutoRoll or the other script toggle as
+        -- a shared mutex: the game's built-in auto-roll uses that attribute
+        -- to coordinate only its own two UI workers.
+        if not Config.AutoTraitRoll then
             continue
         end
         if not TraitRollRE then
@@ -4065,10 +4066,10 @@ task.spawn(function()
         local progressed = false
         local cardsRemaining = false
         for _, tool in ipairs(cards) do
-            if not Config.AutoTraitRoll or Config.AutoRankRoll then break end
+            if not Config.AutoTraitRoll then break end
             if not tool.Parent then continue end
-            while Config.AutoTraitRoll and not Config.AutoRankRoll
-                and tool.Parent and not traitHasTarget(tool) do
+            while Config.AutoTraitRoll and tool.Parent
+                and not traitHasTarget(tool) do
                 cardsRemaining = true
                 local gemCost = getTraitGemsCost()
                 if getTraitGems() < gemCost then
@@ -4084,8 +4085,8 @@ task.spawn(function()
                 end)
 
                 local deadline = os.clock() + 8
-                while Config.AutoTraitRoll and not Config.AutoRankRoll
-                    and traitRollPending and not traitRollResponse
+                while Config.AutoTraitRoll and traitRollPending
+                    and not traitRollResponse
                     and os.clock() < deadline do
                     task.wait(0.1)
                 end
@@ -4198,6 +4199,52 @@ end)
 -- Time potions are not category boosts.  They reduce pack cooldowns, so
 -- they are handled separately from Misc > Auto Use Potions.
 task.spawn(function()
+    -- Inventory item ids have used both compact ids (TimePotion3) and
+    -- display-style ids (Time Potion III) across game revisions. Keep the
+    -- configured compact names, but send the exact key received from server.
+    local function normalizePotionInventoryId(value)
+        local text = string.lower(tostring(value or ""))
+        text = string.gsub(text, "[^%w]", "")
+        if string.sub(text, -3) == "iii" then
+            text = string.sub(text, 1, -4) .. "3"
+        elseif string.sub(text, -2) == "ii" then
+            text = string.sub(text, 1, -3) .. "2"
+        elseif string.sub(text, -1) == "i" then
+            text = string.sub(text, 1, -2) .. "1"
+        end
+        return text
+    end
+
+    local function inventoryQuantity(value)
+        if type(value) == "table" then
+            return tonumber(
+                value.Quantity or value.quantity
+                    or value.Amount or value.amount
+                    or value.Count or value.count
+            ) or 0
+        end
+        return tonumber(value) or 0
+    end
+
+    local function findPotionInventoryItem(preferredId)
+        local preferredKey = normalizePotionInventoryId(preferredId)
+        local directQuantity = inventoryQuantity(
+            potionInventoryCounts[preferredId]
+        )
+        if directQuantity > 0 then
+            return preferredId, directQuantity
+        end
+
+        for itemId, quantity in pairs(potionInventoryCounts) do
+            local amount = inventoryQuantity(quantity)
+            if amount > 0
+                and normalizePotionInventoryId(itemId) == preferredKey then
+                return itemId, amount
+            end
+        end
+        return nil, 0
+    end
+
     while true do
         task.wait(1)
         if not Config.AutoTimePotion then continue end
@@ -4220,14 +4267,15 @@ task.spawn(function()
 
         local selectedPotion
         for _, potion in ipairs(TIME_POTIONS) do
-            if (potionInventoryCounts[potion] or 0) > 0 then
-                selectedPotion = potion
+            local inventoryItem, quantity = findPotionInventoryItem(potion)
+            if inventoryItem and quantity > 0 then
+                selectedPotion = inventoryItem
                 break
             end
         end
         if not selectedPotion then continue end
 
-        pcall(function()
+        local used = pcall(function()
             ItemsREForAutomation:FireServer("UseItem", {
                 ItemId = selectedPotion,
                 Amount = 1,
@@ -4235,7 +4283,7 @@ task.spawn(function()
         end)
         -- Give ItemUpdate/UseOk time to arrive before considering another
         -- time potion. This prevents remote spam if the server is slow.
-        nextTimePotionUse = os.clock() + 1.5
+        nextTimePotionUse = os.clock() + (used and 1.5 or 0.5)
     end
 end)
 
