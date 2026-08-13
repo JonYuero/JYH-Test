@@ -399,7 +399,7 @@ local POTIONS = {
 
 -- Keep the strongest time potion first so pack automation always spends the
 -- best available skip potion before falling back to a weaker one.
-local TIME_POTIONS = { "TimePotion2", "TimePotion1" }
+local TIME_POTIONS = { "TimePotion3", "TimePotion2", "TimePotion1" }
 
 local function normalizeGeneralPotionSelection(selection)
     local valid = {}
@@ -500,7 +500,6 @@ local Config = {
     AutoUpgrade       = false,
     UpgradeDelay      = 0.15,
     CardActionDelay   = 0.6,
-    AutoSell          = false,
     AutoTraitRoll     = false,
     SelectedRankCards = { "All" },
     TargetRank        = {},
@@ -2834,23 +2833,6 @@ task.spawn(function()
     end
 end)
 
--- Auto Sell
-task.spawn(function()
-    while true do
-        task.wait(0.75)
-        if not Config.AutoSell then continue end
-        local backpack = player:FindFirstChild("Backpack")
-        if not backpack then continue end
-        for _, item in ipairs(backpack:GetChildren()) do
-            local lvl = item:FindFirstChild("CardLevel")
-            if lvl and lvl.Value >= MAX_CARD_LEVEL then
-                fireRemote("CardSlotRE", "Sell", item.Name)
-                task.wait(0.1)
-            end
-        end
-    end
-end)
-
 -- Auto Potions
 -- Uses ItemsRE.OnClientEvent (same events the game's ItemsClient listens to)
 -- for reliable inventory counts and active boost tracking. The replacement
@@ -5092,7 +5074,6 @@ local function buildSerializableConfig()
         AutoUpgrade       = Config.AutoUpgrade,
         UpgradeDelay      = Config.UpgradeDelay,
         CardActionDelay   = Config.CardActionDelay,
-        AutoSell          = Config.AutoSell,
         AutoTraitRoll     = Config.AutoTraitRoll,
         SelectedRankCards  = Config.SelectedRankCards,
         TargetRank         = Config.TargetRank,
@@ -5240,7 +5221,7 @@ local function loadConfig(name, isAutoload)
         "AutoSpawnPack", "SpawnDelay", "AutoStopSpawn", "AutoBuyMatching",
         "AutoCarryBox", "AutoSellBox", "AutoSellDelay",
         "SelectedRarities", "SelectedMutations", "SelectedPacks",
-        "AutoUpgrade", "UpgradeDelay", "CardActionDelay", "AutoSell",
+        "AutoUpgrade", "UpgradeDelay", "CardActionDelay",
         "AutoTraitRoll", "SelectedRankCards", "TargetRank",
         "SelectedTraitCards", "TargetTraits",
         "RankUseGems", "RankUseCash", "AutoRankRoll",
@@ -5476,7 +5457,7 @@ Controls.SelectedMutations = spawnTab:CreateDropdown({
 -- ══════════════════════════════════════════════════════════════
 --  TAB 2 – Cards
 -- ══════════════════════════════════════════════════════════════
-local cardsTab = Window:CreateTab("⬆️ Cards", 0)
+local cardsTab = Window:CreateTab("🃏 Cards", 0)
 
 cardsTab:CreateSection("Card Management")
 
@@ -5506,9 +5487,15 @@ Controls.AutoTimePotion = cardsTab:CreateToggle({
     Callback     = function(v) Config.AutoTimePotion = v end,
 })
 
-cardsTab:CreateParagraph({
-    Title   = "Auto Time Potion behavior",
-    Content = "After all pack slots are occupied, Time Potions are used only while packs remain in your backpack and at least one placed pack is still on cooldown.",
+cardsTab:CreateButton({
+    Name     = "Equip Best Cards",
+    Callback = function()
+        local ok = fireRemote("CardSlotRE", "EquipBest")
+        notify(
+            "Equip Best Cards",
+            ok and "Equip Best request sent." or "Could not send Equip Best request."
+        )
+    end,
 })
 
 cardsTab:CreateButton({
@@ -5550,10 +5537,78 @@ Controls.UpgradeDelay = cardsTab:CreateSlider({
     Callback     = function(v) Config.UpgradeDelay = v end,
 })
 
+local sellConfirmation = {
+    action = nil,
+    expiresAt = 0,
+}
+
+local function confirmSellAction(label, action)
+    local now = os.clock()
+    if sellConfirmation.action == action
+        and now < sellConfirmation.expiresAt then
+        sellConfirmation.action = nil
+        sellConfirmation.expiresAt = 0
+        local ok = fireRemote("SellRE", action)
+        notify(
+            label,
+            ok and "Sell request sent." or "Could not send sell request."
+        )
+        return
+    end
+
+    sellConfirmation.action = action
+    sellConfirmation.expiresAt = now + 5
+    notify(
+        "Confirm " .. label,
+        "Click the button again within 5 seconds to confirm."
+    )
+    task.delay(5, function()
+        if sellConfirmation.action == action
+            and sellConfirmation.expiresAt <= os.clock() then
+            sellConfirmation.action = nil
+            sellConfirmation.expiresAt = 0
+        end
+    end)
+end
+
+cardsTab:CreateSection("Sell")
+
+cardsTab:CreateButton({
+    Name     = "Auto Sell All",
+    Callback = function()
+        confirmSellAction("Auto Sell All", "SellAll")
+    end,
+})
+
+cardsTab:CreateButton({
+    Name     = "Auto Sell Cards",
+    Callback = function()
+        confirmSellAction("Auto Sell Cards", "SellCards")
+    end,
+})
+
+cardsTab:CreateButton({
+    Name     = "Auto Sell Packs",
+    Callback = function()
+        confirmSellAction("Auto Sell Packs", "SellPacks")
+    end,
+})
+
+cardsTab:CreateButton({
+    Name     = "Auto Sell on Hand",
+    Callback = function()
+        local ok = fireRemote("SellRE", "SellHand")
+        notify(
+            "Auto Sell on Hand",
+            ok and "Sell request sent." or "Could not send sell request."
+        )
+    end,
+})
+
 -- ══════════════════════════════════════════════════════════════
---  TAB 3 – Auto Sell
+--  TAB 3 – Box & Craft
 -- ══════════════════════════════════════════════════════════════
-local autoSellTab = Window:CreateTab("📦 Auto Sell", 0)
+local autoSellTab = Window:CreateTab("📦 Box & Craft", 0)
 
 autoSellTab:CreateSection("Box Handling")
 
@@ -5579,15 +5634,6 @@ Controls.AutoSellDelay = autoSellTab:CreateSlider({
     CurrentValue = Config.AutoSellDelay,
     Flag         = "AutoSellDelay",
     Callback     = function(v) Config.AutoSellDelay = v end,
-})
-
-autoSellTab:CreateSection("Cards")
-
-autoSellTab:CreateToggle({
-    Name         = "Auto Sell Cards",
-    CurrentValue = Config.AutoSell,
-    Flag         = "AutoSell",
-    Callback     = function(v) Config.AutoSell = v end,
 })
 
 -- ══════════════════════════════════════════════════════════════
