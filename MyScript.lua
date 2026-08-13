@@ -1448,6 +1448,10 @@ local ItemIdIndex     = {}                     -- [itemId]    = packModel
 local PurchaseQueue   = {}                     -- ordered list of records
 local PurchaseQueued  = {}                     -- [record]    = true (dedup)
 local WatchedPrompts  = setmetatable({}, { __mode = "k" })
+-- Weak-key cache for transient conveyor metadata.  The live game frequently
+-- destroys/recreates pack descendants while they replicate; callbacks must be
+-- able to invalidate this table without indexing a nil value.
+local metadataCache    = setmetatable({}, { __mode = "k" })
 local nextPackDiscoveryId = 0
 -- Keep attempts serialized per record through the state machine. Do not use a
 -- global purchase lock here: packs arrive independently and waiting for one
@@ -2216,7 +2220,15 @@ local function rebindConveyorContainerInner()
     end
     table.clear(conveyorContainerConnections)
 
-    for _, record in pairs(ConveyorRecords) do cleanupRecord(record) end
+    -- cleanupRecord removes entries from ConveyorRecords, so take a snapshot
+    -- first instead of mutating the table while pairs() is iterating it.
+    local recordsToCleanup = {}
+    for _, record in pairs(ConveyorRecords) do
+        table.insert(recordsToCleanup, record)
+    end
+    for _, record in ipairs(recordsToCleanup) do
+        cleanupRecord(record)
+    end
     table.clear(ConveyorRecords)
     table.clear(ItemIdIndex)
     table.clear(PurchaseQueue)
