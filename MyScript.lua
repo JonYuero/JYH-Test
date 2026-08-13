@@ -544,6 +544,7 @@ local playtimeReadyRewards = {}
 local playtimeStateReceived = false
 local potionInventoryCounts = {}
 local nextTimePotionUse = 0
+local pendingTimePotion = nil
 
 -- Forward declarations
 local clickGuiButton
@@ -592,22 +593,20 @@ local function fireButton(part)
                or part:FindFirstChild("ClickDetector")
     if click then
         if fireclickdetector then
-            pcall(fireclickdetector, click)
-            return true
+            local ok = pcall(fireclickdetector, click)
+            if ok then return true end
         end
-        pcall(function() click.MouseClick:Fire(player.Character) end)
-        return true
+        return pcall(function() click.MouseClick:Fire(player.Character) end)
     end
 
     local prompt = part:FindFirstChildOfClass("ProximityPrompt")
     if prompt then
         if fireproximityprompt then
-            pcall(fireproximityprompt, prompt)
-            return true
+            local ok = pcall(fireproximityprompt, prompt)
+            if ok then return true end
         end
         if firetouchinterest then
-            pcall(firetouchinterest, part, player.Character, 0)
-            return true
+            return pcall(firetouchinterest, part, player.Character, 0)
         end
     end
 
@@ -2447,7 +2446,7 @@ local autoStopWatcherActive = false
 -- Auto Spawn Pack
 task.spawn(function()
     while true do
-        task.wait(math.max(0.05, Config.SpawnDelay))
+        task.wait(math.max(0.05, tonumber(Config.SpawnDelay) or 0.5))
         if not Config.AutoSpawnPack then continue end
         if boxHandlingActive then continue end
         if autoStopHandled then continue end
@@ -2473,7 +2472,13 @@ task.spawn(function()
                     ". Use 'Detect My Plot' or set the plot number manually.")
             end
         end
-        fireButton(spawnBtn)
+        -- Do not start the watcher unless the interaction primitive actually
+        -- ran. fireButton used to report success even when the executor
+        -- primitive threw, which left Auto Stop waiting for a pack that could
+        -- never arrive.
+        if not fireButton(spawnBtn) then
+            continue
+        end
 
         -- The watcher must be single-instance, but it must not pause the
         -- actual spawn loop while it waits for the new pack's metadata.
@@ -2481,7 +2486,8 @@ task.spawn(function()
             local capturedIds = previousIds
             autoStopWatcherActive = true
             task.spawn(function()
-                if autoStopHandled then
+                if autoStopHandled or not Config.AutoStopSpawn
+                    or not Config.AutoSpawnPack then
                     autoStopWatcherActive = false
                     return
                 end
@@ -2494,6 +2500,11 @@ task.spawn(function()
                 local newRecordsByKey = {}
                 local collectDeadline = os.clock() + 3
                 while os.clock() < collectDeadline do
+                    if autoStopHandled or not Config.AutoStopSpawn
+                        or not Config.AutoSpawnPack then
+                        autoStopWatcherActive = false
+                        return
+                    end
                     for _, record in ipairs(getConveyorPacks()) do
                         local key = getPackKey(record)
                         if not capturedIds[key] then
@@ -2549,7 +2560,8 @@ task.spawn(function()
                 end  -- no match among new packs
 
                 -- ── Step 3: stop spawning ────────────────────────────────
-                if autoStopHandled then
+                if autoStopHandled or not Config.AutoStopSpawn
+                    or not Config.AutoSpawnPack then
                     autoStopWatcherActive = false
                     return
                 end
@@ -2573,6 +2585,11 @@ task.spawn(function()
                         local deadline = os.clock() + 30
                         while os.clock() < deadline do
                             task.wait(0.2)
+                            if not Config.AutoStopSpawn then
+                                autoStopHandled = false
+                                autoStopWatcherActive = false
+                                return
+                            end
                             local st = watchedRecord.state
                             if st == "BoughtAndRemove" or st == "Removed"
                                 or not watchedRecord.model:IsDescendantOf(workspace) then
@@ -3211,13 +3228,53 @@ do
         -- Mirror the same events the ItemsClient script handles. The game
         -- has used both FullInventory and InventoryUpdate for this snapshot,
         -- so Auto Use Time Potion must understand both versions.
+        local function storePotionQuantity(itemId, quantity)
+            if itemId == nil then return end
+            potionCounts[itemId] = quantity
+        end
+
+        local function readItemId(data, includeDisplayName)
+            if type(data) ~= "table" then return nil end
+            return data.ItemId or data.itemId or data.ItemID
+                or data.Id or data.id
+                or (includeDisplayName and (data.Name or data.name))
+        end
+
+        local function readItemQuantity(data)
+            if type(data) ~= "table" then return data end
+            return data.Quantity or data.quantity
+                or data.QuantityValue or data.quantityValue
+                or data.Amount or data.amount
+                or data.Count or data.count
+        end
+
+        local function mirrorInventoryItems(items)
+            if type(items) ~= "table" then return end
+            for itemId, quantity in pairs(items) do
+                -- Inventory snapshots have appeared both as an item map and
+                -- as an array of {ItemId, Quantity} records.
+                if type(quantity) == "table" then
+                    local nestedItemId = readItemId(quantity, true)
+                    local nestedQuantity = readItemQuantity(quantity)
+                    if nestedItemId ~= nil and nestedQuantity ~= nil then
+                        storePotionQuantity(nestedItemId, nestedQuantity)
+                    elseif itemId ~= "Items" and itemId ~= "Inventory"
+                        and itemId ~= "ItemsData" then
+                        storePotionQuantity(itemId, quantity)
+                    end
+                elseif itemId ~= "Items" and itemId ~= "Inventory"
+                    and itemId ~= "ItemsData" then
+                    storePotionQuantity(itemId, quantity)
+                end
+            end
+        end
+
         ItemsRE.OnClientEvent:Connect(function(action, data)
             if (action == "FullInventory" or action == "InventoryUpdate")
                 and type(data) == "table" then
-                if data.ItemId ~= nil then
-                    potionCounts[data.ItemId] = data.Quantity
-                        or data.QuantityValue or data.Amount
-                        or data.Count or 0
+                local snapshotItemId = readItemId(data, false)
+                if snapshotItemId ~= nil then
+                    storePotionQuantity(snapshotItemId, readItemQuantity(data) or 0)
                 else
                     local items = data.Items or data.Inventory or data.ItemsData
                     if type(items) ~= "table" then
@@ -3227,25 +3284,32 @@ do
                     if action == "FullInventory" then
                         table.clear(potionCounts)
                     end
-                    for itemId, quantity in pairs(items) do
-                        if itemId ~= "Items" and itemId ~= "Inventory"
-                            and itemId ~= "ItemsData" then
-                            potionCounts[itemId] = quantity
-                        end
-                    end
+                    mirrorInventoryItems(items)
                 end
                 applyBoosts(data.Boosts)
                 pendingPotion = nil
 
             elseif action == "ItemUpdate" and type(data) == "table" then
-                potionCounts[data.ItemId] = data.Quantity or data.QuantityValue
-                or data.Amount or data.Count or 0
+                storePotionQuantity(
+                    readItemId(data, true),
+                    readItemQuantity(data) or 0
+                )
 
             elseif action == "BoostUpdate" then
                 applyBoosts(data)
                 pendingPotion = nil
-            elseif action == "UseOk" or action == "UseFailed" then
+            elseif action == "UseOk" then
                 pendingPotion = nil
+                if pendingTimePotion then
+                    pendingTimePotion = nil
+                    nextTimePotionUse = os.clock() + 2
+                end
+            elseif action == "UseFailed" then
+                pendingPotion = nil
+                if pendingTimePotion then
+                    pendingTimePotion = nil
+                    nextTimePotionUse = os.clock() + 1
+                end
             end
         end)
 
@@ -3446,7 +3510,10 @@ end
 
 local function areAllCardSlotsOccupied()
     local slots = getAllCardSlots()
-    if #slots == 0 then return false end
+    -- A partially replicated plot is not a full plot.  Treating the visible
+    -- subset as complete can spend a time potion while more card slots are
+    -- still loading.
+    if #slots < 30 then return false end
     for _, slot in ipairs(slots) do
         if not slotIsOccupied(slot) then
             return false
@@ -3497,11 +3564,86 @@ local function findSlotInteraction(slotModel, names)
     return nil
 end
 
+local function cooldownTextIsActive(value, namedField)
+    local text = string.lower(tostring(value or ""))
+    if text == "" then return false end
+    if string.find(text, "skip", 1, true) then return true end
+    if string.find(text, "ready", 1, true)
+        or string.find(text, "available", 1, true) then
+        return false
+    end
+
+    if namedField then
+        local minutes, seconds = string.match(text, "(%d+)%s*:%s*(%d%d)")
+        if minutes and seconds then
+            return tonumber(minutes) * 60 + tonumber(seconds) > 0
+        end
+
+        local numeric = tonumber(string.match(text, "^%s*(%d+%.?%d*)"))
+        if numeric then return numeric > 0 end
+    end
+
+    -- The reference game has used text such as "On Cooldown" and
+    -- "Remaining Time" in addition to a numeric countdown.
+    if namedField and (
+        string.find(text, "on cooldown", 1, true)
+            or string.find(text, "cooldown active", 1, true)
+            or string.find(text, "remaining", 1, true)
+    ) then
+        return true
+    end
+    return false
+end
+
+local function isCooldownFieldName(name)
+    local normalized = string.lower(tostring(name or ""))
+    normalized = string.gsub(normalized, "[^%w]", "")
+    for _, part in ipairs({
+        "cooldown", "cooldownremaining", "secondsleft", "timeleft",
+        "timeremaining", "remainingtime", "countdown", "timeleft",
+    }) do
+        if string.find(normalized, part, 1, true) then return true end
+    end
+    return false
+end
+
 local function slotIsOnCooldown(slotModel)
     if not slotModel then return false end
+
+    local function inspectAttributes(instance)
+        for name, value in pairs(instance:GetAttributes()) do
+            local field = isCooldownFieldName(name)
+            local lowerName = string.lower(tostring(name))
+            if field or string.find(lowerName, "isoncooldown", 1, true)
+                or string.find(lowerName, "cooldownactive", 1, true) then
+                if type(value) == "boolean" then
+                    if value then return true end
+                elseif cooldownTextIsActive(value, true) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    if inspectAttributes(slotModel) then return true end
     for _, desc in ipairs(slotModel:GetDescendants()) do
-        if desc:IsA("TextLabel") or desc:IsA("TextButton") then
-            if string.find(string.lower(desc.Text or ""), "skip", 1, true) then
+        if inspectAttributes(desc) then return true end
+
+        local field = isCooldownFieldName(desc.Name)
+        if desc:IsA("ValueBase") and field
+            and cooldownTextIsActive(desc.Value, true) then
+            return true
+        end
+
+        if desc:IsA("TextLabel") or desc:IsA("TextButton")
+            or desc:IsA("TextBox") then
+            if cooldownTextIsActive(desc.Text, field) then
+                return true
+            end
+        elseif desc:IsA("ProximityPrompt") then
+            if cooldownTextIsActive(desc.ActionText, false)
+                or cooldownTextIsActive(desc.ObjectText, false) then
                 return true
             end
         end
@@ -4367,7 +4509,10 @@ task.spawn(function()
     local nextInventorySync = 0
     while true do
         task.wait(1)
-        if not Config.AutoTimePotion then continue end
+        if not Config.AutoTimePotion then
+            pendingTimePotion = nil
+            continue
+        end
         if not ItemsREForAutomation then continue end
 
         local now = os.clock()
@@ -4401,15 +4546,25 @@ task.spawn(function()
         end
         if not selectedPotion then continue end
 
-        local used = pcall(function()
+        local submitted = pcall(function()
             ItemsREForAutomation:FireServer("UseItem", {
                 ItemId = selectedPotion,
                 Amount = 1,
             })
         end)
-        -- Give ItemUpdate/UseOk time to arrive before considering another
-        -- time potion. This prevents remote spam if the server is slow.
-        nextTimePotionUse = os.clock() + (used and 3 or 1)
+        if submitted then
+            -- A successful pcall only means the client sent the request. Wait
+            -- for UseOk/UseFailed when available, with a timeout for versions
+            -- that do not echo those actions.
+            pendingTimePotion = {
+                itemId = selectedPotion,
+                sentAt = os.clock(),
+            }
+            nextTimePotionUse = os.clock() + 4
+        else
+            pendingTimePotion = nil
+            nextTimePotionUse = os.clock() + 1
+        end
     end
 end)
 
@@ -5590,7 +5745,10 @@ Controls.AutoSpawnPack = spawnTab:CreateToggle({
     Flag         = "AutoSpawnPack",
     Callback     = function(v)
         Config.AutoSpawnPack = v
-        if v then autoStopHandled = false end   -- reset guard on manual re-enable
+        if v then
+            autoStopHandled = false
+            autoStopWatcherActive = false
+        end
     end,
 })
 
@@ -5608,7 +5766,15 @@ Controls.AutoStopSpawn = spawnTab:CreateToggle({
     Name         = "Auto Stop Spawn (on Filter Match)",
     CurrentValue = Config.AutoStopSpawn,
     Flag         = "AutoStopSpawn",
-    Callback     = function(v) Config.AutoStopSpawn = v end,
+    Callback     = function(v)
+        Config.AutoStopSpawn = v
+        if v then
+            -- Re-enabling Auto Stop after a previous match must arm a fresh
+            -- watcher instead of inheriting the old stop guard.
+            autoStopHandled = false
+            autoStopWatcherActive = false
+        end
+    end,
 })
 
 Controls.AutoBuyMatching = spawnTab:CreateToggle({
@@ -5713,7 +5879,13 @@ Controls.AutoTimePotion = cardsTab:CreateToggle({
     Name         = "Auto Use Time Potion",
     CurrentValue = Config.AutoTimePotion,
     Flag         = "AutoTimePotion",
-    Callback     = function(v) Config.AutoTimePotion = v end,
+    Callback     = function(v)
+        Config.AutoTimePotion = v
+        if v then
+            pendingTimePotion = nil
+            nextTimePotionUse = 0
+        end
+    end,
 })
 
 cardsTab:CreateButton({
