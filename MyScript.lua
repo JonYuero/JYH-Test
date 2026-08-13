@@ -4874,46 +4874,32 @@ function findBossRaidTimer()
 end
 
 function isBossRaidOpen()
-    local timer = findBossRaidTimer()
-    local text = readRaidTimerText(timer)
-    if text and string.find(
-        string.lower(text),
+    -- Use the exact timer text shown in the Boss Raid description. This keeps
+    -- the UI and the combat-priority decision on one source of truth.
+    return string.find(
+        string.lower(raidTimerText or ""),
         "end in",
         1,
         true
-    ) then
-        return true
-    end
-
-    -- UI revisions have moved the countdown between the raid model and the
-    -- raid frame. Fall back to visible raid text when no named timer exists.
-    local roots = {
-        playerGui:FindFirstChild("BossRaidGui", true),
-        getCombatGui("BossRaid"),
-    }
-    for _, root in ipairs(roots) do
-        if root then
-            for _, descendant in ipairs(root:GetDescendants()) do
-                if (not descendant:IsA("GuiObject") or descendant.Visible)
-                    and (descendant:IsA("TextLabel")
-                        or descendant:IsA("TextButton")
-                        or descendant:IsA("TextBox")) then
-                    local descendantText = string.lower(
-                        tostring(descendant.Text or "")
-                    )
-                    if string.find(descendantText, "end in", 1, true) then
-                        return true
-                    end
-                end
-            end
-        end
-    end
-    return false
+    ) ~= nil
 end
 
 task.spawn(function()
     while true do
         task.wait(0.5)
+        local timer = findBossRaidTimer()
+        local text = readRaidTimerText(timer)
+        if text and text ~= "" then
+            raidTimerText = text
+        elseif timer then
+            raidTimerText = "Timer found, waiting for countdown..."
+        else
+            raidTimerText = "Boss Raid is currently unavailable"
+        end
+
+        -- Update the shared description value before checking readiness. The
+        -- scheduler and the visible Boss Raid description now read the same
+        -- timer text on every pass.
         if isBossRaidOpen() then
             raidClosedSince = nil
         else
@@ -4927,15 +4913,6 @@ task.spawn(function()
             end
         end
 
-        local timer = findBossRaidTimer()
-        local text = readRaidTimerText(timer)
-        if text and text ~= "" then
-            raidTimerText = text
-        elseif timer then
-            raidTimerText = "Timer found, waiting for countdown..."
-        else
-            raidTimerText = "Boss Raid is currently unavailable"
-        end
         updateRaidInfoDisplay(Config.RaidDifficulties)
     end
 end)
