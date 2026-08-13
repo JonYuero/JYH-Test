@@ -800,19 +800,26 @@ local function normalizeFilterSelection(value)
 
     local function add(option)
         local normalized = normalizeFilterValue(option)
-        if normalized and normalized ~= "any" and normalized ~= "all" then
+        if normalized == "any" or normalized == "all" then
+            -- "Any" is an explicit wildcard.  Rayfield can return the
+            -- previous selections together with the newly selected wildcard,
+            -- so it must win over those stale values.
+            return true
+        end
+        if normalized then
             selected[normalized] = true
         end
+        return false
     end
 
     local hadArrayValues = false
     for _, option in ipairs(value) do
         hadArrayValues = true
-        add(option)
+        if add(option) then return {} end
     end
     if not hadArrayValues then
         for option, enabled in pairs(value) do
-            if enabled then add(option) end
+            if enabled and add(option) then return {} end
         end
     end
 
@@ -858,7 +865,7 @@ local function normalizePackName(value)
 end
 
 -- Decode Anime Card Farm compact cash strings:
--- K, M, B, T, Qd, Qn, Sx, Sp, O, N, Dc.
+-- K, M, B, T, Qd, Qn, Sx, Sp, O, N, Dc, Ud, Dd, Td.
 -- Returns a number on success, nil on failure.
 local function parseCompactCash(text)
     if type(text) ~= "string" then return nil end
@@ -878,6 +885,9 @@ local function parseCompactCash(text)
         o = 1e27,
         n = 1e30,
         dc = 1e33,
+        ud = 1e36,
+        dd = 1e39,
+        td = 1e42,
     }
 
     -- Try two-letter suffix first, then one-letter suffix, then plain number.
@@ -1561,40 +1571,60 @@ end
 -- Fallback: scan descendants for any enabled buy prompt.
 local function getBuyPrompt(packModel)
     if not packModel then return nil end
-    -- Confirmed exact path from screenshots.
+    -- Confirmed exact path from screenshots. Prefer it when it is explicitly
+    -- a buy prompt, but do not let a generic/disabled prompt hide a better
+    -- matching prompt elsewhere in the same pack.
+    local exactPrompt = nil
     local main = packModel:FindFirstChild("Main")
     if main then
         local prompt = main:FindFirstChild("ProximityPrompt")
         if prompt and prompt:IsA("ProximityPrompt") then
-            -- Accept even if Enabled==false so we can watch it become true.
-            return prompt
+            exactPrompt = prompt
+            if isBuyPrompt(prompt) and prompt.Enabled ~= false then
+                return prompt
+            end
         end
     end
-    -- Recursive fallback: scan all descendants.
-    local firstAny = nil
+
+    -- Recursive fallback: prefer an enabled prompt whose text identifies the
+    -- purchase action. If the confirmed Main prompt exists, keep using it
+    -- before falling back to unrelated enabled prompts.
+    local firstBuyPrompt = nil
+    local firstEnabled = nil
     for _, desc in ipairs(packModel:GetDescendants()) do
         if desc:IsA("ProximityPrompt") then
-            if isBuyPrompt(desc) then return desc end
-            if not firstAny then firstAny = desc end
+            if isBuyPrompt(desc) then
+                if desc.Enabled ~= false then return desc end
+                if not firstBuyPrompt then firstBuyPrompt = desc end
+            end
+            if desc.Enabled ~= false and not firstEnabled then
+                firstEnabled = desc
+            end
         end
     end
-    return firstAny
+    return exactPrompt or firstBuyPrompt or firstEnabled
 end
 
 -- Legacy alias used by prompt-watcher helpers below.
 local findBestBuyPrompt = getBuyPrompt
 
 -- ── Cash safety check ─────────────────────────────────────────────────
--- Returns true when the player has enough cash (and enough reserve) to buy.
--- Returns false, reason string on any failure.
+-- Returns true when the player has enough known cash (and enough reserve) to
+-- buy. Unknown client-side cash/price is allowed through to the server, which
+-- remains authoritative.
 local function canBuyWithCash(record)
     local cash = getPlayerCash()
     if cash == nil then
-        return false, "MissingCashValue"
+        -- Cash can be exposed only through a late-replicating HUD or can be
+        -- represented by a server-side value that the client cannot read.
+        -- The purchase prompt/remote still performs the authoritative check.
+        return true, "CashValueUnavailable"
     end
     local price = record.price
     if price == nil then
-        return false, "InvalidPrice"
+        -- Do not discard a matching pack while its BillboardGui/Cost value is
+        -- still replicating.  The server knows the actual price.
+        return true, "PriceUnavailable"
     end
     if cash < price then
         return false, "NotEnoughCash"
@@ -1650,8 +1680,23 @@ refreshRecordMetadata = function(record, force)
     record.lastMetadataRefresh = now
 
     -- ── NEW: read from confirmed BillboardGuiInfo structure ──────────
-    -- Pack name comes from the model name itself.
-    record.packName = record.model.Name
+    -- Prefer a canonical pack name or the name recovered by getBoxInfo.
+    -- Some live conveyor models are generic names such as BoxBaseModel;
+    -- replacing a resolved pack with that generic name breaks specific pack
+    -- filters while "Any" appears to work.
+    local liveInfo = getBoxInfo(record.model)
+    local modelNameKey = filterCompareKey(record.model.Name)
+    local canonicalPackName = nil
+    for _, packName in ipairs(PACKS) do
+        if filterCompareKey(packName) == modelNameKey then
+            canonicalPackName = packName
+            break
+        end
+    end
+    record.packName = canonicalPackName
+        or (liveInfo and liveInfo.pack)
+        or record.packName
+        or record.model.Name
 
     -- Rarity, mutation from BillboardGuiInfo children.
     local freshRarity   = getPackRarity(record.model)
@@ -1788,7 +1833,8 @@ end
 -- PRIMARY PATH: fireproximityprompt(packModel.Main.ProximityPrompt)
 -- FALLBACK:     ConveyorRE:FireServer("TryBuy", { ItemId = itemId })
 --               only when the prompt path is unavailable.
--- SAFETY RULE:  never fire when cash < price; never fire when price is nil.
+-- SAFETY RULE: never fire when known cash < known price. Unknown values are
+-- allowed through because the server validates the actual transaction.
 tryBuyRecord = function(record)
     if not record or not record.model or record.state ~= "Queued" then
         return false
@@ -2044,7 +2090,7 @@ local function registerPack(packModel)
         info                = info,
 
         -- NEW: confirmed structure fields (populated by refreshRecordMetadata)
-        packName            = packModel.Name,
+        packName            = (info and info.pack) or packModel.Name,
         rarity              = nil,
         mutation            = nil,
         price               = nil,
