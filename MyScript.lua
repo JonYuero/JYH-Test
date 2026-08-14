@@ -405,7 +405,7 @@ local POTIONS = {
     "LuckPotion1", "LuckPotion2", "LuckPotion3",
     "CashPotion1", "CashPotion2", "CashPotion3",
     "MutationPotion1", "MutationPotion2", "MutationPotion3",
-    "ProductionPotion1", "ProductionPotion2",
+    "ProductionPotion1", "ProductionPotion2", "ProductionPotion3",
 }
 
 -- Keep the strongest time potion first so pack automation always spends the
@@ -3235,7 +3235,12 @@ do
         -- so Auto Use Time Potion must understand both versions.
         local function storePotionQuantity(itemId, quantity)
             if itemId == nil then return end
-            potionCounts[itemId] = quantity
+            if type(quantity) == "table" then
+                quantity = quantity.Quantity or quantity.quantity
+                    or quantity.Amount or quantity.amount
+                    or quantity.Count or quantity.count
+            end
+            potionCounts[itemId] = tonumber(quantity) or 0
         end
 
         local function readItemId(data, includeDisplayName)
@@ -3251,6 +3256,31 @@ do
                 or data.QuantityValue or data.quantityValue
                 or data.Amount or data.amount
                 or data.Count or data.count
+        end
+
+        -- Inventory ids are not guaranteed to use the same spelling as the
+        -- config list. Older builds send ids such as LuckPotion1, while
+        -- newer builds may send display-style keys such as "Luck Potion I".
+        -- Match by potion family and tier, then return the actual server key.
+        local function findInventoryPotion(preferredId)
+            local preferredFamily, preferredTier = potionDetails(preferredId)
+            if not preferredFamily then return nil, 0 end
+
+            local directQuantity = tonumber(potionCounts[preferredId]) or 0
+            if directQuantity > 0 then
+                return preferredId, directQuantity
+            end
+
+            for inventoryId, quantity in pairs(potionCounts) do
+                local amount = tonumber(quantity) or 0
+                if amount > 0 then
+                    local family, tier = potionDetails(inventoryId)
+                    if family == preferredFamily and tier == preferredTier then
+                        return inventoryId, amount
+                    end
+                end
+            end
+            return nil, 0
         end
 
         local function mirrorInventoryItems(items)
@@ -3356,18 +3386,24 @@ do
                 local selected = Config.SelectedPotions
                 local candidates = {}
                 for _, potion in ipairs(POTIONS) do
-                    if selectionIncludes(selected, potion)
-                        and (potionCounts[potion] or 0) > 0 then
-                        table.insert(candidates, potion)
+                    local inventoryId, quantity = findInventoryPotion(potion)
+                    if selectionIncludes(selected, potion) and quantity > 0 then
+                        table.insert(candidates, {
+                            configuredId = potion,
+                            inventoryId = inventoryId,
+                            quantity = quantity,
+                        })
                     end
                 end
                 table.sort(candidates, function(left, right)
-                    local _, leftTier = potionDetails(left)
-                    local _, rightTier = potionDetails(right)
+                    local _, leftTier = potionDetails(left.configuredId)
+                    local _, rightTier = potionDetails(right.configuredId)
                     return (leftTier or 0) > (rightTier or 0)
                 end)
 
-                for _, potion in ipairs(candidates) do
+                for _, candidate in ipairs(candidates) do
+                    local potion = candidate.configuredId
+                    local inventoryId = candidate.inventoryId
                     if not canUsePotion(potion) then continue end
                     local family, tier = potionDetails(potion)
                     local active = family and activeBoosts[family]
@@ -3376,18 +3412,18 @@ do
                         and active.tier
                         and tier > active.tier
                     pendingPotion = {
-                        itemId = potion,
+                        itemId = inventoryId,
                         startedAt = os.clock(),
                     }
                     local submitted = false
                     if isTierReplacement then
-                        submitted = usePotionThroughItemsUi(potion)
+                        submitted = usePotionThroughItemsUi(inventoryId)
                     end
                     if not submitted then
                         submitted = pcall(function()
                             ItemsRE:FireServer(
                                 "UseItem",
-                                { ItemId = potion, Amount = 1 }
+                                { ItemId = inventoryId, Amount = 1 }
                             )
                         end)
                     end
