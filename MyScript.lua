@@ -5695,7 +5695,7 @@ function cardCraftState.updateStatus()
 
     pcall(function()
         paragraph:Set({
-            Title = tostring(cardName),
+            Title = "Card Crafting",
             Content = table.concat(lines, "\n"),
         })
     end)
