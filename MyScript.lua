@@ -568,7 +568,6 @@ local Controls = {}
 local playtimeReadyRewards = {}
 local playtimeStateReceived = false
 local potionInventoryCounts = {}
-local nextTimePotionUse = 0
 
 -- Forward declarations
 local clickGuiButton
@@ -4443,18 +4442,9 @@ task.spawn(function()
             nextInventorySync = now + 5
         end
 
-        if now < nextTimePotionUse then continue end
-        if not areAllCardSlotsOccupied() then continue end
-
-        local hasCooldown = false
-        for _, slot in ipairs(getAllCardSlots()) do
-            if slotIsOnCooldown(slot) then
-                hasCooldown = true
-                break
-            end
-        end
-        if not hasCooldown then continue end
-
+        -- Time potions are consumables, not timed stat boosts. Do not wait
+        -- for an active boost, a full plot, or a card cooldown. Submit one
+        -- available potion per pass, just like Auto Potions.
         local selectedPotion
         for _, potion in ipairs(TIME_POTIONS) do
             local inventoryItem, quantity = findPotionInventoryItem(potion)
@@ -4465,15 +4455,14 @@ task.spawn(function()
         end
         if not selectedPotion then continue end
 
-        local used = pcall(function()
+        pcall(function()
             ItemsREForAutomation:FireServer("UseItem", {
                 ItemId = selectedPotion,
                 Amount = 1,
             })
         end)
-        -- Give ItemUpdate/UseOk time to arrive before considering another
-        -- time potion. This prevents remote spam if the server is slow.
-        nextTimePotionUse = os.clock() + (used and 3 or 1)
+        -- The one-second loop submits only one item per pass. It never waits
+        -- for an active potion to expire.
     end
 end)
 
@@ -4772,7 +4761,10 @@ exitInfinityTowerBattle = function()
             -- Some versions keep the button's Instance name generic and only
             -- expose "Exit" through its Text property.
             for _, descendant in ipairs(root:GetDescendants()) do
-                if descendant:IsA("GuiButton") then
+                -- ImageButton inherits GuiButton but has no Text property.
+                -- Reading descendant.Text on one raises and kills the
+                -- combat scheduler, so only inspect text-bearing buttons.
+                if descendant:IsA("TextButton") then
                     local text = string.lower(tostring(descendant.Text or ""))
                     if text == "exit" or text == "leave" or text == "quit" then
                         if clickGuiButton(descendant) then
@@ -5064,6 +5056,7 @@ function isBossRaidOpen()
 end
 
 task.spawn(function()
+    local nextRaidStateRequest = 0
     while true do
         task.wait(0.5)
         local timer = findBossRaidTimer()
@@ -5076,13 +5069,21 @@ task.spawn(function()
             raidTimerText = "Boss Raid is currently unavailable"
         end
 
+        -- Refresh the authoritative state periodically. This covers the
+        -- transition where Infinity Tower ends without a BossRaid state
+        -- event being delivered to this script.
+        local now = os.clock()
+        if BossRaidRE and now >= nextRaidStateRequest then
+            pcall(function() BossRaidRE:FireServer("RequestState") end)
+            nextRaidStateRequest = now + 5
+        end
+
         -- Update the shared description value before checking readiness. The
         -- scheduler and the visible Boss Raid description now read the same
         -- timer text on every pass.
         if isBossRaidOpen() then
             raidClosedSince = nil
         else
-            local now = os.clock()
             raidClosedSince = raidClosedSince or now
             -- Require a stable closed state before re-arming. This avoids a brief
             -- timer/UI replication gap reopening the same hourly attempt.
