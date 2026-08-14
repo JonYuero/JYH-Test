@@ -612,26 +612,41 @@ end
 local function fireButton(part)
     if not part then return false end
 
-    local click = part:FindFirstChildOfClass("ClickDetector")
-               or part:FindFirstChild("ClickDetector")
+    local click = part:IsA("ClickDetector") and part
+        or part:FindFirstChildOfClass("ClickDetector")
+        or part:FindFirstChild("ClickDetector", true)
     if click then
         if fireclickdetector then
-            pcall(fireclickdetector, click)
-            return true
+            local ok = pcall(fireclickdetector, click)
+            if ok then return true end
         end
-        pcall(function() click.MouseClick:Fire(player.Character) end)
-        return true
+        local ok = pcall(function()
+            click.MouseClick:Fire(player.Character)
+        end)
+        if ok then return true end
     end
 
-    local prompt = part:FindFirstChildOfClass("ProximityPrompt")
+    local prompt = part:IsA("ProximityPrompt") and part
+        or part:FindFirstChildOfClass("ProximityPrompt")
+        or part:FindFirstChild("ProximityPrompt", true)
     if prompt then
         if fireproximityprompt then
-            pcall(fireproximityprompt, prompt)
-            return true
+            local ok = pcall(fireproximityprompt, prompt)
+            if ok then return true end
         end
         if firetouchinterest then
-            pcall(firetouchinterest, part, player.Character, 0)
-            return true
+            local targetPart = part:IsA("BasePart") and part
+                or prompt.Parent and prompt.Parent:IsA("BasePart")
+                    and prompt.Parent
+            if targetPart then
+                local ok = pcall(
+                    firetouchinterest,
+                    targetPart,
+                    player.Character,
+                    0
+                )
+                if ok then return true end
+            end
         end
     end
 
@@ -2384,10 +2399,9 @@ getConveyorPacks = function()
 end
 
 getPackKey = function(record)
-    if record.itemId ~= nil then
-        return "id:" .. tostring(record.itemId)
-    end
-    return "model:" .. record.model:GetFullName()
+    -- ItemId can be reused for multiple packs of the same item. The live
+    -- Instance is the reliable identity for detecting a newly spawned model.
+    return record.model
 end
 
 indexPackIds = function(packs)
@@ -2427,7 +2441,20 @@ task.spawn(function()
         task.wait(math.max(0.05, Config.SpawnDelay))
         if not Config.AutoSpawnPack then continue end
         if boxHandlingActive then continue end
+        if not Config.AutoStopSpawn then
+            -- Auto Stop may have been disabled after a previous match.
+            -- Never let its old latch block normal spawning.
+            autoStopHandled = false
+        end
         if autoStopHandled then continue end
+
+        -- Prefer the server-assigned plot before touching any ButtonPart.
+        -- This prevents the default plot #1 from being clicked during the
+        -- short window before PlotNumber finishes replicating.
+        local detected = autoDetectMyPlotNumber()
+        if detected and detected ~= Config.PlotNumber then
+            setPlotNumber(detected)
+        end
 
         local previousIds
         if Config.AutoStopSpawn then
@@ -2448,9 +2475,15 @@ task.spawn(function()
                     "Spawn button was not found for plot " ..
                     tostring(Config.PlotNumber) ..
                     ". Use 'Detect My Plot' or set the plot number manually.")
+                continue
             end
         end
-        fireButton(spawnBtn)
+        if not fireButton(spawnBtn) then
+            warnOnce("Spawn:no-interaction",
+                "Spawn button was found, but no working ClickDetector or "
+                    .. "ProximityPrompt interaction was available.")
+            continue
+        end
 
         -- The watcher must be single-instance, but it must not pause the
         -- actual spawn loop while it waits for the new pack's metadata.
@@ -2458,6 +2491,10 @@ task.spawn(function()
             local capturedIds = previousIds
             autoStopWatcherActive = true
             task.spawn(function()
+                if not Config.AutoStopSpawn or not Config.AutoSpawnPack then
+                    autoStopWatcherActive = false
+                    return
+                end
                 if autoStopHandled then
                     autoStopWatcherActive = false
                     return
@@ -2468,6 +2505,10 @@ task.spawn(function()
                 -- check every new pack for a filter match, not just the first.
                 local newRecords = {}
                 for _ = 1, 30 do
+                    if not Config.AutoStopSpawn or not Config.AutoSpawnPack then
+                        autoStopWatcherActive = false
+                        return
+                    end
                     newRecords = {}
                     for _, record in ipairs(getConveyorPacks()) do
                         if not capturedIds[getPackKey(record)] then
@@ -2495,11 +2536,17 @@ task.spawn(function()
                 -- and build a fresh info table for the filter check.
                 local spawnedRecord = nil
                 for _ = 1, 20 do
+                    if not Config.AutoStopSpawn or not Config.AutoSpawnPack then
+                        autoStopWatcherActive = false
+                        return
+                    end
                     task.wait(0.1)
                     for _, record in ipairs(newRecords) do
                         if not record.model:IsDescendantOf(workspace) then continue end
+                        local liveInfo = getBoxInfo(record.model)
                         local freshInfo = {
-                            pack     = record.packName or record.model.Name,
+                            pack     = liveInfo and liveInfo.pack
+                                or record.packName or record.model.Name,
                             rarity   = getPackRarity(record.model),
                             mutation = getPackMutation(record.model),
                         }
@@ -2767,103 +2814,105 @@ task.spawn(function()
         if boxHandlingActive then continue end
 
         boxHandlingActive = true
+        local savedCFrame
+        local passOk, passError = xpcall(function()
+            local char = player.Character
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if not root then return end
 
-        local char = player.Character
-        local root = char and char:FindFirstChild("HumanoidRootPart")
-        if not root then
-            boxHandlingActive = false
-            continue
-        end
+            savedCFrame = root.CFrame
 
-        local savedCFrame = root.CFrame
+            local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+            if not humanoid then return end
 
-        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
-        if not humanoid then
-            boxHandlingActive = false
-            continue
-        end
-
-        local function getBackpackBoxes()
-            local boxes = {}
-            local backpack = player:FindFirstChild("Backpack")
-            if backpack then
-                for _, item in ipairs(backpack:GetChildren()) do
-                    if isBoxTool(item) then table.insert(boxes, item) end
-                end
-            end
-            return boxes
-        end
-
-        local function getCharacterBox()
-            return isBoxTool(char:FindFirstChildOfClass("Tool"))
-                and char:FindFirstChildOfClass("Tool") or nil
-        end
-
-        local function equipAndSell(boxTool)
-            pcall(function() humanoid:EquipTool(boxTool) end)
-            task.wait(0.3)
-            if Config.AutoSellBox then
-                doSellAtStation()
-                task.wait(0.3)
-            end
-            pcall(function() humanoid:UnequipTools() end)
-            task.wait(0.1)
-        end
-
-        local charBox = getCharacterBox()
-        if charBox then
-            if Config.AutoSellBox then
-                doSellAtStation()
-                task.wait(0.3)
-            end
-            pcall(function() humanoid:UnequipTools() end)
-            task.wait(0.1)
-        end
-
-        local existingBoxes = getBackpackBoxes()
-        if #existingBoxes > 0 then
-            local boxTool = existingBoxes[1]
-            if boxTool and boxTool.Parent then
-                equipAndSell(boxTool)
-            end
-
-        elseif Config.AutoCarryBox then
-            local carryInteraction = findOneCarryInteractionOnPlot()
-            if carryInteraction then
-                local interactParent = carryInteraction.Parent
-                if interactParent then
-                    teleportNear(getCFrameOf(interactParent))
-                end
-                task.wait(0.35)  -- let the server register the new position before interacting
-
-                if carryInteraction:IsA("ProximityPrompt") then
-                    firePrompt(carryInteraction)
-                elseif carryInteraction:IsA("ClickDetector") then
-                    fireClickDetector(carryInteraction)
-                end
-                task.wait(0.5)  -- increased from 0.4 to give the server time to give us the box
-
-                local acquired = getCharacterBox()
-                if acquired then
-                    if Config.AutoSellBox then
-                        doSellAtStation()
-                        task.wait(0.3)
+            local function getBackpackBoxes()
+                local boxes = {}
+                local backpack = player:FindFirstChild("Backpack")
+                if backpack then
+                    for _, item in ipairs(backpack:GetChildren()) do
+                        if isBoxTool(item) then table.insert(boxes, item) end
                     end
-                    pcall(function() humanoid:UnequipTools() end)
-                    task.wait(0.1)
-                else
-                    local newBoxes = getBackpackBoxes()
-                    if #newBoxes > 0 then
-                        local b = newBoxes[1]
-                        if b and b.Parent then equipAndSell(b) end
+                end
+                return boxes
+            end
+
+            local function getCharacterBox()
+                return isBoxTool(char:FindFirstChildOfClass("Tool"))
+                    and char:FindFirstChildOfClass("Tool") or nil
+            end
+
+            local function equipAndSell(boxTool)
+                pcall(function() humanoid:EquipTool(boxTool) end)
+                task.wait(0.3)
+                if Config.AutoSellBox then
+                    doSellAtStation()
+                    task.wait(0.3)
+                end
+                pcall(function() humanoid:UnequipTools() end)
+                task.wait(0.1)
+            end
+
+            local charBox = getCharacterBox()
+            if charBox then
+                if Config.AutoSellBox then
+                    doSellAtStation()
+                    task.wait(0.3)
+                end
+                pcall(function() humanoid:UnequipTools() end)
+                task.wait(0.1)
+            end
+
+            local existingBoxes = getBackpackBoxes()
+            if #existingBoxes > 0 then
+                local boxTool = existingBoxes[1]
+                if boxTool and boxTool.Parent then
+                    equipAndSell(boxTool)
+                end
+            elseif Config.AutoCarryBox then
+                local carryInteraction = findOneCarryInteractionOnPlot()
+                if carryInteraction then
+                    local interactParent = carryInteraction.Parent
+                    if interactParent then
+                        teleportNear(getCFrameOf(interactParent))
+                    end
+                    task.wait(0.35)  -- let the server register the new position before interacting
+
+                    if carryInteraction:IsA("ProximityPrompt") then
+                        firePrompt(carryInteraction)
+                    elseif carryInteraction:IsA("ClickDetector") then
+                        fireClickDetector(carryInteraction)
+                    end
+                    task.wait(0.5)  -- increased from 0.4 to give the server time to give us the box
+
+                    local acquired = getCharacterBox()
+                    if acquired then
+                        if Config.AutoSellBox then
+                            doSellAtStation()
+                            task.wait(0.3)
+                        end
+                        pcall(function() humanoid:UnequipTools() end)
+                        task.wait(0.1)
+                    else
+                        local newBoxes = getBackpackBoxes()
+                        if #newBoxes > 0 then
+                            local b = newBoxes[1]
+                            if b and b.Parent then equipAndSell(b) end
+                        end
                     end
                 end
             end
-        end
+
+        end, function(errorValue)
+            return tostring(errorValue)
+        end)
 
         local r = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-        if r then pcall(function() r.CFrame = savedCFrame end) end
-
+        if r and savedCFrame then
+            pcall(function() r.CFrame = savedCFrame end)
+        end
+        if not passOk then
+            warn("[ACF] Auto Carry/Sell pass failed: " .. tostring(passError))
+        end
         boxHandlingActive = false
     end
 end)
