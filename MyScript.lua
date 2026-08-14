@@ -329,7 +329,11 @@ local ItemsREForAutomation = Remotes:WaitForChild("ItemsRE", 15)
 local PlayTimeRewardRE = Remotes:FindFirstChild("PlayTimeRewardRE")
 local DailyRewardRE    = Remotes:FindFirstChild("DailyRewardRE")
 local UpgradesRE       = Remotes:FindFirstChild("UpgradesRE")
-local BossRaidRE = Remotes:FindFirstChild("BossRaidRE")
+-- BossRaidClient waits for this remote before it can receive the authoritative
+-- open/closed state.  Do the same here instead of taking a one-time snapshot:
+-- FindFirstChild can run before the remote has replicated and leave the
+-- automation permanently disabled for the rest of the session.
+local BossRaidRE = Remotes:WaitForChild("BossRaidRE", 15)
 local GradeRollRE      = Remotes:FindFirstChild("GradeRollRE")
 local TraitRollRE      = Remotes:FindFirstChild("TraitRollRE")
 local Modules    = ReplicatedStorage:FindFirstChild("Modules")
@@ -358,6 +362,9 @@ if Modules and Modules:FindFirstChild("GuiManager") then
     end)
 end
 local currentRaidBossId = ""
+local raidStateReceived = false
+local raidStateOpen = false
+local raidAlreadyUsed = false
 
 -- ── Data lists ───────────────────────────────────────────────
 local RARITIES = {
@@ -4715,17 +4722,16 @@ local function getRaidDifficultyOptions()
     return options
 end
 
-local raidDifficultyOptions = { "Easy", "Medium", "Hard", "Nightmare" }
+-- Use the live config's order/names.  The hard-coded list used here before
+-- could contain choices that do not exist in the current game revision, so
+-- selectRaidDifficulty() would silently fail and BATTLE would be clicked with
+-- no valid difficulty selected.
+local raidDifficultyOptions = getRaidDifficultyOptions()
+local raidDifficultyDefault = raidDifficultyOptions[1] or "Normal"
 local raidDifficultySet = {}
 for _, difficulty in ipairs(raidDifficultyOptions) do
     raidDifficultySet[difficulty] = true
 end
-local completedRaidDifficulties = {}
--- Boss Raid grants one attempt per hourly window. Keep the feature enabled
--- after the first click, but latch the attempt so the polling loops cannot
--- click again until the next window is detected.
-local raidAttemptConsumed = false
-local raidClosedSince = nil
 
 local function normalizeRaidDifficulties(value)
     local selected = {}
@@ -4740,6 +4746,28 @@ local function normalizeRaidDifficulties(value)
     end
     return selected
 end
+
+local function normalizeRaidDifficultySelection(value)
+    local selected = {}
+    local seen = {}
+    for _, difficulty in ipairs(normalizeRaidDifficulties(value)) do
+        if raidDifficultySet[difficulty] and not seen[difficulty] then
+            table.insert(selected, difficulty)
+            seen[difficulty] = true
+        end
+    end
+    if #selected == 0 then
+        selected[1] = raidDifficultyDefault
+    end
+    return selected
+end
+
+local completedRaidDifficulties = {}
+-- Boss Raid grants one attempt per hourly window. Keep the feature enabled
+-- after the first click, but latch the attempt so the polling loops cannot
+-- click again until the next window is detected.
+local raidAttemptConsumed = false
+local raidClosedSince = nil
 
 local function getSelectedRaidDifficulties()
     local selected = normalizeRaidDifficulties(Config.RaidDifficulties)
@@ -4858,6 +4886,9 @@ end
 if BossRaidRE then
     BossRaidRE.OnClientEvent:Connect(function(eventName, payload)
         if eventName == "State" and type(payload) == "table" then
+            raidStateReceived = true
+            raidStateOpen = payload.Open == true
+            raidAlreadyUsed = payload.AlreadyUsed == true
             currentRaidBossId = tostring(payload.BossId or "")
         end
     end)
@@ -4920,8 +4951,14 @@ function findBossRaidTimer()
 end
 
 function isBossRaidOpen()
-    -- Use the exact timer text shown in the Boss Raid description. This keeps
-    -- the UI and the combat-priority decision on one source of truth.
+    -- BossRaidRE is the authoritative source used by BossRaidClient.  The
+    -- timer is only presentation text and can be missing or belong to another
+    -- UI during replication.
+    if BossRaidRE then
+        return raidStateReceived and raidStateOpen and not raidAlreadyUsed
+    end
+
+    -- Fallback for older game revisions that do not expose BossRaidRE.
     return string.find(
         string.lower(raidTimerText or ""),
         "end in",
@@ -5003,9 +5040,16 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
 
     local raidDifficulty
     if mode == "BossRaid" then
+        if raidAlreadyUsed then
+            return false
+        end
         raidDifficulty = difficulty or getNextRaidDifficulty()
         if not raidDifficulty then return false end
-        selectRaidDifficulty(raidDifficulty)
+        if not selectRaidDifficulty(raidDifficulty) then
+            warn("[ACF] Boss Raid difficulty button not found: "
+                .. tostring(raidDifficulty))
+            return false
+        end
         task.wait(0.25)
     end
 
@@ -5054,6 +5098,7 @@ task.spawn(function()
 
         local raidReady = Config.AutoRaid
             and isBossRaidOpen()
+            and not raidAlreadyUsed
             and not raidAttemptConsumed
             and getNextRaidDifficulty() ~= nil
         local towerEnabled = Config.AutoInfinityTower
@@ -5381,6 +5426,9 @@ local function loadConfig(name, isAutoload)
             local value = data[key]
             if key == "SelectedPotions" then
                 value = normalizeGeneralPotionSelection(value)
+            end
+            if key == "RaidDifficulties" then
+                value = normalizeRaidDifficultySelection(value)
             end
             Config[key] = value
             local control = Controls[key]
@@ -5905,7 +5953,7 @@ updateRaidInfoDisplay(Config.RaidDifficulties)
 Controls.RaidDifficulties = combatTab:CreateDropdown({
     Name          = "Select Difficulty",
     Options       = raidDifficultyOptions,
-    CurrentOption = Config.RaidDifficulties[1] or "Easy",
+    CurrentOption = Config.RaidDifficulties[1] or raidDifficultyDefault,
     MultipleOptions = false,
     Flag          = "RaidDifficulties",
     Callback      = function(v)
