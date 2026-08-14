@@ -361,10 +361,15 @@ if Modules and Modules:FindFirstChild("GuiManager") then
         GuiManager = require(Modules.GuiManager)
     end)
 end
-local currentRaidBossId = ""
-local raidStateReceived = false
-local raidStateOpen = false
-local raidAlreadyUsed = false
+-- Keep raid state in one local table.  This script is close to Luau's
+-- top-level local-register limit, so separate locals here can prevent the
+-- entire script from compiling.
+local raidState = {
+    BossId = "",
+    Received = false,
+    Open = false,
+    AlreadyUsed = false,
+}
 
 -- ── Data lists ───────────────────────────────────────────────
 local RARITIES = {
@@ -4727,11 +4732,6 @@ end
 -- selectRaidDifficulty() would silently fail and BATTLE would be clicked with
 -- no valid difficulty selected.
 local raidDifficultyOptions = getRaidDifficultyOptions()
-local raidDifficultyDefault = raidDifficultyOptions[1] or "Normal"
-local raidDifficultySet = {}
-for _, difficulty in ipairs(raidDifficultyOptions) do
-    raidDifficultySet[difficulty] = true
-end
 
 local function normalizeRaidDifficulties(value)
     local selected = {}
@@ -4743,21 +4743,6 @@ local function normalizeRaidDifficulties(value)
             table.insert(selected, difficulty)
             selectedSet[difficulty] = true
         end
-    end
-    return selected
-end
-
-local function normalizeRaidDifficultySelection(value)
-    local selected = {}
-    local seen = {}
-    for _, difficulty in ipairs(normalizeRaidDifficulties(value)) do
-        if raidDifficultySet[difficulty] and not seen[difficulty] then
-            table.insert(selected, difficulty)
-            seen[difficulty] = true
-        end
-    end
-    if #selected == 0 then
-        selected[1] = raidDifficultyDefault
     end
     return selected
 end
@@ -4782,6 +4767,9 @@ local function getSelectedRaidDifficulties()
             table.insert(ordered, difficulty)
         end
     end
+    if #ordered == 0 and raidDifficultyOptions[1] then
+        ordered[1] = raidDifficultyOptions[1]
+    end
     return ordered
 end
 
@@ -4804,10 +4792,10 @@ local function getRaidRequirement(difficulty)
     if not BossRaidConfig or not BossRaidConfig.GetBossStats then
         return nil
     end
-    if currentRaidBossId == "" then return nil end
+    if raidState.BossId == "" then return nil end
     local ok, stats = pcall(
         BossRaidConfig.GetBossStats,
-        currentRaidBossId,
+        raidState.BossId,
         difficulty
     )
     if ok and type(stats) == "table" then
@@ -4886,10 +4874,10 @@ end
 if BossRaidRE then
     BossRaidRE.OnClientEvent:Connect(function(eventName, payload)
         if eventName == "State" and type(payload) == "table" then
-            raidStateReceived = true
-            raidStateOpen = payload.Open == true
-            raidAlreadyUsed = payload.AlreadyUsed == true
-            currentRaidBossId = tostring(payload.BossId or "")
+            raidState.Received = true
+            raidState.Open = payload.Open == true
+            raidState.AlreadyUsed = payload.AlreadyUsed == true
+            raidState.BossId = tostring(payload.BossId or "")
         end
     end)
     pcall(function() BossRaidRE:FireServer("RequestState") end)
@@ -4955,7 +4943,7 @@ function isBossRaidOpen()
     -- timer is only presentation text and can be missing or belong to another
     -- UI during replication.
     if BossRaidRE then
-        return raidStateReceived and raidStateOpen and not raidAlreadyUsed
+        return raidState.Received and raidState.Open and not raidState.AlreadyUsed
     end
 
     -- Fallback for older game revisions that do not expose BossRaidRE.
@@ -5040,7 +5028,7 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
 
     local raidDifficulty
     if mode == "BossRaid" then
-        if raidAlreadyUsed then
+        if raidState.AlreadyUsed then
             return false
         end
         raidDifficulty = difficulty or getNextRaidDifficulty()
@@ -5098,7 +5086,7 @@ task.spawn(function()
 
         local raidReady = Config.AutoRaid
             and isBossRaidOpen()
-            and not raidAlreadyUsed
+            and not raidState.AlreadyUsed
             and not raidAttemptConsumed
             and getNextRaidDifficulty() ~= nil
         local towerEnabled = Config.AutoInfinityTower
@@ -5428,7 +5416,7 @@ local function loadConfig(name, isAutoload)
                 value = normalizeGeneralPotionSelection(value)
             end
             if key == "RaidDifficulties" then
-                value = normalizeRaidDifficultySelection(value)
+                value = normalizeRaidDifficulties(value)
             end
             Config[key] = value
             local control = Controls[key]
@@ -5953,7 +5941,7 @@ updateRaidInfoDisplay(Config.RaidDifficulties)
 Controls.RaidDifficulties = combatTab:CreateDropdown({
     Name          = "Select Difficulty",
     Options       = raidDifficultyOptions,
-    CurrentOption = Config.RaidDifficulties[1] or raidDifficultyDefault,
+    CurrentOption = Config.RaidDifficulties[1] or raidDifficultyOptions[1] or "Normal",
     MultipleOptions = false,
     Flag          = "RaidDifficulties",
     Callback      = function(v)
