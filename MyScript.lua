@@ -3236,7 +3236,11 @@ do
 
         local function readItemId(data, includeDisplayName)
             if type(data) ~= "table" then return nil end
-            return data.ItemId or data.itemId or data.ItemID
+            -- The working reference contains both ItemID and PotionId naming.
+            -- Accept every observed spelling so time potions are mirrored even
+            -- if the game sends a potion-specific inventory record.
+            return data.ItemID or data.ItemId or data.itemId
+                or data.PotionId or data.PotionID or data.potionId
                 or data.Id or data.id
                 or (includeDisplayName and (data.Name or data.name))
         end
@@ -3302,12 +3306,18 @@ do
             elseif action == "UseOk" then
                 pendingPotion = nil
                 if RuntimeState.pendingTimePotion then
+                    RuntimeState.timePotionLastResult = "UseOk"
+                    RuntimeState.timePotionLastResultAt = os.clock()
+                    warn("[ACF] Auto Time Potion server response: UseOk")
                     RuntimeState.pendingTimePotion = nil
                     RuntimeState.nextTimePotionUse = os.clock() + 2
                 end
             elseif action == "UseFailed" then
                 pendingPotion = nil
                 if RuntimeState.pendingTimePotion then
+                    RuntimeState.timePotionLastResult = "UseFailed"
+                    RuntimeState.timePotionLastResultAt = os.clock()
+                    warn("[ACF] Auto Time Potion server response: UseFailed")
                     RuntimeState.pendingTimePotion = nil
                     RuntimeState.nextTimePotionUse = os.clock() + 1
                 end
@@ -4531,6 +4541,18 @@ task.spawn(function()
             nextInventorySync = now + 5
         end
 
+        -- If the server never answered the previous request, clear the pending
+        -- state after the retry window and log it. This distinguishes a silent
+        -- server rejection from a Lua-side send error.
+        if RuntimeState.pendingTimePotion
+            and now - (RuntimeState.pendingTimePotion.sentAt or now) >= 4 then
+            warn(
+                "[ACF] Auto Time Potion: no UseOk/UseFailed response for "
+                .. tostring(RuntimeState.pendingTimePotion.itemId)
+            )
+            RuntimeState.pendingTimePotion = nil
+        end
+
         if now < RuntimeState.nextTimePotionUse then continue end
         if not areAllCardSlotsOccupied() then continue end
 
@@ -4553,22 +4575,35 @@ task.spawn(function()
         end
         if not selectedPotion then continue end
 
-        local submitted = pcall(function()
+        -- The known-working reference uses the exact "ItemID" spelling in
+        -- its UseItem path. The previous script used "ItemId", which can be
+        -- silently ignored by a server that expects the exact payload key.
+        RuntimeState.timePotionLastResult = nil
+
+        local submitted, submitError = pcall(function()
             ItemsREForAutomation:FireServer("UseItem", {
-                ItemId = selectedPotion,
+                ItemID = selectedPotion,
                 Amount = 1,
             })
         end)
+
         if submitted then
-            -- A successful pcall only means the client sent the request. Wait
-            -- for UseOk/UseFailed when available, with a timeout for versions
-            -- that do not echo those actions.
+            warn("[ACF] Auto Time Potion sent UseItem for " .. tostring(selectedPotion))
+
             RuntimeState.pendingTimePotion = {
                 itemId = selectedPotion,
                 sentAt = os.clock(),
             }
+
+            -- Give the server time to answer with UseOk/UseFailed.  Do not
+            -- immediately try alternate payloads; that could consume multiple
+            -- potions if the first request actually succeeded.
             RuntimeState.nextTimePotionUse = os.clock() + 4
         else
+            warn(
+                "[ACF] Auto Time Potion could not send UseItem: "
+                .. tostring(submitError)
+            )
             RuntimeState.pendingTimePotion = nil
             RuntimeState.nextTimePotionUse = os.clock() + 1
         end
