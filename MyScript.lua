@@ -3068,7 +3068,7 @@ do
             return nil
         end
 
-        local function usePotionThroughItemsUi(itemId)
+        local function usePotionThroughItemsUi(itemId, amount)
             local itemsFrame = findItemsFrame()
             if not itemsFrame then return false end
 
@@ -3096,7 +3096,8 @@ do
             end
             if not popup then return false end
 
-            local useButton = popup:FindFirstChild("USE", true)
+            local buttonName = (tonumber(amount) or 1) >= 5 and "USE5x" or "USE"
+            local useButton = popup:FindFirstChild(buttonName, true)
             if not useButton or not clickGuiButton(useButton) then
                 return false
             end
@@ -3405,6 +3406,9 @@ do
                     local potion = candidate.configuredId
                     local inventoryId = candidate.inventoryId
                     if not canUsePotion(potion) then continue end
+                    -- Match the Items UI: spend five when possible, otherwise
+                    -- fall back to a single potion.
+                    local amount = candidate.quantity >= 5 and 5 or 1
                     local family, tier = potionDetails(potion)
                     local active = family and activeBoosts[family]
                     local isTierReplacement = active
@@ -3413,17 +3417,18 @@ do
                         and tier > active.tier
                     pendingPotion = {
                         itemId = inventoryId,
+                        amount = amount,
                         startedAt = os.clock(),
                     }
                     local submitted = false
                     if isTierReplacement then
-                        submitted = usePotionThroughItemsUi(inventoryId)
+                        submitted = usePotionThroughItemsUi(inventoryId, amount)
                     end
                     if not submitted then
                         submitted = pcall(function()
                             ItemsRE:FireServer(
                                 "UseItem",
-                                { ItemId = inventoryId, Amount = 1 }
+                                { ItemId = inventoryId, Amount = amount }
                             )
                         end)
                     end
@@ -3688,6 +3693,15 @@ local function slotIsOnCooldown(slotModel)
                 or cooldownTextIsActive(desc.ObjectText, false) then
                 return true
             end
+        end
+    end
+    return false
+end
+
+local function hasCardCooldownToSkip()
+    for _, slot in ipairs(getAllCardSlots()) do
+        if slotIsOccupied(slot) and slotIsOnCooldown(slot) then
+            return true
         end
     end
     return false
@@ -4572,6 +4586,10 @@ task.spawn(function()
 
         if now < RuntimeState.nextTimePotionUse then continue end
         if not areAllCardSlotsOccupied() then continue end
+        -- Only spend a time potion while at least one occupied slot still
+        -- reports an active cooldown.  A full plot by itself is not enough:
+        -- when every card is ready, using a potion would waste it.
+        if not hasCardCooldownToSkip() then continue end
 
         local selectedPotion
         for _, potion in ipairs(TIME_POTIONS) do
