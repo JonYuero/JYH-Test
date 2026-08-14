@@ -839,9 +839,9 @@ local function filterValueMatches(value, selected)
 
     for wanted in pairs(selected) do
         local wantedKey = filterCompareKey(wanted)
-        -- Filters are selections, not fuzzy searches.  Fuzzy matching made
-        -- similarly named packs/ranks match each other unexpectedly.
-        if wantedKey == valueKey then
+        if wantedKey == valueKey
+            or (wantedKey and string.find(valueKey, wantedKey, 1, true))
+            or (wantedKey and string.find(wantedKey, valueKey, 1, true)) then
             return true
         end
     end
@@ -1164,8 +1164,8 @@ end
 -- Path: packModel.GuiHolder.BillboardGuiInfo.Rarity.<child name> (e.g. "Epic")
 local function getPackRarity(packModel)
     if not packModel then return nil end
-    local gui = packModel:FindFirstChild("GuiHolder", true)
-    local info = gui and gui:FindFirstChild("BillboardGuiInfo", true)
+    local gui = packModel:FindFirstChild("GuiHolder")
+    local info = gui and gui:FindFirstChild("BillboardGuiInfo")
     local rarityContainer = info and info:FindFirstChild("Rarity")
     if rarityContainer then
         -- 1. Check text labels inside (most reliable for display value).
@@ -1191,8 +1191,8 @@ end
 -- Path: packModel.GuiHolder.BillboardGuiInfo.Mutation.<child name> (e.g. "Normal")
 local function getPackMutation(packModel)
     if not packModel then return nil end
-    local gui = packModel:FindFirstChild("GuiHolder", true)
-    local info = gui and gui:FindFirstChild("BillboardGuiInfo", true)
+    local gui = packModel:FindFirstChild("GuiHolder")
+    local info = gui and gui:FindFirstChild("BillboardGuiInfo")
     local mutationContainer = info and info:FindFirstChild("Mutation")
     if mutationContainer then
         -- 1. Check text labels inside.
@@ -1216,6 +1216,8 @@ end
 
 -- ────────────────────────────────────────────────────────────────────────────
 
+local metadataCache = setmetatable({}, { __mode = "k" })
+
 local function readBoxValue(box, names)
     for _, name in ipairs(names) do
         local attribute = box:GetAttribute(name)
@@ -1224,40 +1226,40 @@ local function readBoxValue(box, names)
         end
     end
 
-    -- Conveyor metadata is populated incrementally.  A permanent cache here
-    -- made the first empty replication win forever, so filters could randomly
-    -- miss a pack depending on timing.  Read the live tree each time instead.
-    for _, name in ipairs(names) do
-        local key = string.lower(name)
+    local metadata = metadataCache[box]
+    if not metadata then
+        metadata = {
+            attributes = {},
+            values = {},
+        }
         for _, descendant in ipairs(box:GetDescendants()) do
-            local attribute = descendant:GetAttribute(name)
-            if attribute ~= nil then
-                return attribute
+            for key, value in pairs(descendant:GetAttributes()) do
+                key = string.lower(key)
+                if metadata.attributes[key] == nil then
+                    metadata.attributes[key] = value
+                end
             end
 
-            if string.lower(descendant.Name) == key then
+            local key = string.lower(descendant.Name)
+            if metadata.values[key] == nil then
                 if descendant:IsA("ValueBase") then
-                    return descendant.Value
+                    metadata.values[key] = descendant.Value
                 elseif descendant:IsA("TextLabel")
                     or descendant:IsA("TextButton") then
-                    return descendant.Text
+                    metadata.values[key] = descendant.Text
                 end
-
-                -- Some game revisions replicate Pack/Rarity/Mutation as a
-                -- Frame whose value is represented by a child label or by a
-                -- child named after the value.  Treat that container as a
-                -- value source too, but never fall back to the generic
-                -- container name itself.
-                local attribute = descendant:GetAttribute("Value")
-                    or descendant:GetAttribute(name)
-                if attribute ~= nil then
-                    return attribute
-                end
-                local text = firstMeaningfulTextLabel(descendant)
-                if text then return text end
-                local childName = firstMeaningfulChildName(descendant)
-                if childName then return childName end
             end
+        end
+        metadataCache[box] = metadata
+    end
+
+    for _, name in ipairs(names) do
+        local key = string.lower(name)
+        if metadata.attributes[key] ~= nil then
+            return metadata.attributes[key]
+        end
+        if metadata.values[key] ~= nil then
+            return metadata.values[key]
         end
     end
 
@@ -1312,35 +1314,6 @@ local function getBoxInfo(box)
         mutation = readBoxValue(box, { "Mutation",  "MutationName", "mutation" }),
         pack     = packValue,
     }
-end
-
--- Resolve a stable filter value even when the visible model has a generic
--- name such as BoxBaseModel.  The live Pack/PackName metadata is preferred,
--- then the known pack list, then the previous value.
-local function resolvePackName(model, fallback)
-    if not model then return fallback end
-
-    local modelKey = filterCompareKey(model.Name)
-    for _, packName in ipairs(PACKS) do
-        if filterCompareKey(packName) == modelKey then
-            return packName
-        end
-    end
-
-    local info = getBoxInfo(model)
-    if info and info.pack then
-        local infoKey = filterCompareKey(info.pack)
-        for _, packName in ipairs(PACKS) do
-            if filterCompareKey(packName) == infoKey then
-                return packName
-            end
-        end
-        return info.pack
-    end
-
-    -- A generic model name such as BoxBaseModel is not a pack value.  Returning
-    -- it here made a specific Pack filter depend on replication timing.
-    return fallback
 end
 
 local function getItemId(container)
@@ -1448,11 +1421,6 @@ local ItemIdIndex     = {}                     -- [itemId]    = packModel
 local PurchaseQueue   = {}                     -- ordered list of records
 local PurchaseQueued  = {}                     -- [record]    = true (dedup)
 local WatchedPrompts  = setmetatable({}, { __mode = "k" })
--- Weak-key cache for transient conveyor metadata.  The live game frequently
--- destroys/recreates pack descendants while they replicate; callbacks must be
--- able to invalidate this table without indexing a nil value.
-local metadataCache    = setmetatable({}, { __mode = "k" })
-local nextPackDiscoveryId = 0
 -- Keep attempts serialized per record through the state machine. Do not use a
 -- global purchase lock here: packs arrive independently and waiting for one
 -- removal confirmation stalls Auto Buy for every other matching pack.
@@ -1725,11 +1693,10 @@ refreshRecordMetadata = function(record, force)
             break
         end
     end
-    local resolvedPackName = canonicalPackName
+    record.packName = canonicalPackName
         or (liveInfo and liveInfo.pack)
-    if resolvedPackName then
-        record.packName = resolvedPackName
-    end
+        or record.packName
+        or record.model.Name
 
     -- Rarity, mutation from BillboardGuiInfo children.
     local freshRarity   = getPackRarity(record.model)
@@ -2114,20 +2081,16 @@ local function registerPack(packModel)
 
     local info   = getBoxInfo(packModel)
     local itemId = getItemId(packModel)
-    nextPackDiscoveryId = nextPackDiscoveryId + 1
 
     local record = {
         model               = packModel,
-        discoveryId         = nextPackDiscoveryId,
         container           = packModel.Parent,
         state               = "New",
         itemId              = itemId,
         info                = info,
 
         -- NEW: confirmed structure fields (populated by refreshRecordMetadata)
-        -- Do not use a generic model name as a pack value.  The model is often
-        -- BoxBaseModel before its live Pack metadata arrives.
-        packName            = info and info.pack or nil,
+        packName            = (info and info.pack) or packModel.Name,
         rarity              = nil,
         mutation            = nil,
         price               = nil,
@@ -2220,15 +2183,7 @@ local function rebindConveyorContainerInner()
     end
     table.clear(conveyorContainerConnections)
 
-    -- cleanupRecord removes entries from ConveyorRecords, so take a snapshot
-    -- first instead of mutating the table while pairs() is iterating it.
-    local recordsToCleanup = {}
-    for _, record in pairs(ConveyorRecords) do
-        table.insert(recordsToCleanup, record)
-    end
-    for _, record in ipairs(recordsToCleanup) do
-        cleanupRecord(record)
-    end
+    for _, record in pairs(ConveyorRecords) do cleanupRecord(record) end
     table.clear(ConveyorRecords)
     table.clear(ItemIdIndex)
     table.clear(PurchaseQueue)
@@ -2405,12 +2360,10 @@ getConveyorPacks = function()
 end
 
 getPackKey = function(record)
-    -- ItemId is added/replaced while a pack is replicating.  Using it as the
-    -- discovery identity makes an existing pack look newly spawned and causes
-    -- Auto Stop to inspect the wrong record.  Use the id assigned at
-    -- registration instead; it cannot change when the model receives its
-    -- server ItemId or when its metadata finishes replicating.
-    return "record:" .. tostring(record.discoveryId)
+    if record.itemId ~= nil then
+        return "id:" .. tostring(record.itemId)
+    end
+    return "model:" .. record.model:GetFullName()
 end
 
 indexPackIds = function(packs)
@@ -2487,25 +2440,18 @@ task.spawn(function()
                 end
 
                 -- ── Step 1: collect ALL new packs (up to 3 s) ───────────
-                -- A spawn event can replicate several conveyor models in
-                -- separate frames.  Collect the whole window instead of
-                -- stopping at the first model, otherwise a later matching
-                -- pack is ignored.
-                local newRecordsByKey = {}
-                local collectDeadline = os.clock() + 3
-                while os.clock() < collectDeadline do
+                -- With admin events two packs can spawn at once; we must
+                -- check every new pack for a filter match, not just the first.
+                local newRecords = {}
+                for _ = 1, 30 do
+                    newRecords = {}
                     for _, record in ipairs(getConveyorPacks()) do
-                        local key = getPackKey(record)
-                        if not capturedIds[key] then
-                            newRecordsByKey[key] = record
+                        if not capturedIds[getPackKey(record)] then
+                            table.insert(newRecords, record)
                         end
                     end
+                    if #newRecords > 0 then break end
                     task.wait(0.1)
-                end
-
-                local newRecords = {}
-                for _, record in pairs(newRecordsByKey) do
-                    table.insert(newRecords, record)
                 end
 
                 if #newRecords == 0 then
@@ -2516,24 +2462,22 @@ task.spawn(function()
                 end
 
                 -- ── Step 2: wait for metadata to replicate, find a match ─
-                -- Rarity/mutation/pack may not be replicated yet the moment
-                -- the model appears.  Poll long enough to avoid treating a
-                -- temporary placeholder as the final filter result.
+                -- Rarity/mutation may not be replicated yet the moment the
+                -- model appears. Poll up to 2 s so the filter sees real data.
                 --
                 -- NOTE: refreshRecordMetadata is local to the conveyor do-block
                 -- and is not in scope here. Instead read rarity/mutation directly
                 -- via getPackRarity/getPackMutation (declared before the block)
                 -- and build a fresh info table for the filter check.
                 local spawnedRecord = nil
-                for _ = 1, 50 do
+                for _ = 1, 20 do
                     task.wait(0.1)
                     for _, record in ipairs(newRecords) do
                         if not record.model:IsDescendantOf(workspace) then continue end
-                        local liveInfo = getBoxInfo(record.model) or {}
                         local freshInfo = {
-                            pack     = liveInfo.pack or record.packName,
-                            rarity   = liveInfo.rarity or getPackRarity(record.model),
-                            mutation = liveInfo.mutation or getPackMutation(record.model),
+                            pack     = record.packName or record.model.Name,
+                            rarity   = getPackRarity(record.model),
+                            mutation = getPackMutation(record.model),
                         }
                         if passesFilter(freshInfo) then
                             spawnedRecord = record
@@ -4559,36 +4503,14 @@ removeFirstFourCardSlots = function()
 end
 
 -- ── Combat GUI helpers ───────────────────────────────────────
-local function isGuiActuallyVisible(instance)
-    if not instance then return false end
-
-    local current = instance
-    while current and current ~= playerGui do
-        if current:IsA("GuiObject") and current.Visible ~= true then
-            return false
-        end
-        if current:IsA("LayerCollector") and current.Enabled ~= true then
-            return false
-        end
-        current = current.Parent
-    end
-    return true
-end
-
 local function findGuiByName(root, wantedName)
     if not root then return nil end
-    if root.Name == wantedName then
-        if isGuiActuallyVisible(root) then return root end
-    end
+    if root.Name == wantedName then return root end
     for _, descendant in ipairs(root:GetDescendants()) do
         if descendant.Name == wantedName then
-            if isGuiActuallyVisible(descendant) then
-                return descendant
-            end
+            return descendant
         end
     end
-    -- Do not return a hidden duplicate. Callers use nil to try the next
-    -- candidate panel or to wait for the live UI state.
     return nil
 end
 
@@ -4602,9 +4524,9 @@ local function getCombatGui(mode)
     }
     local root
     for _, name in ipairs(candidates[mode] or { mode }) do
-        root = guiMid and findGuiByName(guiMid, name)
+        root = guiMid and guiMid:FindFirstChild(name, true)
         if root then break end
-        root = findGuiByName(playerGui, name)
+        root = playerGui:FindFirstChild(name, true)
         if root then break end
     end
     return root
@@ -4614,14 +4536,9 @@ clickGuiButton = function(button)
     if not button or not button:IsA("GuiButton") then return false end
     -- Do not fire hidden duplicate buttons. Combat screens keep several
     -- copies of Exit/Battle controls in the hierarchy across UI states.
-    if not isGuiActuallyVisible(button) then return false end
-    if button.Active == false then return false end
+    if button:IsA("GuiObject") and not button.Visible then return false end
     if firesignal then
-        local signal
-        if button:IsA("TextButton") or button:IsA("ImageButton") then
-            signal = button.MouseButton1Click
-        end
-        local ok = signal and pcall(firesignal, signal)
+        local ok = pcall(firesignal, button.MouseButton1Click)
         if ok then return true end
     end
     return pcall(function() button:Activate() end)
@@ -4630,8 +4547,10 @@ end
 -- Shared helper: find BossRaidReward root and its CLOSE button.
 local function getRewardCloseButton()
     local guiMid = playerGui:FindFirstChild("GuiMid")
-    local root = guiMid and findGuiByName(guiMid, "BossRaidReward")
-    if not root then root = findGuiByName(playerGui, "BossRaidReward") end
+    local root = guiMid and guiMid:FindFirstChild("BossRaidReward", true)
+    if not root then
+        root = playerGui:FindFirstChild("BossRaidReward", true)
+    end
     if not root then return nil, nil end
     -- Confirmed from BossRaidRewardClient:
     -- BossRaidReward.RaidFrameReward.TOP.CLOSE
@@ -4645,7 +4564,10 @@ local function getRewardCloseButton()
 end
 
 local function isGuiShown(instance)
-    return isGuiActuallyVisible(instance)
+    if not instance then return false end
+    if instance:IsA("GuiObject") then return instance.Visible == true end
+    if instance:IsA("LayerCollector") then return instance.Enabled == true end
+    return false
 end
 
 -- Lightweight immediate check used by startCombatBattle as a gate.
@@ -4731,19 +4653,10 @@ exitInfinityTowerBattle = function()
             -- expose "Exit" through its Text property.
             for _, descendant in ipairs(root:GetDescendants()) do
                 if descendant:IsA("GuiButton") then
-                    -- ImageButton does not expose Text.  The old direct read
-                    -- here raised the exact runtime error that stopped the
-                    -- combat scheduler during an Infinity Tower run.
-                    local text
-                    if descendant:IsA("TextButton") then
-                        text = string.lower(tostring(descendant.Text or ""))
-                    end
-                    if text then
-                        text = text:gsub("^%s*(.-)%s*$", "%1")
-                        if text == "exit" or text == "leave" or text == "quit" then
-                            if clickGuiButton(descendant) then
-                                return true
-                            end
+                    local text = string.lower(tostring(descendant.Text or ""))
+                    if text == "exit" or text == "leave" or text == "quit" then
+                        if clickGuiButton(descendant) then
+                            return true
                         end
                     end
                 end
