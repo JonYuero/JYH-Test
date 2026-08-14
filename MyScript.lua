@@ -5629,6 +5629,17 @@ function cardCraftState.amountFor(requirement)
     return math.max(1, math.floor(amount))
 end
 
+function cardCraftState.inventoryCounts()
+    local counts = {}
+    for _, tool in ipairs(cardCraftState.availableCards()) do
+        local cardName = tostring(tool:GetAttribute("CardName") or "")
+        if cardName ~= "" then
+            counts[cardName] = (counts[cardName] or 0) + 1
+        end
+    end
+    return counts
+end
+
 function cardCraftState.updateStatus()
     local paragraph = cardCraftState.StatusParagraph
     if not paragraph or not paragraph.Set then return end
@@ -5645,31 +5656,33 @@ function cardCraftState.updateStatus()
         local now = cardCraftState.now()
         local startedAt = tonumber(job.StartedAt) or now
         local readyAt = tonumber(job.ReadyAt) or now
-        local duration = math.max(1, tonumber(job.Duration) or (readyAt - startedAt))
-        local elapsed = math.clamp(now - startedAt, 0, duration)
         local remaining = math.max(0, readyAt - now)
         local status = remaining <= 0 and "Ready to claim" or "Crafting"
         table.insert(lines, tostring(cardName) .. " - "
-            .. cardCraftState.formatDuration(elapsed) .. " / "
-            .. cardCraftState.formatDuration(duration) .. " - " .. status)
+            .. cardCraftState.formatDuration(remaining) .. " - " .. status)
 
         local activeRecipe = recipe
         if not activeRecipe and recipeId then
             activeRecipe = cardCraftState.getRecipe(recipeId)
         end
+        local inventory = cardCraftState.inventoryCounts()
         for index, requirement in ipairs(activeRecipe and activeRecipe.Requirements or {}) do
+            local required = cardCraftState.amountFor(requirement)
+            local owned = inventory[tostring(requirement.CardName or "")] or 0
             table.insert(lines, "Recipe " .. tostring(index) .. " - "
                 .. tostring(requirement.CardName or "Card") .. " - "
-                .. tostring(cardCraftState.amountFor(requirement))
-                .. "/" .. tostring(cardCraftState.amountFor(requirement)))
+                .. tostring(owned) .. "/" .. tostring(required))
         end
     else
         table.insert(lines, tostring(cardName)
-            .. " - 00:00:00 / 00:00:00 - Idle")
+            .. " - 00:00:00 - Idle")
+        local inventory = cardCraftState.inventoryCounts()
         for index, requirement in ipairs(recipe and recipe.Requirements or {}) do
+            local required = cardCraftState.amountFor(requirement)
+            local owned = inventory[tostring(requirement.CardName or "")] or 0
             table.insert(lines, "Recipe " .. tostring(index) .. " - "
-                .. tostring(requirement.CardName or "Card") .. " - 0/"
-                .. tostring(cardCraftState.amountFor(requirement)))
+                .. tostring(requirement.CardName or "Card") .. " - "
+                .. tostring(owned) .. "/" .. tostring(required))
         end
         table.insert(lines, "Target mutation: "
             .. table.concat(cardCraftState.normalizeMutations(
@@ -5682,7 +5695,7 @@ function cardCraftState.updateStatus()
 
     pcall(function()
         paragraph:Set({
-            Title = "Card Crafting",
+            Title = tostring(cardName),
             Content = table.concat(lines, "\n"),
         })
     end)
