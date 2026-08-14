@@ -15,8 +15,8 @@
 -- ============================================================
 
 -- ── URL constants (single source of truth) ───────────────────
-local LOADER_URL    = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/Loader.lua"
-local ANIME_CARD_FARM_URL = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/MyScript.lua"
+local LOADER_URL    = "https://raw.githubusercontent.com/JonYuero/Jon-Yuero-Hub/refs/heads/main/JYH%20Loader.lua"
+local ANIME_CARD_FARM_URL = "https://raw.githubusercontent.com/JonYuero/Anime-Card-Farm/refs/heads/main/ACF.lua"
 
 local VALID_LICENSE_TYPES = { FREE = true, ["30D"] = true, LIFETIME = true }
 
@@ -325,7 +325,7 @@ end
 -- ── Remotes ──────────────────────────────────────────────────
 local Remotes    = ReplicatedStorage:WaitForChild("Remotes")
 local ConveyorRE = Remotes:WaitForChild("ConveyorRE")
-local ItemsREForAutomation = Remotes:WaitForChild("ItemsRE", 15)
+local ItemsREForAutomation = Remotes:FindFirstChild("ItemsRE")
 local PlayTimeRewardRE = Remotes:FindFirstChild("PlayTimeRewardRE")
 local DailyRewardRE    = Remotes:FindFirstChild("DailyRewardRE")
 local UpgradesRE       = Remotes:FindFirstChild("UpgradesRE")
@@ -357,15 +357,8 @@ if Modules and Modules:FindFirstChild("GuiManager") then
         GuiManager = require(Modules.GuiManager)
     end)
 end
-local RuntimeState = {
-    currentRaidBossId     = "",
-    playtimeReadyRewards  = {},
-    playtimeStateReceived = false,
-    potionInventoryCounts = {},
-    potionInventoryReceived = false,
-    nextTimePotionUse     = 0,
-    pendingTimePotion     = nil,
-}
+local currentRaidBossId = ""
+local raidServerOpen = nil
 
 -- ── Data lists ───────────────────────────────────────────────
 local RARITIES = {
@@ -375,11 +368,7 @@ local RARITIES = {
     "Manga", "Celestial", "Heavenly", "Corrupted",
     "Striker", "Sacred", "Paradox", "Founder",
     "Evolved", "Magic", "Oni", "Chaos",
-    "Ruin", "Reborn", "Beast", "Nordic",
-    "Hunter", "Soul", "Swordsman", "Gamer",
-    "Revenge", "Chainsaw", "Grail", "Conquest",
-    "Blaze", "Devour", "Raven", "Arcane",
-    "Nightfall",
+    "Ruin", "Limited",
 }
 
 local MUTATIONS = {
@@ -399,19 +388,19 @@ local PACKS = {
     "Hunter Pack", "Soul Pack", "Swordsman Pack", "Gamer Pack",
     "Revenge Pack", "Chainsaw Pack", "Eternity Pack", "Academy Pack",
     "Dynasty Pack", "Grail Pack", "Conquest Pack", "Blaze Pack",
-    "Devour Pack", "Raven Pack", "Arcane Pack", "Nightfall Pack",
+    "Devour Pack",
 }
 
 local POTIONS = {
     "LuckPotion1", "LuckPotion2", "LuckPotion3",
     "CashPotion1", "CashPotion2", "CashPotion3",
-    "MutationPotion1", "MutationPotion2", "MutationPotion3",
-    "ProductionPotion1", "ProductionPotion2", "ProductionPotion3",
+    "MutationPotion1",
+    "ProductionPotion1", "ProductionPotion2",
 }
 
 -- Keep the strongest time potion first so pack automation always spends the
 -- best available skip potion before falling back to a weaker one.
-local TIME_POTIONS = { "TimePotion3", "TimePotion2", "TimePotion1" }
+local TIME_POTIONS = { "TimePotion2", "TimePotion1" }
 
 local function normalizeGeneralPotionSelection(selection)
     local valid = {}
@@ -512,9 +501,10 @@ local Config = {
     AutoUpgrade       = false,
     UpgradeDelay      = 0.15,
     CardActionDelay   = 0.6,
+    AutoSell          = false,
     AutoTraitRoll     = false,
     SelectedRankCards = { "All" },
-    TargetRank        = {},
+    TargetRank        = { "UR" },
     SelectedTraitCards = { "All" },
     TargetTraits      = {},
     RankUseGems       = true,
@@ -552,6 +542,11 @@ local Config = {
 local Controls = {}
 
 -- Playtime state is pushed by the game's client remote.
+local playtimeReadyRewards = {}
+local playtimeStateReceived = false
+local potionInventoryCounts = {}
+local nextTimePotionUse = 0
+
 -- Forward declarations
 local clickGuiButton
 local startCombatBattle
@@ -599,20 +594,22 @@ local function fireButton(part)
                or part:FindFirstChild("ClickDetector")
     if click then
         if fireclickdetector then
-            local ok = pcall(fireclickdetector, click)
-            if ok then return true end
+            pcall(fireclickdetector, click)
+            return true
         end
-        return pcall(function() click.MouseClick:Fire(player.Character) end)
+        pcall(function() click.MouseClick:Fire(player.Character) end)
+        return true
     end
 
     local prompt = part:FindFirstChildOfClass("ProximityPrompt")
     if prompt then
         if fireproximityprompt then
-            local ok = pcall(fireproximityprompt, prompt)
-            if ok then return true end
+            pcall(fireproximityprompt, prompt)
+            return true
         end
         if firetouchinterest then
-            return pcall(firetouchinterest, part, player.Character, 0)
+            pcall(firetouchinterest, part, player.Character, 0)
+            return true
         end
     end
 
@@ -649,8 +646,8 @@ end
 
 local function refreshPlaytimeReadyRewards(state)
     if type(state) ~= "table" then return end
-    RuntimeState.playtimeStateReceived = true
-    table.clear(RuntimeState.playtimeReadyRewards)
+    playtimeStateReceived = true
+    table.clear(playtimeReadyRewards)
     local rewards = state.Rewards or state
     if type(rewards) ~= "table" then return end
     for index = 1, 12 do
@@ -658,7 +655,7 @@ local function refreshPlaytimeReadyRewards(state)
         if type(reward) == "table"
             and reward.Claimed ~= true
             and reward.Ready == true then
-            RuntimeState.playtimeReadyRewards[index] = true
+            playtimeReadyRewards[index] = true
         end
     end
 end
@@ -669,7 +666,7 @@ if PlayTimeRewardRE and PlayTimeRewardRE:IsA("RemoteEvent") then
             refreshPlaytimeReadyRewards(payload)
         elseif eventName == "ClaimSuccess" and type(payload) == "table" then
             local index = tonumber(payload.RewardIndex)
-            if index then RuntimeState.playtimeReadyRewards[index] = nil end
+            if index then playtimeReadyRewards[index] = nil end
         end
     end)
 end
@@ -805,26 +802,19 @@ local function normalizeFilterSelection(value)
 
     local function add(option)
         local normalized = normalizeFilterValue(option)
-        if normalized == "any" or normalized == "all" then
-            -- "Any" is an explicit wildcard.  Rayfield can return the
-            -- previous selections together with the newly selected wildcard,
-            -- so it must win over those stale values.
-            return true
-        end
-        if normalized then
+        if normalized and normalized ~= "any" and normalized ~= "all" then
             selected[normalized] = true
         end
-        return false
     end
 
     local hadArrayValues = false
     for _, option in ipairs(value) do
         hadArrayValues = true
-        if add(option) then return {} end
+        add(option)
     end
     if not hadArrayValues then
         for option, enabled in pairs(value) do
-            if enabled and add(option) then return {} end
+            if enabled then add(option) end
         end
     end
 
@@ -844,9 +834,9 @@ local function filterValueMatches(value, selected)
 
     for wanted in pairs(selected) do
         local wantedKey = filterCompareKey(wanted)
-        -- Filters are selections, not fuzzy searches.  Fuzzy matching made
-        -- similarly named packs/ranks match each other unexpectedly.
-        if wantedKey == valueKey then
+        if wantedKey == valueKey
+            or (wantedKey and string.find(valueKey, wantedKey, 1, true))
+            or (wantedKey and string.find(wantedKey, valueKey, 1, true)) then
             return true
         end
     end
@@ -870,7 +860,7 @@ local function normalizePackName(value)
 end
 
 -- Decode Anime Card Farm compact cash strings:
--- K, M, B, T, Qd, Qn, Sx, Sp, O, N, Dc, Ud, Dd, Td.
+-- K, M, B, T, Qd, Qn, Sx, Sp, O, N, Dc.
 -- Returns a number on success, nil on failure.
 local function parseCompactCash(text)
     if type(text) ~= "string" then return nil end
@@ -890,9 +880,6 @@ local function parseCompactCash(text)
         o = 1e27,
         n = 1e30,
         dc = 1e33,
-        ud = 1e36,
-        dd = 1e39,
-        td = 1e42,
     }
 
     -- Try two-letter suffix first, then one-letter suffix, then plain number.
@@ -1169,8 +1156,8 @@ end
 -- Path: packModel.GuiHolder.BillboardGuiInfo.Rarity.<child name> (e.g. "Epic")
 local function getPackRarity(packModel)
     if not packModel then return nil end
-    local gui = packModel:FindFirstChild("GuiHolder", true)
-    local info = gui and gui:FindFirstChild("BillboardGuiInfo", true)
+    local gui = packModel:FindFirstChild("GuiHolder")
+    local info = gui and gui:FindFirstChild("BillboardGuiInfo")
     local rarityContainer = info and info:FindFirstChild("Rarity")
     if rarityContainer then
         -- 1. Check text labels inside (most reliable for display value).
@@ -1196,8 +1183,8 @@ end
 -- Path: packModel.GuiHolder.BillboardGuiInfo.Mutation.<child name> (e.g. "Normal")
 local function getPackMutation(packModel)
     if not packModel then return nil end
-    local gui = packModel:FindFirstChild("GuiHolder", true)
-    local info = gui and gui:FindFirstChild("BillboardGuiInfo", true)
+    local gui = packModel:FindFirstChild("GuiHolder")
+    local info = gui and gui:FindFirstChild("BillboardGuiInfo")
     local mutationContainer = info and info:FindFirstChild("Mutation")
     if mutationContainer then
         -- 1. Check text labels inside.
@@ -1221,6 +1208,8 @@ end
 
 -- ────────────────────────────────────────────────────────────────────────────
 
+local metadataCache = setmetatable({}, { __mode = "k" })
+
 local function readBoxValue(box, names)
     for _, name in ipairs(names) do
         local attribute = box:GetAttribute(name)
@@ -1229,40 +1218,40 @@ local function readBoxValue(box, names)
         end
     end
 
-    -- Conveyor metadata is populated incrementally.  A permanent cache here
-    -- made the first empty replication win forever, so filters could randomly
-    -- miss a pack depending on timing.  Read the live tree each time instead.
-    for _, name in ipairs(names) do
-        local key = string.lower(name)
+    local metadata = metadataCache[box]
+    if not metadata then
+        metadata = {
+            attributes = {},
+            values = {},
+        }
         for _, descendant in ipairs(box:GetDescendants()) do
-            local attribute = descendant:GetAttribute(name)
-            if attribute ~= nil then
-                return attribute
+            for key, value in pairs(descendant:GetAttributes()) do
+                key = string.lower(key)
+                if metadata.attributes[key] == nil then
+                    metadata.attributes[key] = value
+                end
             end
 
-            if string.lower(descendant.Name) == key then
+            local key = string.lower(descendant.Name)
+            if metadata.values[key] == nil then
                 if descendant:IsA("ValueBase") then
-                    return descendant.Value
+                    metadata.values[key] = descendant.Value
                 elseif descendant:IsA("TextLabel")
                     or descendant:IsA("TextButton") then
-                    return descendant.Text
+                    metadata.values[key] = descendant.Text
                 end
-
-                -- Some game revisions replicate Pack/Rarity/Mutation as a
-                -- Frame whose value is represented by a child label or by a
-                -- child named after the value.  Treat that container as a
-                -- value source too, but never fall back to the generic
-                -- container name itself.
-                local attribute = descendant:GetAttribute("Value")
-                    or descendant:GetAttribute(name)
-                if attribute ~= nil then
-                    return attribute
-                end
-                local text = firstMeaningfulTextLabel(descendant)
-                if text then return text end
-                local childName = firstMeaningfulChildName(descendant)
-                if childName then return childName end
             end
+        end
+        metadataCache[box] = metadata
+    end
+
+    for _, name in ipairs(names) do
+        local key = string.lower(name)
+        if metadata.attributes[key] ~= nil then
+            return metadata.attributes[key]
+        end
+        if metadata.values[key] ~= nil then
+            return metadata.values[key]
         end
     end
 
@@ -1317,35 +1306,6 @@ local function getBoxInfo(box)
         mutation = readBoxValue(box, { "Mutation",  "MutationName", "mutation" }),
         pack     = packValue,
     }
-end
-
--- Resolve a stable filter value even when the visible model has a generic
--- name such as BoxBaseModel.  The live Pack/PackName metadata is preferred,
--- then the known pack list, then the previous value.
-local function resolvePackName(model, fallback)
-    if not model then return fallback end
-
-    local modelKey = filterCompareKey(model.Name)
-    for _, packName in ipairs(PACKS) do
-        if filterCompareKey(packName) == modelKey then
-            return packName
-        end
-    end
-
-    local info = getBoxInfo(model)
-    if info and info.pack then
-        local infoKey = filterCompareKey(info.pack)
-        for _, packName in ipairs(PACKS) do
-            if filterCompareKey(packName) == infoKey then
-                return packName
-            end
-        end
-        return info.pack
-    end
-
-    -- A generic model name such as BoxBaseModel is not a pack value.  Returning
-    -- it here made a specific Pack filter depend on replication timing.
-    return fallback
 end
 
 local function getItemId(container)
@@ -1453,11 +1413,6 @@ local ItemIdIndex     = {}                     -- [itemId]    = packModel
 local PurchaseQueue   = {}                     -- ordered list of records
 local PurchaseQueued  = {}                     -- [record]    = true (dedup)
 local WatchedPrompts  = setmetatable({}, { __mode = "k" })
--- Weak-key cache for transient conveyor metadata.  The live game frequently
--- destroys/recreates pack descendants while they replicate; callbacks must be
--- able to invalidate this table without indexing a nil value.
-local metadataCache    = setmetatable({}, { __mode = "k" })
-local nextPackDiscoveryId = 0
 -- Keep attempts serialized per record through the state machine. Do not use a
 -- global purchase lock here: packs arrive independently and waiting for one
 -- removal confirmation stalls Auto Buy for every other matching pack.
@@ -1608,60 +1563,40 @@ end
 -- Fallback: scan descendants for any enabled buy prompt.
 local function getBuyPrompt(packModel)
     if not packModel then return nil end
-    -- Confirmed exact path from screenshots. Prefer it when it is explicitly
-    -- a buy prompt, but do not let a generic/disabled prompt hide a better
-    -- matching prompt elsewhere in the same pack.
-    local exactPrompt = nil
+    -- Confirmed exact path from screenshots.
     local main = packModel:FindFirstChild("Main")
     if main then
         local prompt = main:FindFirstChild("ProximityPrompt")
         if prompt and prompt:IsA("ProximityPrompt") then
-            exactPrompt = prompt
-            if isBuyPrompt(prompt) and prompt.Enabled ~= false then
-                return prompt
-            end
+            -- Accept even if Enabled==false so we can watch it become true.
+            return prompt
         end
     end
-
-    -- Recursive fallback: prefer an enabled prompt whose text identifies the
-    -- purchase action. If the confirmed Main prompt exists, keep using it
-    -- before falling back to unrelated enabled prompts.
-    local firstBuyPrompt = nil
-    local firstEnabled = nil
+    -- Recursive fallback: scan all descendants.
+    local firstAny = nil
     for _, desc in ipairs(packModel:GetDescendants()) do
         if desc:IsA("ProximityPrompt") then
-            if isBuyPrompt(desc) then
-                if desc.Enabled ~= false then return desc end
-                if not firstBuyPrompt then firstBuyPrompt = desc end
-            end
-            if desc.Enabled ~= false and not firstEnabled then
-                firstEnabled = desc
-            end
+            if isBuyPrompt(desc) then return desc end
+            if not firstAny then firstAny = desc end
         end
     end
-    return exactPrompt or firstBuyPrompt or firstEnabled
+    return firstAny
 end
 
 -- Legacy alias used by prompt-watcher helpers below.
 local findBestBuyPrompt = getBuyPrompt
 
 -- ── Cash safety check ─────────────────────────────────────────────────
--- Returns true when the player has enough known cash (and enough reserve) to
--- buy. Unknown client-side cash/price is allowed through to the server, which
--- remains authoritative.
+-- Returns true when the player has enough cash (and enough reserve) to buy.
+-- Returns false, reason string on any failure.
 local function canBuyWithCash(record)
     local cash = getPlayerCash()
     if cash == nil then
-        -- Cash can be exposed only through a late-replicating HUD or can be
-        -- represented by a server-side value that the client cannot read.
-        -- The purchase prompt/remote still performs the authoritative check.
-        return true, "CashValueUnavailable"
+        return false, "MissingCashValue"
     end
     local price = record.price
     if price == nil then
-        -- Do not discard a matching pack while its BillboardGui/Cost value is
-        -- still replicating.  The server knows the actual price.
-        return true, "PriceUnavailable"
+        return false, "InvalidPrice"
     end
     if cash < price then
         return false, "NotEnoughCash"
@@ -1717,24 +1652,8 @@ refreshRecordMetadata = function(record, force)
     record.lastMetadataRefresh = now
 
     -- ── NEW: read from confirmed BillboardGuiInfo structure ──────────
-    -- Prefer a canonical pack name or the name recovered by getBoxInfo.
-    -- Some live conveyor models are generic names such as BoxBaseModel;
-    -- replacing a resolved pack with that generic name breaks specific pack
-    -- filters while "Any" appears to work.
-    local liveInfo = getBoxInfo(record.model)
-    local modelNameKey = filterCompareKey(record.model.Name)
-    local canonicalPackName = nil
-    for _, packName in ipairs(PACKS) do
-        if filterCompareKey(packName) == modelNameKey then
-            canonicalPackName = packName
-            break
-        end
-    end
-    local resolvedPackName = canonicalPackName
-        or (liveInfo and liveInfo.pack)
-    if resolvedPackName then
-        record.packName = resolvedPackName
-    end
+    -- Pack name comes from the model name itself.
+    record.packName = record.model.Name
 
     -- Rarity, mutation from BillboardGuiInfo children.
     local freshRarity   = getPackRarity(record.model)
@@ -1871,8 +1790,7 @@ end
 -- PRIMARY PATH: fireproximityprompt(packModel.Main.ProximityPrompt)
 -- FALLBACK:     ConveyorRE:FireServer("TryBuy", { ItemId = itemId })
 --               only when the prompt path is unavailable.
--- SAFETY RULE: never fire when known cash < known price. Unknown values are
--- allowed through because the server validates the actual transaction.
+-- SAFETY RULE:  never fire when cash < price; never fire when price is nil.
 tryBuyRecord = function(record)
     if not record or not record.model or record.state ~= "Queued" then
         return false
@@ -2119,20 +2037,16 @@ local function registerPack(packModel)
 
     local info   = getBoxInfo(packModel)
     local itemId = getItemId(packModel)
-    nextPackDiscoveryId = nextPackDiscoveryId + 1
 
     local record = {
         model               = packModel,
-        discoveryId         = nextPackDiscoveryId,
         container           = packModel.Parent,
         state               = "New",
         itemId              = itemId,
         info                = info,
 
         -- NEW: confirmed structure fields (populated by refreshRecordMetadata)
-        -- Do not use a generic model name as a pack value.  The model is often
-        -- BoxBaseModel before its live Pack metadata arrives.
-        packName            = info and info.pack or nil,
+        packName            = packModel.Name,
         rarity              = nil,
         mutation            = nil,
         price               = nil,
@@ -2225,15 +2139,7 @@ local function rebindConveyorContainerInner()
     end
     table.clear(conveyorContainerConnections)
 
-    -- cleanupRecord removes entries from ConveyorRecords, so take a snapshot
-    -- first instead of mutating the table while pairs() is iterating it.
-    local recordsToCleanup = {}
-    for _, record in pairs(ConveyorRecords) do
-        table.insert(recordsToCleanup, record)
-    end
-    for _, record in ipairs(recordsToCleanup) do
-        cleanupRecord(record)
-    end
+    for _, record in pairs(ConveyorRecords) do cleanupRecord(record) end
     table.clear(ConveyorRecords)
     table.clear(ItemIdIndex)
     table.clear(PurchaseQueue)
@@ -2410,12 +2316,10 @@ getConveyorPacks = function()
 end
 
 getPackKey = function(record)
-    -- ItemId is added/replaced while a pack is replicating.  Using it as the
-    -- discovery identity makes an existing pack look newly spawned and causes
-    -- Auto Stop to inspect the wrong record.  Use the id assigned at
-    -- registration instead; it cannot change when the model receives its
-    -- server ItemId or when its metadata finishes replicating.
-    return "record:" .. tostring(record.discoveryId)
+    if record.itemId ~= nil then
+        return "id:" .. tostring(record.itemId)
+    end
+    return "model:" .. record.model:GetFullName()
 end
 
 indexPackIds = function(packs)
@@ -2452,7 +2356,7 @@ local autoStopWatcherActive = false
 -- Auto Spawn Pack
 task.spawn(function()
     while true do
-        task.wait(math.max(0.05, tonumber(Config.SpawnDelay) or 0.5))
+        task.wait(math.max(0.05, Config.SpawnDelay))
         if not Config.AutoSpawnPack then continue end
         if boxHandlingActive then continue end
         if autoStopHandled then continue end
@@ -2478,13 +2382,7 @@ task.spawn(function()
                     ". Use 'Detect My Plot' or set the plot number manually.")
             end
         end
-        -- Do not start the watcher unless the interaction primitive actually
-        -- ran. fireButton used to report success even when the executor
-        -- primitive threw, which left Auto Stop waiting for a pack that could
-        -- never arrive.
-        if not fireButton(spawnBtn) then
-            continue
-        end
+        fireButton(spawnBtn)
 
         -- The watcher must be single-instance, but it must not pause the
         -- actual spawn loop while it waits for the new pack's metadata.
@@ -2492,37 +2390,24 @@ task.spawn(function()
             local capturedIds = previousIds
             autoStopWatcherActive = true
             task.spawn(function()
-                if autoStopHandled or not Config.AutoStopSpawn
-                    or not Config.AutoSpawnPack then
+                if autoStopHandled then
                     autoStopWatcherActive = false
                     return
                 end
 
                 -- ── Step 1: collect ALL new packs (up to 3 s) ───────────
-                -- A spawn event can replicate several conveyor models in
-                -- separate frames.  Collect the whole window instead of
-                -- stopping at the first model, otherwise a later matching
-                -- pack is ignored.
-                local newRecordsByKey = {}
-                local collectDeadline = os.clock() + 3
-                while os.clock() < collectDeadline do
-                    if autoStopHandled or not Config.AutoStopSpawn
-                        or not Config.AutoSpawnPack then
-                        autoStopWatcherActive = false
-                        return
-                    end
+                -- With admin events two packs can spawn at once; we must
+                -- check every new pack for a filter match, not just the first.
+                local newRecords = {}
+                for _ = 1, 30 do
+                    newRecords = {}
                     for _, record in ipairs(getConveyorPacks()) do
-                        local key = getPackKey(record)
-                        if not capturedIds[key] then
-                            newRecordsByKey[key] = record
+                        if not capturedIds[getPackKey(record)] then
+                            table.insert(newRecords, record)
                         end
                     end
+                    if #newRecords > 0 then break end
                     task.wait(0.1)
-                end
-
-                local newRecords = {}
-                for _, record in pairs(newRecordsByKey) do
-                    table.insert(newRecords, record)
                 end
 
                 if #newRecords == 0 then
@@ -2533,24 +2418,22 @@ task.spawn(function()
                 end
 
                 -- ── Step 2: wait for metadata to replicate, find a match ─
-                -- Rarity/mutation/pack may not be replicated yet the moment
-                -- the model appears.  Poll long enough to avoid treating a
-                -- temporary placeholder as the final filter result.
+                -- Rarity/mutation may not be replicated yet the moment the
+                -- model appears. Poll up to 2 s so the filter sees real data.
                 --
                 -- NOTE: refreshRecordMetadata is local to the conveyor do-block
                 -- and is not in scope here. Instead read rarity/mutation directly
                 -- via getPackRarity/getPackMutation (declared before the block)
                 -- and build a fresh info table for the filter check.
                 local spawnedRecord = nil
-                for _ = 1, 50 do
+                for _ = 1, 20 do
                     task.wait(0.1)
                     for _, record in ipairs(newRecords) do
                         if not record.model:IsDescendantOf(workspace) then continue end
-                        local liveInfo = getBoxInfo(record.model) or {}
                         local freshInfo = {
-                            pack     = liveInfo.pack or record.packName,
-                            rarity   = liveInfo.rarity or getPackRarity(record.model),
-                            mutation = liveInfo.mutation or getPackMutation(record.model),
+                            pack     = record.packName or record.model.Name,
+                            rarity   = getPackRarity(record.model),
+                            mutation = getPackMutation(record.model),
                         }
                         if passesFilter(freshInfo) then
                             spawnedRecord = record
@@ -2566,8 +2449,7 @@ task.spawn(function()
                 end  -- no match among new packs
 
                 -- ── Step 3: stop spawning ────────────────────────────────
-                if autoStopHandled or not Config.AutoStopSpawn
-                    or not Config.AutoSpawnPack then
+                if autoStopHandled then
                     autoStopWatcherActive = false
                     return
                 end
@@ -2591,11 +2473,6 @@ task.spawn(function()
                         local deadline = os.clock() + 30
                         while os.clock() < deadline do
                             task.wait(0.2)
-                            if not Config.AutoStopSpawn then
-                                autoStopHandled = false
-                                autoStopWatcherActive = false
-                                return
-                            end
                             local st = watchedRecord.state
                             if st == "BoughtAndRemove" or st == "Removed"
                                 or not watchedRecord.model:IsDescendantOf(workspace) then
@@ -2958,6 +2835,23 @@ task.spawn(function()
     end
 end)
 
+-- Auto Sell
+task.spawn(function()
+    while true do
+        task.wait(0.75)
+        if not Config.AutoSell then continue end
+        local backpack = player:FindFirstChild("Backpack")
+        if not backpack then continue end
+        for _, item in ipairs(backpack:GetChildren()) do
+            local lvl = item:FindFirstChild("CardLevel")
+            if lvl and lvl.Value >= MAX_CARD_LEVEL then
+                fireRemote("CardSlotRE", "Sell", item.Name)
+                task.wait(0.1)
+            end
+        end
+    end
+end)
+
 -- Auto Potions
 -- Uses ItemsRE.OnClientEvent (same events the game's ItemsClient listens to)
 -- for reliable inventory counts and active boost tracking. The replacement
@@ -2968,7 +2862,7 @@ do
         -- potionCounts[itemId] = number owned
         -- activeBoosts[family] = tier/expiry while that boost is running
         -- Keep this inventory mirror available to the pack automation below.
-        local potionCounts = RuntimeState.potionInventoryCounts
+        local potionCounts = potionInventoryCounts
         -- activeBoosts is indexed by potion family (luck/cash/etc.), not by
         -- the raw stat key.  That lets CashPotion I/II/III share one timer.
         local activeBoosts = {}
@@ -3069,7 +2963,7 @@ do
             return nil
         end
 
-        local function usePotionThroughItemsUi(itemId, amount)
+        local function usePotionThroughItemsUi(itemId)
             local itemsFrame = findItemsFrame()
             if not itemsFrame then return false end
 
@@ -3097,11 +2991,7 @@ do
             end
             if not popup then return false end
 
-            -- The game's potion client uses the single-use action for
-            -- automation.  Sending USE5x here can leave the popup open on
-            -- versions that do not expose the batch-use button.
-            local buttonName = "USE"
-            local useButton = popup:FindFirstChild(buttonName, true)
+            local useButton = popup:FindFirstChild("USE", true)
             if not useButton or not clickGuiButton(useButton) then
                 return false
             end
@@ -3110,11 +3000,9 @@ do
 
         local function potionDetails(itemId)
             local name = string.lower(tostring(itemId or ""))
-            -- Inventory keys are not consistent between game versions.
-            -- Besides LuckPotion1 / "Luck Potion I", some versions expose
-            -- display-style ids such as "Luck I" or "Cash_II".  Match the
-            -- family and tier after removing separators so all of those
-            -- representations resolve to the same potion.
+            -- Inventory ids vary between client versions.  In addition to
+            -- LuckPotion1 / "Luck Potion I", the game may send display-style
+            -- keys such as "Luck I" or "Cash_II".
             local compactName = string.gsub(name, "[^%w]", "")
             local family
             if string.find(compactName, "luck", 1, true) then
@@ -3230,25 +3118,8 @@ do
             -- A running potion in the same category blocks an equal or
             -- weaker potion.  A higher tier is allowed through so the live
             -- game's confirmation dialog can ask whether to replace it.
-            -- Some game revisions omit the active potion tier; in that case
-            -- let the server decide instead of silently disabling automation.
-            if not tier or not active.tier then
-                return true
-            end
+            if not tier or not active.tier then return true end
             return tier > active.tier
-        end
-
-        -- Mirror the same events the ItemsClient script handles. The game
-        -- has used both FullInventory and InventoryUpdate for this snapshot,
-        -- so Auto Use Time Potion must understand both versions.
-        local function storePotionQuantity(itemId, quantity)
-            if itemId == nil then return end
-            if type(quantity) == "table" then
-                quantity = quantity.Quantity or quantity.quantity
-                    or quantity.Amount or quantity.amount
-                    or quantity.Count or quantity.count
-            end
-            potionCounts[itemId] = tonumber(quantity) or 0
         end
 
         local function readItemId(data, includeDisplayName)
@@ -3266,10 +3137,32 @@ do
                 or data.Count or data.count
         end
 
-        -- Inventory ids are not guaranteed to use the same spelling as the
-        -- config list. Older builds send ids such as LuckPotion1, while
-        -- newer builds may send display-style keys such as "Luck Potion I".
-        -- Match by potion family and tier, then return the actual server key.
+        local function storePotionQuantity(itemId, quantity)
+            if itemId == nil then return end
+            potionCounts[itemId] = tonumber(readItemQuantity(quantity)) or 0
+        end
+
+        local function mirrorInventoryItems(items)
+            if type(items) ~= "table" then return end
+            for itemId, quantity in pairs(items) do
+                if type(quantity) == "table" then
+                    local nestedItemId = readItemId(quantity, true)
+                    local nestedQuantity = readItemQuantity(quantity)
+                    if nestedItemId ~= nil and nestedQuantity ~= nil then
+                        storePotionQuantity(nestedItemId, nestedQuantity)
+                    elseif potionDetails(itemId) then
+                        storePotionQuantity(itemId, quantity)
+                    elseif itemId ~= "Items" and itemId ~= "Inventory"
+                        and itemId ~= "ItemsData" then
+                        mirrorInventoryItems(quantity)
+                    end
+                elseif itemId ~= "Items" and itemId ~= "Inventory"
+                    and itemId ~= "ItemsData" then
+                    storePotionQuantity(itemId, quantity)
+                end
+            end
+        end
+
         local function findInventoryPotion(preferredId)
             local preferredFamily, preferredTier = potionDetails(preferredId)
             if not preferredFamily then return nil, 0 end
@@ -3291,76 +3184,41 @@ do
             return nil, 0
         end
 
-        local function mirrorInventoryItems(items)
-            if type(items) ~= "table" then return end
-            for itemId, quantity in pairs(items) do
-                -- Inventory snapshots have appeared both as an item map and
-                -- as an array of {ItemId, Quantity} records.
-                if type(quantity) == "table" then
-                    local nestedItemId = readItemId(quantity, true)
-                    local nestedQuantity = readItemQuantity(quantity)
-                    if nestedItemId ~= nil and nestedQuantity ~= nil then
-                        storePotionQuantity(nestedItemId, nestedQuantity)
-                    elseif potionDetails(itemId) then
-                        -- Some snapshots use display-style item ids as the
-                        -- map key and put the count inside a nested record.
-                        storePotionQuantity(itemId, quantity)
-                    elseif itemId ~= "Items" and itemId ~= "Inventory"
-                        and itemId ~= "ItemsData" then
-                        -- Keep walking unknown containers.  This covers
-                        -- versions that wrap the item map one level deeper.
-                        mirrorInventoryItems(quantity)
-                    end
-                elseif itemId ~= "Items" and itemId ~= "Inventory"
-                    and itemId ~= "ItemsData" then
-                    storePotionQuantity(itemId, quantity)
-                end
-            end
-        end
-
         ItemsRE.OnClientEvent:Connect(function(action, data)
-            if (action == "FullInventory" or action == "InventoryUpdate")
-                and type(data) == "table" then
+            local actionName = string.lower(tostring(action or ""))
+            local isInventoryAction = actionName == "fullinventory"
+                or actionName == "inventoryupdate"
+                or actionName == "inventory"
+
+            if isInventoryAction and type(data) == "table" then
                 local snapshotItemId = readItemId(data, false)
+                if actionName == "fullinventory" then
+                    table.clear(potionCounts)
+                end
+
                 if snapshotItemId ~= nil then
-                    storePotionQuantity(snapshotItemId, readItemQuantity(data) or 0)
+                    storePotionQuantity(
+                        snapshotItemId,
+                        readItemQuantity(data) or 0
+                    )
                 else
                     local items = data.Items or data.Inventory or data.ItemsData
-                    if type(items) ~= "table" then
-                        -- Some game versions send the item map directly.
-                        items = data
-                    end
-                    if action == "FullInventory" then
-                        table.clear(potionCounts)
-                        table.clear(RuntimeState.potionInventoryCounts)
-                    end
-                    mirrorInventoryItems(items)
+                    mirrorInventoryItems(type(items) == "table" and items or data)
                 end
-                applyBoosts(data.Boosts)
-                RuntimeState.potionInventoryReceived = true
+                applyBoosts(data.Boosts or data.boosts)
                 pendingPotion = nil
 
-            elseif action == "ItemUpdate" and type(data) == "table" then
+            elseif actionName == "itemupdate" and type(data) == "table" then
                 storePotionQuantity(
                     readItemId(data, true),
                     readItemQuantity(data) or 0
                 )
 
-            elseif action == "BoostUpdate" then
+            elseif actionName == "boostupdate" then
                 applyBoosts(data)
                 pendingPotion = nil
-            elseif action == "UseOk" then
+            elseif actionName == "useok" or actionName == "usefailed" then
                 pendingPotion = nil
-                if RuntimeState.pendingTimePotion then
-                    RuntimeState.pendingTimePotion = nil
-                    RuntimeState.nextTimePotionUse = os.clock() + 2
-                end
-            elseif action == "UseFailed" then
-                pendingPotion = nil
-                if RuntimeState.pendingTimePotion then
-                    RuntimeState.pendingTimePotion = nil
-                    RuntimeState.nextTimePotionUse = os.clock() + 1
-                end
             end
         end)
 
@@ -3389,19 +3247,7 @@ do
                 local now = os.clock()
                 if now >= nextInventorySync then
                     pcall(function() ItemsRE:FireServer("Init") end)
-                    -- Keep requesting until the event handler has received a
-                    -- snapshot. This matters when the script is executed
-                    -- after the game's ItemsClient already initialized.
-                    nextInventorySync = now
-                        + (RuntimeState.potionInventoryReceived and 5 or 1)
-                end
-
-                if not RuntimeState.potionInventoryReceived then
-                    warnOnce(
-                        "AutoPotion:no-inventory-snapshot",
-                        "Auto Potion is waiting for ItemsRE FullInventory."
-                    )
-                    continue
+                    nextInventorySync = now + 5
                 end
 
                 if pendingPotion then
@@ -3419,7 +3265,6 @@ do
                         table.insert(candidates, {
                             configuredId = potion,
                             inventoryId = inventoryId,
-                            quantity = quantity,
                         })
                     end
                 end
@@ -3429,28 +3274,10 @@ do
                     return (leftTier or 0) > (rightTier or 0)
                 end)
 
-                if #candidates == 0 then
-                    warnOnce(
-                        "AutoPotion:no-selected-inventory-item",
-                        "Auto Potion found no selected potion in the inventory."
-                    )
-                end
-
                 for _, candidate in ipairs(candidates) do
                     local potion = candidate.configuredId
                     local inventoryId = candidate.inventoryId
-                    if not canUsePotion(potion) then
-                        warnOnce(
-                            "AutoPotion:blocked-" .. tostring(potion),
-                            "Auto Potion skipped " .. tostring(potion)
-                                .. " because an equal or stronger boost is active."
-                        )
-                        continue
-                    end
-                    -- Use one potion at a time.  This matches the reference
-                    -- client and lets the next inventory/boost update decide
-                    -- whether another potion is needed.
-                    local amount = 1
+                    if not canUsePotion(potion) then continue end
                     local family, tier = potionDetails(potion)
                     local active = family and activeBoosts[family]
                     local isTierReplacement = active
@@ -3459,18 +3286,17 @@ do
                         and tier > active.tier
                     pendingPotion = {
                         itemId = inventoryId,
-                        amount = amount,
                         startedAt = os.clock(),
                     }
                     local submitted = false
                     if isTierReplacement then
-                        submitted = usePotionThroughItemsUi(inventoryId, amount)
+                        submitted = usePotionThroughItemsUi(inventoryId)
                     end
                     if not submitted then
                         submitted = pcall(function()
                             ItemsRE:FireServer(
                                 "UseItem",
-                                { ItemId = inventoryId, Amount = amount }
+                                { ItemId = inventoryId, Amount = 1 }
                             )
                         end)
                     end
@@ -3500,14 +3326,13 @@ task.spawn(function()
         task.wait(0.5)
         if not Config.AutoClaimPlaytime or not PlayTimeRewardRE then continue end
         local now = os.clock()
-        if not RuntimeState.playtimeStateReceived
-            or now >= nextStateRequest then
+        if not playtimeStateReceived or now >= nextStateRequest then
             pcall(function() PlayTimeRewardRE:FireServer("RequestState") end)
             nextStateRequest = now + 10
         end
         for rewardIndex = 1, 12 do
-            if RuntimeState.playtimeReadyRewards[rewardIndex] then
-                RuntimeState.playtimeReadyRewards[rewardIndex] = nil
+            if playtimeReadyRewards[rewardIndex] then
+                playtimeReadyRewards[rewardIndex] = nil
                 pcall(function()
                     PlayTimeRewardRE:FireServer("ClaimReward", {
                         RewardIndex = rewardIndex,
@@ -3599,8 +3424,6 @@ end
 
 local function areAllCardSlotsOccupied()
     local slots = getAllCardSlots()
-    -- Plots can have fewer than 30 unlocked slots. Requiring exactly 30
-    -- made Auto Use Time Potion stay disabled on smaller full plots.
     if #slots == 0 then return false end
     for _, slot in ipairs(slots) do
         if not slotIsOccupied(slot) then
@@ -3652,123 +3475,13 @@ local function findSlotInteraction(slotModel, names)
     return nil
 end
 
-local function cooldownTextIsActive(value, namedField)
-    local text = string.lower(tostring(value or ""))
-    if text == "" then return false end
-    if string.find(text, "skip", 1, true) then return true end
-    if string.find(text, "ready", 1, true)
-        or string.find(text, "available", 1, true) then
-        return false
-    end
-
-    if namedField then
-        local minutes, seconds = string.match(text, "(%d+)%s*:%s*(%d%d)")
-        if minutes and seconds then
-            return tonumber(minutes) * 60 + tonumber(seconds) > 0
-        end
-
-        local numeric = tonumber(string.match(text, "^%s*(%d+%.?%d*)"))
-        if numeric then return numeric > 0 end
-    end
-
-    -- The reference game has used text such as "On Cooldown" and
-    -- "Remaining Time" in addition to a numeric countdown.
-    if namedField and (
-        string.find(text, "on cooldown", 1, true)
-            or string.find(text, "cooldown active", 1, true)
-            or string.find(text, "remaining", 1, true)
-    ) then
-        return true
-    end
-    return false
-end
-
-local function isCooldownFieldName(name)
-    local normalized = string.lower(tostring(name or ""))
-    normalized = string.gsub(normalized, "[^%w]", "")
-    for _, part in ipairs({
-        "cooldown", "cooldownremaining", "secondsleft", "timeleft",
-        "timer", "timeremaining", "remainingtime", "countdown",
-        "remaining",
-    }) do
-        if string.find(normalized, part, 1, true) then return true end
-    end
-    return false
-end
-
 local function slotIsOnCooldown(slotModel)
     if not slotModel then return false end
-
-    local function inspectAttributes(instance)
-        for name, value in pairs(instance:GetAttributes()) do
-            local field = isCooldownFieldName(name)
-            local lowerName = string.lower(tostring(name))
-            if field or string.find(lowerName, "isoncooldown", 1, true)
-                or string.find(lowerName, "cooldownactive", 1, true) then
-                if type(value) == "boolean" then
-                    if value then return true end
-                elseif cooldownTextIsActive(value, true) then
-                    return true
-                end
-            end
-        end
-        return false
-    end
-
-    if inspectAttributes(slotModel) then return true end
     for _, desc in ipairs(slotModel:GetDescendants()) do
-        if inspectAttributes(desc) then return true end
-
-        local field = isCooldownFieldName(desc.Name)
-        if desc:IsA("ValueBase") and field
-            and cooldownTextIsActive(desc.Value, true) then
-            return true
-        end
-
-        if desc:IsA("TextLabel") or desc:IsA("TextButton")
-            or desc:IsA("TextBox") then
-            if cooldownTextIsActive(desc.Text, field) then
+        if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+            if string.find(string.lower(desc.Text or ""), "skip", 1, true) then
                 return true
             end
-        elseif desc:IsA("ProximityPrompt") then
-            if cooldownTextIsActive(desc.ActionText, false)
-                or cooldownTextIsActive(desc.ObjectText, false) then
-                return true
-            end
-        end
-    end
-    return false
-end
-
-local function hasCardCooldownToSkip()
-    local function promptIsSkip(prompt)
-        if not prompt or not prompt:IsA("ProximityPrompt")
-            or prompt.Enabled == false then
-            return false
-        end
-
-        local text = string.lower(table.concat({
-            tostring(prompt.Name or ""),
-            tostring(prompt.ActionText or ""),
-            tostring(prompt.ObjectText or ""),
-        }, " "))
-        return string.find(text, "skip", 1, true) ~= nil
-    end
-
-    -- The live game has moved the Skip prompt between the slot model and
-    -- the plot-level interaction holder.  Check the actual prompt first so
-    -- one ready-to-skip pack is enough; a completely full plot is not
-    -- required for this feature.
-    local plot = findPlot(Config.PlotNumber)
-    if plot then
-        for _, desc in ipairs(plot:GetDescendants()) do
-            if promptIsSkip(desc) then return true end
-        end
-    end
-
-    for _, slot in ipairs(getAllCardSlots()) do
-        if slotIsOccupied(slot) and slotIsOnCooldown(slot) then
-            return true
         end
     end
     return false
@@ -4423,11 +4136,11 @@ end)
 task.spawn(function()
     while true do
         task.wait(0.15)
-        -- Trait and ranking rerolls use separate remotes and may run at the
-        -- same time.  Do not use ActiveAutoRoll or the other script toggle as
-        -- a shared mutex: the game's built-in auto-roll uses that attribute
-        -- to coordinate only its own two UI workers.
-        if not Config.AutoTraitRoll then
+        -- Card Ranking always owns the reroll worker first. Traits starts
+        -- automatically after ranking has been stopped/completed.
+        if not Config.AutoTraitRoll
+            or Config.AutoRankRoll
+            or rankRollPending then
             continue
         end
         if not TraitRollRE then
@@ -4450,10 +4163,10 @@ task.spawn(function()
         local progressed = false
         local cardsRemaining = false
         for _, tool in ipairs(cards) do
-            if not Config.AutoTraitRoll then break end
+            if not Config.AutoTraitRoll or Config.AutoRankRoll then break end
             if not tool.Parent then continue end
-            while Config.AutoTraitRoll and tool.Parent
-                and not traitHasTarget(tool) do
+            while Config.AutoTraitRoll and not Config.AutoRankRoll
+                and tool.Parent and not traitHasTarget(tool) do
                 cardsRemaining = true
                 local gemCost = getTraitGemsCost()
                 if getTraitGems() < gemCost then
@@ -4469,8 +4182,8 @@ task.spawn(function()
                 end)
 
                 local deadline = os.clock() + 8
-                while Config.AutoTraitRoll and traitRollPending
-                    and not traitRollResponse
+                while Config.AutoTraitRoll and not Config.AutoRankRoll
+                    and traitRollPending and not traitRollResponse
                     and os.clock() < deadline do
                     task.wait(0.1)
                 end
@@ -4580,18 +4293,13 @@ task.spawn(function()
 end)
 
 -- ── Auto Use Time Potion ──────────────────────────────────────
--- Time potions are not category boosts.  They are handled separately from
--- Misc > Auto Use Potions and are used whenever this toggle is enabled.
+-- Time potions are separate from category boosts and are used whenever the
+-- user enables this toggle.  Do not require Auto Place, Auto Open, full
+-- slots, proximity, or a visible Skip prompt.
 task.spawn(function()
-    -- Inventory item ids have used both compact ids (TimePotion3) and
-    -- display-style ids (Time Potion III) across game revisions. Keep the
-    -- configured compact names, but send the exact key received from server.
     local function normalizePotionInventoryId(value)
         local text = string.lower(tostring(value or ""))
         text = string.gsub(text, "[^%w]", "")
-        -- The inventory has used both "TimePotion3" and display-style
-        -- keys such as "Time III". Removing "potion" lets both forms
-        -- resolve to the same canonical key (time3).
         text = string.gsub(text, "potion", "")
         if string.sub(text, -3) == "iii" then
             text = string.sub(text, 1, -4) .. "3"
@@ -4616,14 +4324,12 @@ task.spawn(function()
 
     local function findPotionInventoryItem(preferredId)
         local preferredKey = normalizePotionInventoryId(preferredId)
-        local directQuantity = inventoryQuantity(
-            RuntimeState.potionInventoryCounts[preferredId]
-        )
+        local directQuantity = inventoryQuantity(potionInventoryCounts[preferredId])
         if directQuantity > 0 then
             return preferredId, directQuantity
         end
 
-        for itemId, quantity in pairs(RuntimeState.potionInventoryCounts) do
+        for itemId, quantity in pairs(potionInventoryCounts) do
             local amount = inventoryQuantity(quantity)
             if amount > 0
                 and normalizePotionInventoryId(itemId) == preferredKey then
@@ -4637,21 +4343,17 @@ task.spawn(function()
     while true do
         task.wait(1)
         if not Config.AutoTimePotion then
-            RuntimeState.pendingTimePotion = nil
+            nextTimePotionUse = 0
             continue
         end
         if not ItemsREForAutomation then continue end
 
         local now = os.clock()
-        -- Keep this feature independent from Misc > Auto Use Potions. The
-        -- time-potion toggle can be enabled by itself and still receives
-        -- current inventory data.
         if now >= nextInventorySync then
             pcall(function() ItemsREForAutomation:FireServer("Init") end)
             nextInventorySync = now + 5
         end
-
-        if now < RuntimeState.nextTimePotionUse then continue end
+        if now < nextTimePotionUse then continue end
 
         local selectedPotion
         for _, potion in ipairs(TIME_POTIONS) do
@@ -4669,19 +4371,9 @@ task.spawn(function()
                 Amount = 1,
             })
         end)
-        if submitted then
-            -- A successful pcall only means the client sent the request. Wait
-            -- for UseOk/UseFailed when available, with a timeout for versions
-            -- that do not echo those actions.
-            RuntimeState.pendingTimePotion = {
-                itemId = selectedPotion,
-                sentAt = os.clock(),
-            }
-            RuntimeState.nextTimePotionUse = os.clock() + 4
-        else
-            RuntimeState.pendingTimePotion = nil
-            RuntimeState.nextTimePotionUse = os.clock() + 1
-        end
+        -- A successful pcall only means the request was sent. Keep a delay
+        -- between attempts so a slow server cannot receive duplicate uses.
+        nextTimePotionUse = os.clock() + (submitted and 4 or 1)
     end
 end)
 
@@ -4833,7 +4525,6 @@ end
 -- ── Combat GUI helpers ───────────────────────────────────────
 local function isGuiActuallyVisible(instance)
     if not instance then return false end
-
     local current = instance
     while current and current ~= playerGui do
         if current:IsA("GuiObject") and current.Visible ~= true then
@@ -4849,19 +4540,6 @@ end
 
 local function findGuiByName(root, wantedName)
     if not root then return nil end
-    if root.Name == wantedName then
-        if isGuiActuallyVisible(root) then return root end
-    end
-    for _, descendant in ipairs(root:GetDescendants()) do
-        if descendant.Name == wantedName then
-            if isGuiActuallyVisible(descendant) then
-                return descendant
-            end
-        end
-    end
-    -- A few client builds changed only the casing of combat controls
-    -- (for example Battle/BATTLE). Keep the visibility check, but do not
-    -- make the automation depend on that cosmetic difference.
     local wantedLower = string.lower(tostring(wantedName))
     if string.lower(tostring(root.Name)) == wantedLower
         and isGuiActuallyVisible(root) then
@@ -4873,8 +4551,6 @@ local function findGuiByName(root, wantedName)
             return descendant
         end
     end
-    -- Do not return a hidden duplicate. Callers use nil to try the next
-    -- candidate panel or to wait for the live UI state.
     return nil
 end
 
@@ -4899,9 +4575,7 @@ end
 clickGuiButton = function(button)
     if not button then return false end
     if not button:IsA("GuiButton") then
-        -- Difficulty entries and some combat controls are Frames whose
-        -- clickable child is named FrameButton. The old code rejected the
-        -- Frame before it could reach that child.
+        -- Some combat entries are Frames with a clickable FrameButton child.
         local namedButton = button:FindFirstChild("FrameButton", true)
         if namedButton and namedButton:IsA("GuiButton") then
             button = namedButton
@@ -4914,11 +4588,11 @@ clickGuiButton = function(button)
             end
         end
     end
-    if not button or not button:IsA("GuiButton") then return false end
-    -- Do not fire hidden duplicate buttons. Combat screens keep several
-    -- copies of Exit/Battle controls in the hierarchy across UI states.
-    if not isGuiActuallyVisible(button) then return false end
-    if button.Active == false then return false end
+    if not button or not button:IsA("GuiButton")
+        or not isGuiActuallyVisible(button)
+        or button.Active == false then
+        return false
+    end
     if firesignal then
         local signal
         if button:IsA("TextButton") or button:IsA("ImageButton") then
@@ -4933,8 +4607,10 @@ end
 -- Shared helper: find BossRaidReward root and its CLOSE button.
 local function getRewardCloseButton()
     local guiMid = playerGui:FindFirstChild("GuiMid")
-    local root = guiMid and findGuiByName(guiMid, "BossRaidReward")
-    if not root then root = findGuiByName(playerGui, "BossRaidReward") end
+    local root = guiMid and guiMid:FindFirstChild("BossRaidReward", true)
+    if not root then
+        root = playerGui:FindFirstChild("BossRaidReward", true)
+    end
     if not root then return nil, nil end
     -- Confirmed from BossRaidRewardClient:
     -- BossRaidReward.RaidFrameReward.TOP.CLOSE
@@ -4995,9 +4671,8 @@ local function clickCombatButton(mode, names)
             end
         end
 
-        -- Some versions name every clickable entry FrameButton and expose
-        -- the action only through the button text or its parent frame name.
-        -- Resolve those controls without reading Text from ImageButtons.
+        -- Some builds name controls generically and expose the action through
+        -- the button text or a parent frame name instead.
         for _, descendant in ipairs(root:GetDescendants()) do
             if descendant:IsA("GuiButton") then
                 local labels = {
@@ -5015,10 +4690,9 @@ local function clickCombatButton(mode, names)
                 for _, wanted in ipairs(names) do
                     local needle = string.lower(tostring(wanted))
                     for _, label in ipairs(labels) do
-                        if label == needle or string.find(label, needle, 1, true) then
-                            if clickGuiButton(descendant) then
-                                return true
-                            end
+                        if label == needle
+                            or string.find(label, needle, 1, true) then
+                            if clickGuiButton(descendant) then return true end
                             break
                         end
                     end
@@ -5065,19 +4739,15 @@ exitInfinityTowerBattle = function()
             -- expose "Exit" through its Text property.
             for _, descendant in ipairs(root:GetDescendants()) do
                 if descendant:IsA("GuiButton") then
-                    -- ImageButton does not expose Text.  The old direct read
-                    -- here raised the exact runtime error that stopped the
-                    -- combat scheduler during an Infinity Tower run.
+                    -- ImageButton has no Text property. Reading it directly
+                    -- caused the combat scheduler to stop on some clients.
                     local text
                     if descendant:IsA("TextButton") then
                         text = string.lower(tostring(descendant.Text or ""))
                     end
-                    if text then
-                        text = text:gsub("^%s*(.-)%s*$", "%1")
-                        if text == "exit" or text == "leave" or text == "quit" then
-                            if clickGuiButton(descendant) then
-                                return true
-                            end
+                    if text == "exit" or text == "leave" or text == "quit" then
+                        if clickGuiButton(descendant) then
+                            return true
                         end
                     end
                 end
@@ -5094,10 +4764,8 @@ local function selectRaidDifficulty(difficulty)
     local difficultyFrame = findGuiByName(root, "DifficultyFrame") or root
     local scrolling = findGuiByName(difficultyFrame, "ScrollingFrameDifficulty")
         or difficultyFrame
-    local choice = scrolling:FindFirstChild(tostring(difficulty))
-    if not choice then
-        choice = findGuiByName(scrolling, tostring(difficulty))
-    end
+    local choice = findGuiByName(scrolling, tostring(difficulty))
+        or scrolling:FindFirstChild(tostring(difficulty))
     if not choice then return false end
 
     local button = findGuiByName(choice, "FrameButton") or choice
@@ -5136,39 +4804,18 @@ local function getRaidDifficultyOptions()
     return options
 end
 
-local RaidState = {
-    -- Keep known defaults available even before the Boss Raid panel has
-    -- replicated. A UI scan at script startup can otherwise return only
-    -- "Normal" and make the default Easy selection look invalid.
-    difficultyOptions = { "Easy", "Medium", "Hard", "Nightmare" },
-    completedDifficulties = {},
-    -- Boss Raid grants one attempt per hourly window. Keep the feature
-    -- enabled after the first click, but latch the attempt so polling loops
-    -- cannot click again until the next window is detected.
-    attemptConsumed = false,
-    closedSince = nil,
-    difficultyInfo = {
-        Easy = {
-            damage = "2.1B",
-            description = "At least 2.1B damage per card.",
-        },
-        Medium = {
-            damage = "412.9Qn",
-            description = "At least 412.9Qn damage per card.",
-        },
-        Hard = {
-            damage = "617.7O",
-            description = "At least 617.7O damage per card.",
-        },
-        Nightmare = {
-            damage = "13.1O",
-            description = "At least 13.1O damage per card.",
-        },
-    },
-    infoParagraph = nil,
-    timerText = "Searching for Boss Raid timer...",
-    serverOpen = nil,
-}
+local raidDifficultyOptions = { "Easy", "Medium", "Hard", "Nightmare" }
+local raidDifficultySet = {}
+for _, difficulty in ipairs(raidDifficultyOptions) do
+    raidDifficultySet[difficulty] = true
+end
+local completedRaidDifficulties = {}
+-- Boss Raid grants one attempt per hourly window. Keep the feature enabled
+-- after the first click, but latch the attempt so the polling loops cannot
+-- click again until the next window is detected.
+local raidAttemptConsumed = false
+local raidClosedSince = nil
+
 local function normalizeRaidDifficulties(value)
     local selected = {}
     local selectedSet = {}
@@ -5191,7 +4838,7 @@ local function getSelectedRaidDifficulties()
     end
 
     local ordered = {}
-    for _, difficulty in ipairs(RaidState.difficultyOptions) do
+    for _, difficulty in ipairs(raidDifficultyOptions) do
         if selectedSet[difficulty] then
             table.insert(ordered, difficulty)
         end
@@ -5201,7 +4848,7 @@ end
 
 local function getNextRaidDifficulty()
     for _, difficulty in ipairs(getSelectedRaidDifficulties()) do
-        if not RaidState.completedDifficulties[difficulty] then
+        if not completedRaidDifficulties[difficulty] then
             return difficulty
         end
     end
@@ -5209,8 +4856,8 @@ local function getNextRaidDifficulty()
 end
 
 local function clearCompletedRaidDifficulties()
-    for difficulty in pairs(RaidState.completedDifficulties) do
-        RaidState.completedDifficulties[difficulty] = nil
+    for difficulty in pairs(completedRaidDifficulties) do
+        completedRaidDifficulties[difficulty] = nil
     end
 end
 
@@ -5218,10 +4865,10 @@ local function getRaidRequirement(difficulty)
     if not BossRaidConfig or not BossRaidConfig.GetBossStats then
         return nil
     end
-    if RuntimeState.currentRaidBossId == "" then return nil end
+    if currentRaidBossId == "" then return nil end
     local ok, stats = pcall(
         BossRaidConfig.GetBossStats,
-        RuntimeState.currentRaidBossId,
+        currentRaidBossId,
         difficulty
     )
     if ok and type(stats) == "table" then
@@ -5230,9 +4877,31 @@ local function getRaidRequirement(difficulty)
     return nil
 end
 
+local RAID_DIFFICULTY_INFO = {
+    Easy = {
+        damage = "1.3B",
+        description = "At least 1.3B damage per card.",
+    },
+    Medium = {
+        damage = "24.4Qn",
+        description = "At least 24.4Qn damage per card.",
+    },
+    Hard = {
+        damage = "4.7O",
+        description = "At least 4.7O damage per card.",
+    },
+    Nightmare = {
+        damage = "13.1O",
+        description = "At least 13.1O damage per card.",
+    },
+}
+
+local raidInfoParagraph
+local raidTimerText = "Searching for Boss Raid timer..."
+
 local function getRaidDifficultyInfo(difficulty)
     local wanted = string.lower(tostring(difficulty or ""))
-    for name, info in pairs(RaidState.difficultyInfo) do
+    for name, info in pairs(RAID_DIFFICULTY_INFO) do
         if string.lower(name) == wanted then
             return info
         end
@@ -5241,9 +4910,7 @@ local function getRaidDifficultyInfo(difficulty)
 end
 
 local function updateRaidInfoDisplay(difficulties)
-    if not RaidState.infoParagraph or not RaidState.infoParagraph.Set then
-        return
-    end
+    if not raidInfoParagraph or not raidInfoParagraph.Set then return end
 
     local selected = getSelectedRaidDifficulties()
 
@@ -5258,10 +4925,10 @@ local function updateRaidInfoDisplay(difficulties)
             )
         end
     end
-    table.insert(lines, "Timer: " .. RaidState.timerText)
+    table.insert(lines, "Timer: " .. raidTimerText)
 
     pcall(function()
-        RaidState.infoParagraph:Set({
+        raidInfoParagraph:Set({
             Title = "Boss Raid",
             Content = table.concat(lines, "\n"),
         })
@@ -5280,13 +4947,13 @@ end
 if BossRaidRE then
     BossRaidRE.OnClientEvent:Connect(function(eventName, payload)
         if eventName == "State" and type(payload) == "table" then
-            RuntimeState.currentRaidBossId = tostring(payload.BossId or "")
+            currentRaidBossId = tostring(payload.BossId or "")
             for _, field in ipairs({
                 "Open", "IsOpen", "Available", "IsAvailable",
                 "CanEnter", "Active",
             }) do
                 if type(payload[field]) == "boolean" then
-                    RaidState.serverOpen = payload[field]
+                    raidServerOpen = payload[field]
                     break
                 end
             end
@@ -5326,7 +4993,7 @@ local function readRaidTimerText(timer)
     return nil
 end
 
-function findBossRaidTimer()
+local function findBossRaidTimer()
     local roots = {
         workspace:FindFirstChild("BossRaidModel", true),
         workspace:FindFirstChild("BossRaid", true),
@@ -5334,13 +5001,11 @@ function findBossRaidTimer()
         playerGui:FindFirstChild("BossRaidGui", true),
         getCombatGui("BossRaid"),
     }
-    local timerNames = {
-        "Timer", "TimeLeft", "TimeRemaining", "Countdown",
-    }
-
     for _, root in ipairs(roots) do
         if root then
-            for _, name in ipairs(timerNames) do
+            for _, name in ipairs({
+                "Timer", "TimeLeft", "TimeRemaining", "Countdown",
+            }) do
                 local timer = findGuiByName(root, name)
                     or root:FindFirstChild(name, true)
                 if timer then return timer end
@@ -5350,81 +5015,102 @@ function findBossRaidTimer()
     return nil
 end
 
-function isBossRaidOpen()
-    if RaidState.serverOpen ~= nil then
-        return RaidState.serverOpen == true
+local function isBossRaidOpen()
+    if raidServerOpen ~= nil then
+        return raidServerOpen == true
     end
 
-    -- Use the timer shown by the live Boss Raid UI, but accept the wording
-    -- used by the different client builds. The old exact "end in" match made
-    -- Combat silently do nothing when the UI said "Ends in" or displayed
-    -- only a numeric countdown.
-    local text = string.lower(tostring(RaidState.timerText or ""))
-    if text == "" then return false end
-    if string.find(text, "unavailable", 1, true)
-        or string.find(text, "not available", 1, true)
-        or string.find(text, "closed", 1, true)
-        or string.find(text, "starts in", 1, true)
-        or string.find(text, "next raid", 1, true) then
+    local timer = findBossRaidTimer()
+    local text = readRaidTimerText(timer)
+    if not text then return false end
+
+    local normalized = string.lower(text)
+    if string.find(normalized, "unavailable", 1, true)
+        or string.find(normalized, "not available", 1, true)
+        or string.find(normalized, "closed", 1, true)
+        or string.find(normalized, "starts in", 1, true)
+        or string.find(normalized, "next raid", 1, true) then
         return false
     end
-    if string.find(text, "end in", 1, true)
-        or string.find(text, "ends in", 1, true)
-        or string.find(text, "open", 1, true)
-        or string.find(text, "active", 1, true)
-        or string.find(text, "ready", 1, true) then
+    if string.find(normalized, "end in", 1, true)
+        or string.find(normalized, "ends in", 1, true)
+        or string.find(normalized, "open", 1, true)
+        or string.find(normalized, "active", 1, true)
+        or string.find(normalized, "ready", 1, true) then
         return true
     end
 
     local hours, minutes, seconds = string.match(
-        text, "(%d+)%s*:%s*(%d+)%s*:%s*(%d+)"
+        normalized, "(%d+)%s*:%s*(%d+)%s*:%s*(%d+)"
     )
     if hours and minutes and seconds then
         return tonumber(hours) + tonumber(minutes) + tonumber(seconds) > 0
     end
-    minutes, seconds = string.match(text, "(%d+)%s*:%s*(%d+)")
+    minutes, seconds = string.match(normalized, "(%d+)%s*:%s*(%d+)")
     if minutes and seconds then
         return tonumber(minutes) + tonumber(seconds) > 0
     end
-    local numeric = tonumber(string.match(text, "^%s*(%d+%.?%d*)%s*$"))
-    if numeric then
-        return numeric > 0
+    local numeric = tonumber(string.match(normalized, "^%s*(%d+%.?%d*)%s*$"))
+    return numeric ~= nil and numeric > 0
+end
+
+local function resetRaidAttemptAfterClosedWindow()
+    if isBossRaidOpen() then
+        raidClosedSince = nil
+        return
     end
-    return false
+
+    local now = os.clock()
+    raidClosedSince = raidClosedSince or now
+    -- Require a stable closed state before re-arming. This avoids a brief
+    -- timer/UI replication gap reopening the same hourly attempt.
+    if now - raidClosedSince >= 3 then
+        raidAttemptConsumed = false
+        clearCompletedRaidDifficulties()
+    end
 end
 
 task.spawn(function()
     while true do
         task.wait(0.5)
+        resetRaidAttemptAfterClosedWindow()
         local timer = findBossRaidTimer()
         local text = readRaidTimerText(timer)
         if text and text ~= "" then
-            RaidState.timerText = text
+            raidTimerText = text
         elseif timer then
-            RaidState.timerText = "Timer found, waiting for countdown..."
+            raidTimerText = "Timer found, waiting for countdown..."
         else
-            RaidState.timerText = "Boss Raid is currently unavailable"
+            raidTimerText = "Boss Raid is currently unavailable"
         end
-
-        -- Update the shared description value before checking readiness. The
-        -- scheduler and the visible Boss Raid description now read the same
-        -- timer text on every pass.
-        if isBossRaidOpen() then
-            RaidState.closedSince = nil
-        else
-            local now = os.clock()
-            RaidState.closedSince = RaidState.closedSince or now
-            -- Require a stable closed state before re-arming. This avoids a brief
-            -- timer/UI replication gap reopening the same hourly attempt.
-            if now - RaidState.closedSince >= 3 then
-                RaidState.attemptConsumed = false
-                clearCompletedRaidDifficulties()
-            end
-        end
-
         updateRaidInfoDisplay(Config.RaidDifficulties)
     end
 end)
+
+local function clickBackpackEquipBest()
+    return doEquipBestCards(4) ~= nil
+end
+
+local function equipBestCardsWithRetry()
+    for _ = 1, 2 do
+        local placed = doEquipBestCards(4)
+        if placed and placed > 0 then
+            return true
+        end
+        task.wait(CARD_REMOVAL_DELAY)
+    end
+    return false
+end
+
+local function waitForBossRaidConfirmation()
+    for _ = 1, 20 do
+        if player:GetAttribute("BossRaidInBattle") == true then
+            return true
+        end
+        task.wait(0.15)
+    end
+    return false
+end
 
 startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     -- BossRaidRewardClient claims the reward from its CLOSE button. Never
@@ -5435,7 +5121,7 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     if mode == "BossRaid" and not isBossRaidOpen() then
         return false
     end
-    if mode == "BossRaid" and RaidState.attemptConsumed then
+    if mode == "BossRaid" and raidAttemptConsumed then
         return false
     end
 
@@ -5456,7 +5142,7 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     end
     if isCombatActive() then return false end
 
-    if equipBest or mode == "InfinityTower" then
+    if equipBest then
         local names = mode == "BossRaid"
             and { "EQUIPBEST", "EquipBest", "EQUIPEBEST" }
             or { "EQUIPEBEST", "EQUIPBEST", "EquipBest" }
@@ -5468,7 +5154,7 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     if mode == "BossRaid" then
         raidDifficulty = difficulty or getNextRaidDifficulty()
         if not raidDifficulty then return false end
-        selectRaidDifficulty(raidDifficulty)
+        if not selectRaidDifficulty(raidDifficulty) then return false end
         task.wait(0.25)
     end
 
@@ -5479,17 +5165,9 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
         -- Consume the hourly attempt as soon as the battle button is clicked.
         -- Do not wait for the battle attribute: a rejected/failed start must
         -- not cause the polling loop to spam the server repeatedly.
-        RaidState.attemptConsumed = true
-        local raidConfirmed = false
-        for _ = 1, 20 do
-            if player:GetAttribute("BossRaidInBattle") == true then
-                raidConfirmed = true
-                break
-            end
-            task.wait(0.15)
-        end
-        if raidConfirmed then
-            RaidState.completedDifficulties[raidDifficulty] = true
+        raidAttemptConsumed = true
+        if waitForBossRaidConfirmation() then
+            completedRaidDifficulties[raidDifficulty] = true
         else
             return false
         end
@@ -5506,7 +5184,7 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     return true
 end
 
-combatBusy = false
+local combatBusy = false
 
 -- One scheduler owns both modes.  Boss Raid is evaluated first on every
 -- pass, including while Tower is active, so "End in" cannot be missed.
@@ -5517,7 +5195,7 @@ task.spawn(function()
 
         local raidReady = Config.AutoRaid
             and isBossRaidOpen()
-            and not RaidState.attemptConsumed
+            and not raidAttemptConsumed
             and getNextRaidDifficulty() ~= nil
         local towerEnabled = Config.AutoInfinityTower
         local towerActive = player:GetAttribute("InfinityTowerInBattle") == true
@@ -5538,16 +5216,7 @@ task.spawn(function()
 
             if not isCombatActive() then
                 if Config.AutoTeamCardCycle then
-                    local cardsEquipped = false
-                    for _ = 1, 2 do
-                        local placed = doEquipBestCards(4)
-                        if placed and placed > 0 then
-                            cardsEquipped = true
-                            break
-                        end
-                        task.wait(CARD_REMOVAL_DELAY)
-                    end
-                    if cardsEquipped then
+                    if equipBestCardsWithRetry() then
                         startCombatBattle(
                             "BossRaid",
                             Config.AutoRaidEquip,
@@ -5570,16 +5239,7 @@ task.spawn(function()
         if towerEnabled and not isCombatActive() then
             combatBusy = true
             if Config.AutoTeamCardCycle then
-                local cardsEquipped = false
-                for _ = 1, 2 do
-                    local placed = doEquipBestCards(4)
-                    if placed and placed > 0 then
-                        cardsEquipped = true
-                        break
-                    end
-                    task.wait(CARD_REMOVAL_DELAY)
-                end
-                if cardsEquipped then
+                if equipBestCardsWithRetry() then
                     startCombatBattle(
                         "InfinityTower",
                         Config.AutoInfinityEquip,
@@ -5605,7 +5265,7 @@ end)
 -- Luau limits the number of local registers in the top-level chunk; without
 -- this boundary the many UI controls added below make the whole script fail
 -- during compilation with "Out of local registers".
-function buildUserInterface()
+local function buildUserInterface()
 
 local ConfigManager = {
     ConfigName        = "",
@@ -5679,6 +5339,7 @@ local function buildSerializableConfig()
         AutoUpgrade       = Config.AutoUpgrade,
         UpgradeDelay      = Config.UpgradeDelay,
         CardActionDelay   = Config.CardActionDelay,
+        AutoSell          = Config.AutoSell,
         AutoTraitRoll     = Config.AutoTraitRoll,
         SelectedRankCards  = Config.SelectedRankCards,
         TargetRank         = Config.TargetRank,
@@ -5826,7 +5487,7 @@ local function loadConfig(name, isAutoload)
         "AutoSpawnPack", "SpawnDelay", "AutoStopSpawn", "AutoBuyMatching",
         "AutoCarryBox", "AutoSellBox", "AutoSellDelay",
         "SelectedRarities", "SelectedMutations", "SelectedPacks",
-        "AutoUpgrade", "UpgradeDelay", "CardActionDelay",
+        "AutoUpgrade", "UpgradeDelay", "CardActionDelay", "AutoSell",
         "AutoTraitRoll", "SelectedRankCards", "TargetRank",
         "SelectedTraitCards", "TargetTraits",
         "RankUseGems", "RankUseCash", "AutoRankRoll",
@@ -5966,10 +5627,7 @@ Controls.AutoSpawnPack = spawnTab:CreateToggle({
     Flag         = "AutoSpawnPack",
     Callback     = function(v)
         Config.AutoSpawnPack = v
-        if v then
-            autoStopHandled = false
-            autoStopWatcherActive = false
-        end
+        if v then autoStopHandled = false end   -- reset guard on manual re-enable
     end,
 })
 
@@ -5987,15 +5645,7 @@ Controls.AutoStopSpawn = spawnTab:CreateToggle({
     Name         = "Auto Stop Spawn (on Filter Match)",
     CurrentValue = Config.AutoStopSpawn,
     Flag         = "AutoStopSpawn",
-    Callback     = function(v)
-        Config.AutoStopSpawn = v
-        if v then
-            -- Re-enabling Auto Stop after a previous match must arm a fresh
-            -- watcher instead of inheriting the old stop guard.
-            autoStopHandled = false
-            autoStopWatcherActive = false
-        end
-    end,
+    Callback     = function(v) Config.AutoStopSpawn = v end,
 })
 
 Controls.AutoBuyMatching = spawnTab:CreateToggle({
@@ -6073,7 +5723,7 @@ Controls.SelectedMutations = spawnTab:CreateDropdown({
 -- ══════════════════════════════════════════════════════════════
 --  TAB 2 – Cards
 -- ══════════════════════════════════════════════════════════════
-local cardsTab = Window:CreateTab("🃏 Cards", 0)
+local cardsTab = Window:CreateTab("⬆️ Cards", 0)
 
 cardsTab:CreateSection("Card Management")
 
@@ -6102,22 +5752,13 @@ Controls.AutoTimePotion = cardsTab:CreateToggle({
     Flag         = "AutoTimePotion",
     Callback     = function(v)
         Config.AutoTimePotion = v
-        if v then
-            RuntimeState.pendingTimePotion = nil
-            RuntimeState.nextTimePotionUse = 0
-        end
+        if v then nextTimePotionUse = 0 end
     end,
 })
 
-cardsTab:CreateButton({
-    Name     = "Equip Best Cards",
-    Callback = function()
-        local ok = fireRemote("CardSlotRE", "EquipBest")
-        notify(
-            "Equip Best Cards",
-            ok and "Equip Best request sent." or "Could not send Equip Best request."
-        )
-    end,
+cardsTab:CreateParagraph({
+    Title   = "Auto Time Potion behavior",
+    Content = "When enabled, the strongest available Time Potion is used automatically. It does not require Auto Place, Auto Open, full slots, proximity, or a visible Skip prompt.",
 })
 
 cardsTab:CreateButton({
@@ -6159,166 +5800,10 @@ Controls.UpgradeDelay = cardsTab:CreateSlider({
     Callback     = function(v) Config.UpgradeDelay = v end,
 })
 
-local sellConfirmationGui
-
-local function closeSellConfirmation()
-    if sellConfirmationGui then
-        pcall(function() sellConfirmationGui:Destroy() end)
-        sellConfirmationGui = nil
-    end
-end
-
-local function confirmSellAction(label, action)
-    closeSellConfirmation()
-
-    local messageByAction = {
-        SellAll = "Are you sure you want to sell all?",
-        SellCards = "Are you sure you want to sell all cards?",
-        SellPacks = "Are you sure you want to sell all packs?",
-    }
-
-    local confirmationGui = Instance.new("ScreenGui")
-    confirmationGui.Name = "JYH_SellConfirmation"
-    confirmationGui.DisplayOrder = 10000
-    confirmationGui.ResetOnSpawn = false
-    confirmationGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    confirmationGui.Parent = playerGui
-    sellConfirmationGui = confirmationGui
-
-    local overlay = Instance.new("Frame")
-    overlay.Name = "Overlay"
-    overlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-    overlay.BackgroundTransparency = 0.45
-    overlay.BorderSizePixel = 0
-    overlay.Size = UDim2.fromScale(1, 1)
-    overlay.Parent = confirmationGui
-
-    local panel = Instance.new("Frame")
-    panel.Name = "Panel"
-    panel.AnchorPoint = Vector2.new(0.5, 0.5)
-    panel.Position = UDim2.fromScale(0.5, 0.5)
-    panel.Size = UDim2.fromOffset(360, 170)
-    panel.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
-    panel.BorderSizePixel = 0
-    panel.Parent = overlay
-
-    local panelCorner = Instance.new("UICorner")
-    panelCorner.CornerRadius = UDim.new(0, 10)
-    panelCorner.Parent = panel
-
-    local title = Instance.new("TextLabel")
-    title.Name = "Title"
-    title.BackgroundTransparency = 1
-    title.Position = UDim2.fromOffset(20, 16)
-    title.Size = UDim2.new(1, -40, 0, 28)
-    title.Font = Enum.Font.GothamBold
-    title.Text = "Confirm sale"
-    title.TextColor3 = Color3.fromRGB(255, 255, 255)
-    title.TextSize = 20
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = panel
-
-    local message = Instance.new("TextLabel")
-    message.Name = "Message"
-    message.BackgroundTransparency = 1
-    message.Position = UDim2.fromOffset(20, 52)
-    message.Size = UDim2.new(1, -40, 0, 40)
-    message.Font = Enum.Font.Gotham
-    message.Text = messageByAction[action] or ("Are you sure you want to " .. label .. "?")
-    message.TextColor3 = Color3.fromRGB(220, 220, 225)
-    message.TextSize = 16
-    message.TextWrapped = true
-    message.TextXAlignment = Enum.TextXAlignment.Left
-    message.Parent = panel
-
-    local function makeButton(name, text, color, position)
-        local button = Instance.new("TextButton")
-        button.Name = name
-        button.Position = position
-        button.Size = UDim2.fromOffset(145, 38)
-        button.BackgroundColor3 = color
-        button.BorderSizePixel = 0
-        button.Font = Enum.Font.GothamBold
-        button.Text = text
-        button.TextColor3 = Color3.fromRGB(255, 255, 255)
-        button.TextSize = 16
-        button.Parent = panel
-
-        local corner = Instance.new("UICorner")
-        corner.CornerRadius = UDim.new(0, 7)
-        corner.Parent = button
-        return button
-    end
-
-    local noButton = makeButton(
-        "No",
-        "No",
-        Color3.fromRGB(75, 75, 85),
-        UDim2.new(0, 20, 1, -54)
-    )
-    local yesButton = makeButton(
-        "Yes",
-        "Yes",
-        Color3.fromRGB(205, 65, 75),
-        UDim2.new(1, -165, 1, -54)
-    )
-
-    local finished = false
-    local function finish(confirmed)
-        if finished then return end
-        finished = true
-        closeSellConfirmation()
-        if not confirmed then return end
-
-        local ok = fireRemote("SellRE", action)
-        notify(
-            label,
-            ok and "Sell request sent." or "Could not send sell request."
-        )
-    end
-
-    yesButton.Activated:Connect(function() finish(true) end)
-    noButton.Activated:Connect(function() finish(false) end)
-end
-
-cardsTab:CreateSection("Sell")
-
-cardsTab:CreateButton({
-    Name     = "Auto Sell All",
-    Callback = function()
-        confirmSellAction("Auto Sell All", "SellAll")
-    end,
-})
-
-cardsTab:CreateButton({
-    Name     = "Auto Sell Cards",
-    Callback = function()
-        confirmSellAction("Auto Sell Cards", "SellCards")
-    end,
-})
-
-cardsTab:CreateButton({
-    Name     = "Auto Sell Packs",
-    Callback = function()
-        confirmSellAction("Auto Sell Packs", "SellPacks")
-    end,
-})
-
-cardsTab:CreateButton({
-    Name     = "Auto Sell on Hand",
-    Callback = function()
-        local ok = fireRemote("SellRE", "SellHand")
-        notify(
-            "Auto Sell on Hand",
-            ok and "Sell request sent." or "Could not send sell request."
-        )
-    end,
-})
-
 -- ══════════════════════════════════════════════════════════════
---  TAB 3 – Box & Craft
+--  TAB 3 – Auto Sell
 -- ══════════════════════════════════════════════════════════════
-local autoSellTab = Window:CreateTab("📦 Box & Craft", 0)
+local autoSellTab = Window:CreateTab("📦 Auto Sell", 0)
 
 autoSellTab:CreateSection("Box Handling")
 
@@ -6346,6 +5831,15 @@ Controls.AutoSellDelay = autoSellTab:CreateSlider({
     Callback     = function(v) Config.AutoSellDelay = v end,
 })
 
+autoSellTab:CreateSection("Cards")
+
+autoSellTab:CreateToggle({
+    Name         = "Auto Sell Cards",
+    CurrentValue = Config.AutoSell,
+    Flag         = "AutoSell",
+    Callback     = function(v) Config.AutoSell = v end,
+})
+
 -- ══════════════════════════════════════════════════════════════
 --  TAB 4 – Combat
 -- ══════════════════════════════════════════════════════════════
@@ -6353,7 +5847,7 @@ local combatTab = Window:CreateTab("⚔️ Combat", 0)
 
 combatTab:CreateSection("Infinity Tower")
 
-combatTab:CreateToggle({
+Controls.AutoInfinityEquip = combatTab:CreateToggle({
     Name         = "Auto Equip Best Card",
     CurrentValue = Config.AutoInfinityEquip,
     Flag         = "AutoInfinityEquip",
@@ -6367,7 +5861,7 @@ Controls.AutoInfinityTower = combatTab:CreateToggle({
     Callback     = function(v) Config.AutoInfinityTower = v end,
 })
 
-combatTab:CreateToggle({
+Controls.AutoInfinityHide = combatTab:CreateToggle({
     Name         = "Auto Hide Battle",
     CurrentValue = Config.AutoInfinityHide,
     Flag         = "AutoInfinityHide",
@@ -6376,7 +5870,7 @@ combatTab:CreateToggle({
 
 combatTab:CreateSection("Boss Raid")
 
-RaidState.infoParagraph = combatTab:CreateParagraph({
+raidInfoParagraph = combatTab:CreateParagraph({
     Title   = "Boss Raid",
     Content = "Loading Boss Raid information...",
 })
@@ -6384,14 +5878,14 @@ updateRaidInfoDisplay(Config.RaidDifficulties)
 
 Controls.RaidDifficulties = combatTab:CreateDropdown({
     Name          = "Select Difficulty",
-    Options       = RaidState.difficultyOptions,
+    Options       = raidDifficultyOptions,
     CurrentOption = Config.RaidDifficulties[1] or "Easy",
     MultipleOptions = false,
     Flag          = "RaidDifficulties",
     Callback      = function(v)
         local selected = normalizeRaidDifficulties(v)
         if #selected == 0 then
-            selected = { RaidState.difficultyOptions[1] }
+            selected = { raidDifficultyOptions[1] }
         end
         Config.RaidDifficulties = selected
         clearCompletedRaidDifficulties()
@@ -6399,7 +5893,7 @@ Controls.RaidDifficulties = combatTab:CreateDropdown({
     end,
 })
 
-combatTab:CreateToggle({
+Controls.AutoRaidEquip = combatTab:CreateToggle({
     Name         = "Auto Equip Best Card",
     CurrentValue = Config.AutoRaidEquip,
     Flag         = "AutoRaidEquip",
@@ -6418,7 +5912,7 @@ Controls.AutoRaid = combatTab:CreateToggle({
     end,
 })
 
-combatTab:CreateToggle({
+Controls.AutoRaidHide = combatTab:CreateToggle({
     Name         = "Auto Hide Battle",
     CurrentValue = Config.AutoRaidHide,
     Flag         = "AutoRaidHide",
@@ -6446,7 +5940,7 @@ local rerollTab = Window:CreateTab("🔄 Reroll", 0)
 
 rerollTab:CreateParagraph({
     Title   = "⚠️ Before You Reroll",
-    Content = "Do not hold or equip a card while rerolling is active. Held or equipped cards are skipped entirely.",
+    Content = "Do not hold or equip a card while rerolling is active. Held or equipped cards are removed from your backpack, making them invisible to the script — those cards will be skipped entirely until you put them away.",
 })
 
 rerollTab:CreateSection("Card Ranking")
@@ -6478,7 +5972,7 @@ local validTargets = {}
 for _, r in ipairs(Config.TargetRank) do
     if validRankSet[r] then table.insert(validTargets, r) end
 end
-Config.TargetRank = validTargets
+Config.TargetRank = #validTargets > 0 and validTargets or { rankOptions[1] or "UR" }
 
 Controls.TargetRank = rerollTab:CreateDropdown({
     Name            = "Target Ranking",
@@ -6488,7 +5982,7 @@ Controls.TargetRank = rerollTab:CreateDropdown({
     Flag            = "TargetRank",
     Callback        = function(v)
         if type(v) == "string" then v = { v } end
-        Config.TargetRank = (type(v) == "table" and #v > 0) and v or {}
+        Config.TargetRank = (type(v) == "table" and #v > 0) and v or { rankOptions[1] or "UR" }
     end,
 })
 
@@ -6520,6 +6014,11 @@ Controls.AutoRankRoll = rerollTab:CreateToggle({
             notify("Card Ranking", "GradeRollRE was not found.")
         end
     end,
+})
+
+rerollTab:CreateParagraph({
+    Title   = "Card Ranking behavior",
+    Content = "Selected cards are rerolled one at a time until they reach the target ranking. Gems are used first; cash is used only after gems reach zero.",
 })
 
 rerollTab:CreateSection("Traits")
@@ -6591,6 +6090,11 @@ Controls.AutoTraitRoll = rerollTab:CreateToggle({
     end,
 })
 
+rerollTab:CreateParagraph({
+    Title   = "Traits behavior",
+    Content = "Selected cards are rerolled until they reach one of the selected traits. Trait rerolls use Trait Gems only and stop immediately when no Trait Gems remain. If both rerolls are enabled, Card Ranking runs first.",
+})
+
 -- ══════════════════════════════════════════════════════════════
 --  TAB 6 – Misc
 -- ══════════════════════════════════════════════════════════════
@@ -6619,6 +6123,11 @@ Controls.AutoPotion = miscTab:CreateToggle({
     CurrentValue = Config.AutoPotion,
     Flag         = "AutoPotion",
     Callback     = function(v) Config.AutoPotion = v end,
+})
+
+miscTab:CreateParagraph({
+    Title   = "Potion behavior",
+    Content = "Only selected potions that you own are used. A potion waits until its category timer reaches zero; a higher tier can replace a lower tier and its confirmation is accepted automatically.",
 })
 
 miscTab:CreateSection("Auto Buy Boost")
