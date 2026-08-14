@@ -380,7 +380,10 @@ local RARITIES = {
     "Manga", "Celestial", "Heavenly", "Corrupted",
     "Striker", "Sacred", "Paradox", "Founder",
     "Evolved", "Magic", "Oni", "Chaos",
-    "Ruin", "Limited",
+    "Ruin", "Reborn", "Beast", "Nordic",
+    "Hunter", "Soul", "Swordsman", "Gamer",
+    "Revenge", "Chainsaw", "Grail", "Conquest",
+    "Blaze", "Devour", "Raven", "Arcane", "Nightfall",
 }
 
 local MUTATIONS = {
@@ -527,6 +530,15 @@ local Config = {
     AutoOpenPack      = false,
     AutoTimePotion    = false,
     AutoBuyBoost      = false,
+
+    -- Filtered Sell
+    FilteredSellMode  = "Whitelist",
+    FilteredSellPack  = "All",
+    FilteredSellRarity = "All",
+    FilteredSellMutation = "All",
+    FilteredSellRanking = "All",
+    FilteredSellTrait = "All",
+    AutoFilteredSell  = false,
 
     -- Combat
     AutoInfinityEquip = false,
@@ -3586,7 +3598,85 @@ local function getCardInfo(item)
     }
 end
 
-local function getSortedCardsInBackpack()
+local getSortedCardsInBackpack
+
+local function getCardPack(item)
+    local pack = readBoxValue(item, {
+        "Pack", "PackName", "CardPack", "CardPackName", "pack",
+    })
+    if pack ~= nil and tostring(pack) ~= "" then
+        return pack
+    end
+
+    local itemName = string.lower(tostring(item and item.Name or ""))
+    for _, packName in ipairs(PACKS) do
+        if string.find(itemName, string.lower(packName), 1, true) then
+            return packName
+        end
+    end
+    return nil
+end
+
+local function getCardRanking(item)
+    return readBoxValue(item, {
+        "CardGrade", "Ranking", "Rank", "Grade",
+    }) or (item and item:GetAttribute("CardGrade"))
+end
+
+local function getCardTrait(item)
+    return readBoxValue(item, {
+        "CardTrait", "Trait", "TraitName", "trait",
+    }) or (item and item:GetAttribute("CardTrait"))
+end
+
+local function filteredSellFieldMatches(value, selected)
+    local wanted = string.lower(string.gsub(
+        tostring(selected or "All"),
+        "^%s*(.-)%s*$",
+        "%1"
+    ))
+    if wanted == "" or wanted == "all" or wanted == "any" then
+        return true
+    end
+    return filterValueMatches(value, normalizeFilterSelection({ selected }))
+end
+
+local function cardMatchesFilteredSell(item)
+    local cardInfo = getCardInfo(item)
+    local matches = (
+        filteredSellFieldMatches(getCardPack(item), Config.FilteredSellPack)
+        and filteredSellFieldMatches(cardInfo.rarity, Config.FilteredSellRarity)
+        and filteredSellFieldMatches(cardInfo.mutation, Config.FilteredSellMutation)
+        and filteredSellFieldMatches(getCardRanking(item), Config.FilteredSellRanking)
+        and filteredSellFieldMatches(getCardTrait(item), Config.FilteredSellTrait)
+    )
+
+    if tostring(Config.FilteredSellMode) == "Blacklist" then
+        return not matches
+    end
+    return matches
+end
+
+local function getFilteredSellCards()
+    local result = {}
+    for _, entry in ipairs(getSortedCardsInBackpack()) do
+        if cardMatchesFilteredSell(entry.tool) then
+            table.insert(result, entry.tool)
+        end
+    end
+    return result
+end
+
+-- The filtered action is intentionally separate from SellHand/SellCards:
+-- those existing actions are broad and would ignore the selected filters.
+local function sellFilteredCard(card)
+    if not card or card.Parent ~= player:FindFirstChild("Backpack") then
+        return false
+    end
+    return fireRemote("SellRE", "SellCard", { Tool = card })
+end
+
+getSortedCardsInBackpack = function()
     local result = {}
     local backpack = player:FindFirstChild("Backpack")
     if not backpack then return result end
@@ -5289,6 +5379,13 @@ local function buildSerializableConfig()
         AutoOpenPack      = Config.AutoOpenPack,
         AutoTimePotion    = Config.AutoTimePotion,
         AutoBuyBoost      = Config.AutoBuyBoost,
+        FilteredSellMode  = Config.FilteredSellMode,
+        FilteredSellPack  = Config.FilteredSellPack,
+        FilteredSellRarity = Config.FilteredSellRarity,
+        FilteredSellMutation = Config.FilteredSellMutation,
+        FilteredSellRanking = Config.FilteredSellRanking,
+        FilteredSellTrait = Config.FilteredSellTrait,
+        AutoFilteredSell  = Config.AutoFilteredSell,
         AutoInfinityEquip = Config.AutoInfinityEquip,
         AutoInfinityTower = Config.AutoInfinityTower,
         AutoInfinityHide  = Config.AutoInfinityHide,
@@ -5428,6 +5525,9 @@ local function loadConfig(name, isAutoload)
         "RankUseGems", "RankUseCash", "AutoRankRoll",
         "AutoClaimPlaytime", "AutoClaimDaily",
         "AutoPlacePack", "AutoOpenPack", "AutoTimePotion", "AutoBuyBoost",
+        "FilteredSellMode", "FilteredSellPack", "FilteredSellRarity",
+        "FilteredSellMutation", "FilteredSellRanking", "FilteredSellTrait",
+        "AutoFilteredSell",
         "AutoInfinityEquip", "AutoInfinityTower", "AutoInfinityHide",
         "RaidDifficulties", "AutoRaidEquip", "AutoRaid", "AutoRaidHide",
         "AutoTeamCardCycle", "AutoPotion", "SelectedPotions",
@@ -5750,7 +5850,7 @@ local function closeSellConfirmation()
     end
 end
 
-local function confirmSellAction(label, action)
+local function confirmSellAction(label, action, onConfirmed, customMessage)
     closeSellConfirmation()
 
     local messageByAction = {
@@ -5806,7 +5906,9 @@ local function confirmSellAction(label, action)
     message.Position = UDim2.fromOffset(20, 52)
     message.Size = UDim2.new(1, -40, 0, 40)
     message.Font = Enum.Font.Gotham
-    message.Text = messageByAction[action] or ("Are you sure you want to " .. label .. "?")
+    message.Text = customMessage
+        or messageByAction[action]
+        or ("Are you sure you want to " .. label .. "?")
     message.TextColor3 = Color3.fromRGB(220, 220, 225)
     message.TextSize = 16
     message.TextWrapped = true
@@ -5852,6 +5954,15 @@ local function confirmSellAction(label, action)
         closeSellConfirmation()
         if not confirmed then return end
 
+        if onConfirmed then
+            local ok, err = pcall(onConfirmed)
+            if not ok then
+                warn("[ACF] " .. label .. " failed: " .. tostring(err))
+                notify(label, "Could not enable filtered selling.")
+            end
+            return
+        end
+
         local ok = fireRemote("SellRE", action)
         notify(
             label,
@@ -5896,6 +6007,184 @@ cardsTab:CreateButton({
         )
     end,
 })
+
+cardsTab:CreateSection("Filtered Sell")
+
+local function resolveFilteredSellValue(value, fallback)
+    if type(value) == "table" then
+        value = value[1]
+    end
+    value = tostring(value or "")
+    if value == "" or value == "Any" then
+        return fallback
+    end
+    return value
+end
+
+local filteredSellPackOptions = { "All" }
+for _, packName in ipairs(PACKS) do
+    table.insert(filteredSellPackOptions, packName)
+end
+
+local filteredSellRarityOptions = { "All" }
+for _, rarityName in ipairs(RARITIES) do
+    table.insert(filteredSellRarityOptions, rarityName)
+end
+
+local filteredSellMutationOptions = { "All" }
+for _, mutationName in ipairs(MUTATIONS) do
+    table.insert(filteredSellMutationOptions, mutationName)
+end
+
+local filteredSellRankingOptions = { "All" }
+for _, rankingName in ipairs(getRankTargetOptions()) do
+    table.insert(filteredSellRankingOptions, rankingName)
+end
+
+local filteredSellTraitOptions = { "All" }
+for _, traitName in ipairs(getTraitOptions()) do
+    table.insert(filteredSellTraitOptions, traitName)
+end
+
+Controls.FilteredSellMode = cardsTab:CreateDropdown({
+    Name            = "Mode",
+    Options         = { "Whitelist", "Blacklist" },
+    CurrentOption   = resolveFilteredSellValue(
+        Config.FilteredSellMode,
+        "Whitelist"
+    ),
+    MultipleOptions = false,
+    Flag            = "FilteredSellMode",
+    Callback        = function(v)
+        local mode = resolveFilteredSellValue(v, "Whitelist")
+        if mode ~= "Blacklist" then mode = "Whitelist" end
+        Config.FilteredSellMode = mode
+    end,
+})
+
+Controls.FilteredSellPack = cardsTab:CreateDropdown({
+    Name            = "Pack",
+    Options         = filteredSellPackOptions,
+    CurrentOption   = resolveFilteredSellValue(Config.FilteredSellPack, "All"),
+    MultipleOptions = false,
+    Flag            = "FilteredSellPack",
+    Callback        = function(v)
+        Config.FilteredSellPack = resolveFilteredSellValue(v, "All")
+    end,
+})
+
+Controls.FilteredSellRarity = cardsTab:CreateDropdown({
+    Name            = "Rarity",
+    Options         = filteredSellRarityOptions,
+    CurrentOption   = resolveFilteredSellValue(Config.FilteredSellRarity, "All"),
+    MultipleOptions = false,
+    Flag            = "FilteredSellRarity",
+    Callback        = function(v)
+        Config.FilteredSellRarity = resolveFilteredSellValue(v, "All")
+    end,
+})
+
+Controls.FilteredSellMutation = cardsTab:CreateDropdown({
+    Name            = "Mutation",
+    Options         = filteredSellMutationOptions,
+    CurrentOption   = resolveFilteredSellValue(
+        Config.FilteredSellMutation,
+        "All"
+    ),
+    MultipleOptions = false,
+    Flag            = "FilteredSellMutation",
+    Callback        = function(v)
+        Config.FilteredSellMutation = resolveFilteredSellValue(v, "All")
+    end,
+})
+
+Controls.FilteredSellRanking = cardsTab:CreateDropdown({
+    Name            = "Ranking",
+    Options         = filteredSellRankingOptions,
+    CurrentOption   = resolveFilteredSellValue(
+        Config.FilteredSellRanking,
+        "All"
+    ),
+    MultipleOptions = false,
+    Flag            = "FilteredSellRanking",
+    Callback        = function(v)
+        Config.FilteredSellRanking = resolveFilteredSellValue(v, "All")
+    end,
+})
+
+Controls.FilteredSellTrait = cardsTab:CreateDropdown({
+    Name            = "Trait",
+    Options         = filteredSellTraitOptions,
+    CurrentOption   = resolveFilteredSellValue(Config.FilteredSellTrait, "All"),
+    MultipleOptions = false,
+    Flag            = "FilteredSellTrait",
+    Callback        = function(v)
+        Config.FilteredSellTrait = resolveFilteredSellValue(v, "All")
+    end,
+})
+
+local function filteredSellConfirmationMessage()
+    if Config.FilteredSellMode == "Blacklist" then
+        return "Are you sure you want to sell cards that do not match the filters?"
+    end
+    return "Are you sure you want to sell cards matching the filters?"
+end
+
+local updatingFilteredSellControl = false
+
+Controls.AutoFilteredSell = cardsTab:CreateToggle({
+    Name         = "Auto Sell",
+    CurrentValue = Config.AutoFilteredSell,
+    Flag         = "AutoFilteredSell",
+    Callback     = function(v)
+        if updatingFilteredSellControl then return end
+        if not v then
+            Config.AutoFilteredSell = false
+            return
+        end
+
+        -- Do not start selling until the user confirms this exact mode.
+        Config.AutoFilteredSell = false
+        if Controls.AutoFilteredSell and Controls.AutoFilteredSell.Set then
+            updatingFilteredSellControl = true
+            pcall(function() Controls.AutoFilteredSell:Set(false) end)
+            updatingFilteredSellControl = false
+        end
+
+        confirmSellAction(
+            "Filtered Sell",
+            nil,
+            function()
+                Config.AutoFilteredSell = true
+                if Controls.AutoFilteredSell
+                    and Controls.AutoFilteredSell.Set then
+                    updatingFilteredSellControl = true
+                    pcall(function() Controls.AutoFilteredSell:Set(true) end)
+                    updatingFilteredSellControl = false
+                end
+                notify("Filtered Sell", "Auto Sell enabled.")
+            end,
+            filteredSellConfirmationMessage()
+        )
+    end,
+})
+
+task.spawn(function()
+    while true do
+        task.wait(0.75)
+        if not Config.AutoFilteredSell then continue end
+
+        local backpack = player:FindFirstChild("Backpack")
+        local filteredCards = getFilteredSellCards()
+        for _, card in ipairs(filteredCards) do
+            if not Config.AutoFilteredSell then break end
+            if backpack and card.Parent == backpack then
+                sellFilteredCard(card)
+                task.wait(math.max(0.5, Config.CardActionDelay))
+            end
+        end
+    end
+end)
 
 -- ══════════════════════════════════════════════════════════════
 --  TAB 3 – Box & Craft
