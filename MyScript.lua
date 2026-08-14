@@ -3233,41 +3233,9 @@ do
         -- Mirror the same events the ItemsClient script handles. The game
         -- has used both FullInventory and InventoryUpdate for this snapshot,
         -- so Auto Use Time Potion must understand both versions.
-        local function quantityNumber(value)
-            if type(value) == "number" then
-                return value
-            end
-            if type(value) == "string" then
-                return tonumber(value) or 0
-            end
-            if type(value) ~= "table" then
-                return 0
-            end
-            return tonumber(
-                value.Quantity or value.quantity
-                    or value.QuantityValue or value.quantityValue
-                    or value.Amount or value.amount
-                    or value.Count or value.count
-            ) or 0
-        end
-
-        local function normalizePotionId(value)
-            local text = string.lower(tostring(value or ""))
-            text = string.gsub(text, "[^%w]", "")
-            text = string.gsub(text, "potion", "")
-            if string.sub(text, -3) == "iii" then
-                text = string.sub(text, 1, -4) .. "3"
-            elseif string.sub(text, -2) == "ii" then
-                text = string.sub(text, 1, -3) .. "2"
-            elseif string.sub(text, -1) == "i" then
-                text = string.sub(text, 1, -2) .. "1"
-            end
-            return text
-        end
-
         local function storePotionQuantity(itemId, quantity)
             if itemId == nil then return end
-            potionCounts[itemId] = quantityNumber(quantity)
+            potionCounts[itemId] = quantity
         end
 
         local function readItemId(data, includeDisplayName)
@@ -3304,22 +3272,6 @@ do
                     storePotionQuantity(itemId, quantity)
                 end
             end
-        end
-
-        local function findOwnedPotion(preferredId)
-            local preferredKey = normalizePotionId(preferredId)
-            local directQuantity = quantityNumber(potionCounts[preferredId])
-            if directQuantity > 0 then
-                return preferredId, directQuantity
-            end
-
-            for itemId, quantity in pairs(potionCounts) do
-                local amount = quantityNumber(quantity)
-                if amount > 0 and normalizePotionId(itemId) == preferredKey then
-                    return itemId, amount
-                end
-            end
-            return nil, 0
         end
 
         ItemsRE.OnClientEvent:Connect(function(action, data)
@@ -3403,13 +3355,10 @@ do
 
                 local selected = Config.SelectedPotions
                 local candidates = {}
-                local selectedItemIds = {}
                 for _, potion in ipairs(POTIONS) do
-                    local itemId, quantity = findOwnedPotion(potion)
-                    if selectionIncludes(selected, potion) and itemId
-                        and quantity > 0 then
+                    if selectionIncludes(selected, potion)
+                        and (potionCounts[potion] or 0) > 0 then
                         table.insert(candidates, potion)
-                        selectedItemIds[potion] = itemId
                     end
                 end
                 table.sort(candidates, function(left, right)
@@ -3420,7 +3369,6 @@ do
 
                 for _, potion in ipairs(candidates) do
                     if not canUsePotion(potion) then continue end
-                    local itemId = selectedItemIds[potion] or potion
                     local family, tier = potionDetails(potion)
                     local active = family and activeBoosts[family]
                     local isTierReplacement = active
@@ -3428,18 +3376,18 @@ do
                         and active.tier
                         and tier > active.tier
                     pendingPotion = {
-                        itemId = itemId,
+                        itemId = potion,
                         startedAt = os.clock(),
                     }
                     local submitted = false
                     if isTierReplacement then
-                        submitted = usePotionThroughItemsUi(itemId)
+                        submitted = usePotionThroughItemsUi(potion)
                     end
                     if not submitted then
                         submitted = pcall(function()
                             ItemsRE:FireServer(
                                 "UseItem",
-                                { ItemId = itemId, Amount = 1 }
+                                { ItemId = potion, Amount = 1 }
                             )
                         end)
                     end
