@@ -4537,15 +4537,6 @@ task.spawn(function()
         if now < RuntimeState.nextTimePotionUse then continue end
         if not areAllCardSlotsOccupied() then continue end
 
-        local hasCooldown = false
-        for _, slot in ipairs(getAllCardSlots()) do
-            if slotIsOnCooldown(slot) then
-                hasCooldown = true
-                break
-            end
-        end
-        if not hasCooldown then continue end
-
         local selectedPotion
         for _, potion in ipairs(TIME_POTIONS) do
             local inventoryItem, quantity = findPotionInventoryItem(potion)
