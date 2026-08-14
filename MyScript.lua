@@ -3600,7 +3600,9 @@ end
 
 local getSortedCardsInBackpack
 
-local function getCardPack(item)
+local filteredSellState = {}
+
+filteredSellState.getCardPack = function(item)
     local pack = readBoxValue(item, {
         "Pack", "PackName", "CardPack", "CardPackName", "pack",
     })
@@ -3617,19 +3619,19 @@ local function getCardPack(item)
     return nil
 end
 
-local function getCardRanking(item)
+filteredSellState.getCardRanking = function(item)
     return readBoxValue(item, {
         "CardGrade", "Ranking", "Rank", "Grade",
     }) or (item and item:GetAttribute("CardGrade"))
 end
 
-local function getCardTrait(item)
+filteredSellState.getCardTrait = function(item)
     return readBoxValue(item, {
         "CardTrait", "Trait", "TraitName", "trait",
     }) or (item and item:GetAttribute("CardTrait"))
 end
 
-local function filteredSellFieldMatches(value, selected)
+filteredSellState.fieldMatches = function(value, selected)
     local wanted = string.lower(string.gsub(
         tostring(selected or "All"),
         "^%s*(.-)%s*$",
@@ -3641,14 +3643,29 @@ local function filteredSellFieldMatches(value, selected)
     return filterValueMatches(value, normalizeFilterSelection({ selected }))
 end
 
-local function cardMatchesFilteredSell(item)
+filteredSellState.cardMatches = function(item)
     local cardInfo = getCardInfo(item)
     local matches = (
-        filteredSellFieldMatches(getCardPack(item), Config.FilteredSellPack)
-        and filteredSellFieldMatches(cardInfo.rarity, Config.FilteredSellRarity)
-        and filteredSellFieldMatches(cardInfo.mutation, Config.FilteredSellMutation)
-        and filteredSellFieldMatches(getCardRanking(item), Config.FilteredSellRanking)
-        and filteredSellFieldMatches(getCardTrait(item), Config.FilteredSellTrait)
+        filteredSellState.fieldMatches(
+            filteredSellState.getCardPack(item),
+            Config.FilteredSellPack
+        )
+        and filteredSellState.fieldMatches(
+            cardInfo.rarity,
+            Config.FilteredSellRarity
+        )
+        and filteredSellState.fieldMatches(
+            cardInfo.mutation,
+            Config.FilteredSellMutation
+        )
+        and filteredSellState.fieldMatches(
+            filteredSellState.getCardRanking(item),
+            Config.FilteredSellRanking
+        )
+        and filteredSellState.fieldMatches(
+            filteredSellState.getCardTrait(item),
+            Config.FilteredSellTrait
+        )
     )
 
     if tostring(Config.FilteredSellMode) == "Blacklist" then
@@ -3657,10 +3674,10 @@ local function cardMatchesFilteredSell(item)
     return matches
 end
 
-local function getFilteredSellCards()
+filteredSellState.getFilteredCards = function()
     local result = {}
     for _, entry in ipairs(getSortedCardsInBackpack()) do
-        if cardMatchesFilteredSell(entry.tool) then
+        if filteredSellState.cardMatches(entry.tool) then
             table.insert(result, entry.tool)
         end
     end
@@ -3669,7 +3686,7 @@ end
 
 -- The filtered action is intentionally separate from SellHand/SellCards:
 -- those existing actions are broad and would ignore the selected filters.
-local function sellFilteredCard(card)
+filteredSellState.sellCard = function(card)
     if not card or card.Parent ~= player:FindFirstChild("Backpack") then
         return false
     end
@@ -6175,11 +6192,11 @@ task.spawn(function()
         if not Config.AutoFilteredSell then continue end
 
         local backpack = player:FindFirstChild("Backpack")
-        local filteredCards = getFilteredSellCards()
+        local filteredCards = filteredSellState.getFilteredCards()
         for _, card in ipairs(filteredCards) do
             if not Config.AutoFilteredSell then break end
             if backpack and card.Parent == backpack then
-                sellFilteredCard(card)
+                filteredSellState.sellCard(card)
                 task.wait(math.max(0.5, Config.CardActionDelay))
             end
         end
