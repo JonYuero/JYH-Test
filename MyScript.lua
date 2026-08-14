@@ -4743,6 +4743,26 @@ exitInfinityTowerBattle = function()
 
     local hideBattleRoot = getCombatGui("HideBattle")
 
+    local function activateButtonAndVerify(button, changed)
+        if not button or not button:IsA("GuiButton")
+            or (button:IsA("GuiObject") and not button.Visible) then
+            return false
+        end
+
+        -- Activate first so buttons wired to Activated respond normally.
+        pcall(function() button:Activate() end)
+        task.wait(0.2)
+        if changed() then return true end
+
+        -- Some game revisions wire these controls only to MouseButton1Click.
+        -- Use the signal as a fallback, then verify the state again.
+        if firesignal then
+            pcall(firesignal, button.MouseButton1Click)
+            task.wait(0.2)
+        end
+        return changed()
+    end
+
     -- Auto Hide Battle leaves the tower running behind the compact
     -- HideBattle control.  In that state the Exit button is not available
     -- until the same button is clicked to show the battle again.
@@ -4751,12 +4771,20 @@ exitInfinityTowerBattle = function()
         and findGuiByName(hideBattleRoot, "Hide")
     if hideBattleButton and hideBattleButton:IsA("TextButton") then
         local buttonText = string.lower(tostring(hideBattleButton.Text or ""))
-        local isShowBattle = string.find(buttonText, "show", 1, true)
-            and string.find(buttonText, "battle", 1, true)
+        local isShowBattle = string.find(buttonText, "show", 1, true) ~= nil
+            and string.find(buttonText, "battle", 1, true) ~= nil
         if isShowBattle then
             -- This is the exact same HideBattle > Hide control used by
             -- Auto Hide Battle; do not search for a different button.
-            showBattleClicked = clickGuiButton(hideBattleButton)
+            showBattleClicked = activateButtonAndVerify(
+                hideBattleButton,
+                function()
+                    local text = string.lower(
+                        tostring(hideBattleButton.Text or "")
+                    )
+                    return string.find(text, "show", 1, true) == nil
+                end
+            )
         end
     end
 
@@ -4773,11 +4801,17 @@ exitInfinityTowerBattle = function()
         "Exit", "EXIT", "ExitBattle", "ExitTower",
         "Leave", "LeaveBattle", "Quit",
     }
+    local function activateExitButton(button)
+        return activateButtonAndVerify(button, function()
+            return player:GetAttribute("InfinityTowerInBattle") ~= true
+        end)
+    end
+
     for _, root in ipairs(roots) do
         if root then
             for _, name in ipairs(names) do
                 local button = findGuiByName(root, name)
-                if button and clickGuiButton(button) then
+                if button and activateExitButton(button) then
                     return true
                 end
             end
@@ -4791,7 +4825,7 @@ exitInfinityTowerBattle = function()
                 if descendant:IsA("TextButton") then
                     local text = string.lower(tostring(descendant.Text or ""))
                     if text == "exit" or text == "leave" or text == "quit" then
-                        if clickGuiButton(descendant) then
+                        if activateExitButton(descendant) then
                             return true
                         end
                     end
