@@ -374,7 +374,11 @@ local RARITIES = {
     "Manga", "Celestial", "Heavenly", "Corrupted",
     "Striker", "Sacred", "Paradox", "Founder",
     "Evolved", "Magic", "Oni", "Chaos",
-    "Ruin", "Limited",
+    "Ruin", "Reborn", "Beast", "Nordic",
+    "Hunter", "Soul", "Swordsman", "Gamer",
+    "Revenge", "Chainsaw", "Grail", "Conquest",
+    "Blaze", "Devour", "Raven", "Arcane",
+    "Nightfall",
 }
 
 local MUTATIONS = {
@@ -3236,11 +3240,7 @@ do
 
         local function readItemId(data, includeDisplayName)
             if type(data) ~= "table" then return nil end
-            -- The working reference contains both ItemID and PotionId naming.
-            -- Accept every observed spelling so time potions are mirrored even
-            -- if the game sends a potion-specific inventory record.
-            return data.ItemID or data.ItemId or data.itemId
-                or data.PotionId or data.PotionID or data.potionId
+            return data.ItemId or data.itemId or data.ItemID
                 or data.Id or data.id
                 or (includeDisplayName and (data.Name or data.name))
         end
@@ -3306,18 +3306,12 @@ do
             elseif action == "UseOk" then
                 pendingPotion = nil
                 if RuntimeState.pendingTimePotion then
-                    RuntimeState.timePotionLastResult = "UseOk"
-                    RuntimeState.timePotionLastResultAt = os.clock()
-                    warn("[ACF] Auto Time Potion server response: UseOk")
                     RuntimeState.pendingTimePotion = nil
                     RuntimeState.nextTimePotionUse = os.clock() + 2
                 end
             elseif action == "UseFailed" then
                 pendingPotion = nil
                 if RuntimeState.pendingTimePotion then
-                    RuntimeState.timePotionLastResult = "UseFailed"
-                    RuntimeState.timePotionLastResultAt = os.clock()
-                    warn("[ACF] Auto Time Potion server response: UseFailed")
                     RuntimeState.pendingTimePotion = nil
                     RuntimeState.nextTimePotionUse = os.clock() + 1
                 end
@@ -3522,10 +3516,9 @@ end
 
 local function areAllCardSlotsOccupied()
     local slots = getAllCardSlots()
-    -- A partially replicated plot is not a full plot.  Treating the visible
-    -- subset as complete can spend a time potion while more card slots are
-    -- still loading.
-    if #slots < 30 then return false end
+    -- Plots can have fewer than 30 unlocked slots. Requiring exactly 30
+    -- made Auto Use Time Potion stay disabled on smaller full plots.
+    if #slots == 0 then return false end
     for _, slot in ipairs(slots) do
         if not slotIsOccupied(slot) then
             return false
@@ -3612,7 +3605,8 @@ local function isCooldownFieldName(name)
     normalized = string.gsub(normalized, "[^%w]", "")
     for _, part in ipairs({
         "cooldown", "cooldownremaining", "secondsleft", "timeleft",
-        "timeremaining", "remainingtime", "countdown", "timeleft",
+        "timer", "timeremaining", "remainingtime", "countdown",
+        "remaining",
     }) do
         if string.find(normalized, part, 1, true) then return true end
     end
@@ -3622,49 +3616,44 @@ end
 local function slotIsOnCooldown(slotModel)
     if not slotModel then return false end
 
-    -- Confirmed live game structure:
-    --
-    -- CardSlot
-    --   └─ PromptHolder
-    --       └─ ProximityPrompt
-    --
-    -- While a placed pack is opening, the prompt ActionText is shown as
-    -- something like "Skip 30min".  Use that prompt as the authoritative
-    -- cooldown signal instead of guessing from timer labels/attributes.
-    local promptHolder = slotModel:FindFirstChild("PromptHolder", true)
+    local function inspectAttributes(instance)
+        for name, value in pairs(instance:GetAttributes()) do
+            local field = isCooldownFieldName(name)
+            local lowerName = string.lower(tostring(name))
+            if field or string.find(lowerName, "isoncooldown", 1, true)
+                or string.find(lowerName, "cooldownactive", 1, true) then
+                if type(value) == "boolean" then
+                    if value then return true end
+                elseif cooldownTextIsActive(value, true) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
 
-    if promptHolder then
-        local prompt = promptHolder:FindFirstChildWhichIsA(
-            "ProximityPrompt",
-            true
-        )
+    if inspectAttributes(slotModel) then return true end
+    for _, desc in ipairs(slotModel:GetDescendants()) do
+        if inspectAttributes(desc) then return true end
 
-        if prompt then
-            local actionText = string.lower(
-                tostring(prompt.ActionText or "")
-            )
+        local field = isCooldownFieldName(desc.Name)
+        if desc:IsA("ValueBase") and field
+            and cooldownTextIsActive(desc.Value, true) then
+            return true
+        end
 
-            if string.find(actionText, "skip", 1, true) then
+        if desc:IsA("TextLabel") or desc:IsA("TextButton")
+            or desc:IsA("TextBox") then
+            if cooldownTextIsActive(desc.Text, field) then
+                return true
+            end
+        elseif desc:IsA("ProximityPrompt") then
+            if cooldownTextIsActive(desc.ActionText, false)
+                or cooldownTextIsActive(desc.ObjectText, false) then
                 return true
             end
         end
     end
-
-    -- Compatibility fallback: if the game moves PromptHolder but still keeps
-    -- a ProximityPrompt under the slot, only accept prompts whose ActionText
-    -- explicitly contains "skip".
-    for _, descendant in ipairs(slotModel:GetDescendants()) do
-        if descendant:IsA("ProximityPrompt") then
-            local actionText = string.lower(
-                tostring(descendant.ActionText or "")
-            )
-
-            if string.find(actionText, "skip", 1, true) then
-                return true
-            end
-        end
-    end
-
     return false
 end
 
@@ -4483,6 +4472,10 @@ task.spawn(function()
     local function normalizePotionInventoryId(value)
         local text = string.lower(tostring(value or ""))
         text = string.gsub(text, "[^%w]", "")
+        -- The inventory has used both "TimePotion3" and display-style
+        -- keys such as "Time III". Removing "potion" lets both forms
+        -- resolve to the same canonical key (time3).
+        text = string.gsub(text, "potion", "")
         if string.sub(text, -3) == "iii" then
             text = string.sub(text, 1, -4) .. "3"
         elseif string.sub(text, -2) == "ii" then
@@ -4541,18 +4534,6 @@ task.spawn(function()
             nextInventorySync = now + 5
         end
 
-        -- If the server never answered the previous request, clear the pending
-        -- state after the retry window and log it. This distinguishes a silent
-        -- server rejection from a Lua-side send error.
-        if RuntimeState.pendingTimePotion
-            and now - (RuntimeState.pendingTimePotion.sentAt or now) >= 4 then
-            warn(
-                "[ACF] Auto Time Potion: no UseOk/UseFailed response for "
-                .. tostring(RuntimeState.pendingTimePotion.itemId)
-            )
-            RuntimeState.pendingTimePotion = nil
-        end
-
         if now < RuntimeState.nextTimePotionUse then continue end
         if not areAllCardSlotsOccupied() then continue end
 
@@ -4575,35 +4556,22 @@ task.spawn(function()
         end
         if not selectedPotion then continue end
 
-        -- The known-working reference uses the exact "ItemID" spelling in
-        -- its UseItem path. The previous script used "ItemId", which can be
-        -- silently ignored by a server that expects the exact payload key.
-        RuntimeState.timePotionLastResult = nil
-
-        local submitted, submitError = pcall(function()
+        local submitted = pcall(function()
             ItemsREForAutomation:FireServer("UseItem", {
-                ItemID = selectedPotion,
+                ItemId = selectedPotion,
                 Amount = 1,
             })
         end)
-
         if submitted then
-            warn("[ACF] Auto Time Potion sent UseItem for " .. tostring(selectedPotion))
-
+            -- A successful pcall only means the client sent the request. Wait
+            -- for UseOk/UseFailed when available, with a timeout for versions
+            -- that do not echo those actions.
             RuntimeState.pendingTimePotion = {
                 itemId = selectedPotion,
                 sentAt = os.clock(),
             }
-
-            -- Give the server time to answer with UseOk/UseFailed.  Do not
-            -- immediately try alternate payloads; that could consume multiple
-            -- potions if the first request actually succeeded.
             RuntimeState.nextTimePotionUse = os.clock() + 4
         else
-            warn(
-                "[ACF] Auto Time Potion could not send UseItem: "
-                .. tostring(submitError)
-            )
             RuntimeState.pendingTimePotion = nil
             RuntimeState.nextTimePotionUse = os.clock() + 1
         end
