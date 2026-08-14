@@ -15,8 +15,8 @@
 -- ============================================================
 
 -- ── URL constants (single source of truth) ───────────────────
-local LOADER_URL    = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/Loader.lua"
-local ANIME_CARD_FARM_URL = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/MyScript.lua"
+local LOADER_URL    = "https://raw.githubusercontent.com/JonYuero/Jon-Yuero-Hub/refs/heads/main/JYH%20Loader.lua"
+local ANIME_CARD_FARM_URL = "https://raw.githubusercontent.com/JonYuero/Anime-Card-Farm/refs/heads/main/ACF.lua"
 
 local VALID_LICENSE_TYPES = { FREE = true, ["30D"] = true, LIFETIME = true }
 
@@ -31,10 +31,7 @@ local HttpService = game:GetService("HttpService")
 local DEVICE_ROOT = "Jon Yuero Hub"
 local DEVICE_FILE = DEVICE_ROOT .. "/DeviceId.txt"
 
--- Keep these early helpers as global function bindings. Luau counts every
--- top-level local binding toward the chunk register budget; making this large
--- helper group local causes compilation to fail later in the Boss Raid code.
-function getPersistentDeviceId()
+local function getPersistentDeviceId()
     local localPlayer = game:GetService("Players").LocalPlayer
     -- Compatibility fallback for executors without file APIs. This keeps
     -- ACF from crashing, but remains account-based on that executor.
@@ -84,7 +81,7 @@ function getPersistentDeviceId()
 end
 
 -- ── Lightweight notification (available before Rayfield) ──────
-function coreNotify(title, text)
+local function coreNotify(title, text)
     pcall(
         game:GetService("StarterGui").SetCore,
         game:GetService("StarterGui"),
@@ -95,7 +92,7 @@ end
 
 -- ── Safe Lua source fetcher ───────────────────────────────────
 -- Returns a compiled function on success, or nil + reason on failure.
-function fetchLua(url)
+local function fetchLua(url)
     local ok, raw = pcall(game.HttpGet, game, url, true)
     if not ok or type(raw) ~= "string" or raw == "" then
         return nil, "HttpGet failed: " .. tostring(raw)
@@ -118,7 +115,7 @@ end
 -- ── Return to the official loader ────────────────────────────
 -- Shows the reason, clears session state, and re-executes Loader.lua.
 -- A duplicate guard prevents the Loader ↔ MyScript redirect loop.
-function returnToLoader(reason)
+local function returnToLoader(reason)
     -- Prevent multiple concurrent redirect attempts.
     if ENV.JYH_RETURNING_TO_LOADER == true then
         return
@@ -156,7 +153,7 @@ end
 -- Validates every required field of the short-lived launch session.
 -- Returns true on success; false + reason string on any failure.
 -- Uses os.time() throughout — never tick() — for Unix comparisons.
-function validateSession(session)
+local function validateSession(session)
     -- 1. Must be a table
     if type(session) ~= "table" then
         return false, "No valid key"
@@ -319,7 +316,7 @@ local playerGui = player:WaitForChild("PlayerGui")
 
 -- ── In-game notification (uses StarterGui, defined early so
 --    setPlotNumber and other helpers can call it safely) ───────
-function notify(title, text)
+local function notify(title, text)
     pcall(StarterGui.SetCore, StarterGui, "SendNotification", {
         Title = title, Text = text, Duration = 3,
     })
@@ -361,7 +358,6 @@ if Modules and Modules:FindFirstChild("GuiManager") then
     end)
 end
 local currentRaidBossId = ""
-local raidServerOpen = nil
 
 -- ── Data lists ───────────────────────────────────────────────
 local RARITIES = {
@@ -405,7 +401,7 @@ local POTIONS = {
 -- best available skip potion before falling back to a weaker one.
 local TIME_POTIONS = { "TimePotion2", "TimePotion1" }
 
-function normalizeGeneralPotionSelection(selection)
+local function normalizeGeneralPotionSelection(selection)
     local valid = {}
     local validSet = {}
     for _, potion in ipairs(POTIONS) do
@@ -433,7 +429,7 @@ local BOOSTS = {
     { label = "Speed Boost",    id = "speed" },
 }
 
-function selectionIncludes(selection, wanted)
+local function selectionIncludes(selection, wanted)
     if type(selection) ~= "table" then
         return selection == nil or tostring(selection) == "All"
             or tostring(selection) == wanted
@@ -449,7 +445,7 @@ function selectionIncludes(selection, wanted)
     return false
 end
 
-function collapseFullSelection(selection, options)
+local function collapseFullSelection(selection, options)
     if type(selection) ~= "table" or #selection == 0 then
         return { "All" }
     end
@@ -560,13 +556,13 @@ local closeBossRaidReward
 local exitInfinityTowerBattle
 
 -- ── Remote helpers ───────────────────────────────────────────
-function findRemote(name)
+local function findRemote(name)
     local directRemote = Remotes and Remotes:FindFirstChild(name)
     if directRemote then return directRemote end
     return ReplicatedStorage:FindFirstChild(name, true)
 end
 
-function fireRemote(name, ...)
+local function fireRemote(name, ...)
     local remote = findRemote(name)
     if not remote then
         warn("[ACF] Remote not found: " .. name)
@@ -590,7 +586,7 @@ function fireRemote(name, ...)
 end
 
 -- ── Button firing ────────────────────────────────────────────
-function fireButton(part)
+local function fireButton(part)
     if not part then return false end
 
     local click = part:FindFirstChildOfClass("ClickDetector")
@@ -619,7 +615,7 @@ function fireButton(part)
     return false
 end
 
-function firePrompt(prompt)
+local function firePrompt(prompt)
     if not prompt then return false end
     if fireproximityprompt then
         local ok, err = pcall(fireproximityprompt, prompt)
@@ -638,7 +634,7 @@ function firePrompt(prompt)
     return false, "No prompt firing primitive or prompt remote available"
 end
 
-function fireClickDetector(detector)
+local function fireClickDetector(detector)
     if not detector then return false end
     if fireclickdetector then
         local ok = pcall(fireclickdetector, detector)
@@ -647,7 +643,7 @@ function fireClickDetector(detector)
     return pcall(function() detector.MouseClick:Fire(player) end)
 end
 
-function refreshPlaytimeReadyRewards(state)
+local function refreshPlaytimeReadyRewards(state)
     if type(state) ~= "table" then return end
     playtimeStateReceived = true
     table.clear(playtimeReadyRewards)
@@ -678,14 +674,14 @@ end
 --  PLOT AUTO-DETECTION
 -- ══════════════════════════════════════════════════════════════
 
-function setPlotNumber(n)
+local function setPlotNumber(n)
     if type(n) ~= "number" or n == Config.PlotNumber then return end
     Config.PlotNumber = n
     warn("[ACF] Plot auto-detected: #" .. tostring(n))
     notify("Plot Detected", "Your plot is slot #" .. tostring(n))
 end
 
-function readPlayerPlotNumber()
+local function readPlayerPlotNumber()
     local iv = player:FindFirstChild("PlotNumber")
     if iv and iv:IsA("IntValue") then return tonumber(iv.Value) end
     local attr = player:GetAttribute("PlotNumber")
@@ -693,7 +689,7 @@ function readPlayerPlotNumber()
     return nil
 end
 
-function autoDetectMyPlotNumber()
+local function autoDetectMyPlotNumber()
     return readPlayerPlotNumber()
 end
 
@@ -746,7 +742,7 @@ task.spawn(function()
     end
 end)
 
-function findPlot(plotNumber)
+local function findPlot(plotNumber)
     local map   = workspace:FindFirstChild("MAP")
     local plots = map and map:FindFirstChild("Plots")
     if plots then
@@ -770,7 +766,7 @@ function findPlot(plotNumber)
     return nil
 end
 
-function getPlotButtons(plotNumber)
+local function getPlotButtons(plotNumber)
     local plot = findPlot(plotNumber)
     if not plot then return nil, nil end
 
@@ -785,7 +781,7 @@ function getPlotButtons(plotNumber)
 end
 
 -- ── Filter logic ─────────────────────────────────────────────
-function normalizeFilterValue(value)
+local function normalizeFilterValue(value)
     if value == nil then return nil end
     local normalized = string.lower(string.gsub(tostring(value), "^%s*(.-)%s*$", "%1"))
     -- The game calls this mutation "Unknow" (without the final n).
@@ -796,7 +792,7 @@ function normalizeFilterValue(value)
     return normalized
 end
 
-function normalizeFilterSelection(value)
+local function normalizeFilterSelection(value)
     local selected = {}
 
     if type(value) ~= "table" then
@@ -824,13 +820,13 @@ function normalizeFilterSelection(value)
     return selected
 end
 
-function filterCompareKey(value)
+local function filterCompareKey(value)
     local normalized = normalizeFilterValue(value)
     if not normalized then return nil end
     return string.gsub(normalized, "[^%w]", "")
 end
 
-function filterValueMatches(value, selected)
+local function filterValueMatches(value, selected)
     if next(selected) == nil then return true end
     local valueKey = filterCompareKey(value)
     if not valueKey then return false end
@@ -853,7 +849,7 @@ end
 -- ════════════════════════════════════════════════════════════════
 
 -- Normalize a pack name for comparison (strips spaces, lowercases).
-function normalizePackName(value)
+local function normalizePackName(value)
     if value == nil then return nil end
     local s = tostring(value)
     s = s:gsub("^%s*(.-)%s*$", "%1")  -- trim
@@ -865,7 +861,7 @@ end
 -- Decode Anime Card Farm compact cash strings:
 -- K, M, B, T, Qd, Qn, Sx, Sp, O, N, Dc.
 -- Returns a number on success, nil on failure.
-function parseCompactCash(text)
+local function parseCompactCash(text)
     if type(text) ~= "string" then return nil end
     text = text:gsub(",", ""):gsub("%s+", "")  -- strip commas and spaces
     text = text:gsub("^%$", "")                -- strip leading $
@@ -919,7 +915,7 @@ end
 -- Get the player's current exact cash as a number.
 -- Primary source: Players.LocalPlayer.CashValue (NumberValue or IntValue).
 -- Fallback: leaderstats.Cash text parsed through parseCompactCash.
-function getPlayerCash()
+local function getPlayerCash()
     local function readCashValue(valueObject)
         if not valueObject or not valueObject:IsA("ValueBase") then
             return nil
@@ -991,7 +987,7 @@ function getPlayerCash()
     return nil
 end
 
-function getPlayerGems()
+local function getPlayerGems()
     local gv = player:FindFirstChild("GemsValue")
     if gv and (gv:IsA("NumberValue") or gv:IsA("IntValue")) then
         return tonumber(gv.Value) or 0
@@ -999,7 +995,7 @@ function getPlayerGems()
     return 0
 end
 
-function getPlayerTraitGems()
+local function getPlayerTraitGems()
     for _, name in ipairs({
         "TraitGemsValue", "TraitGems", "TraitGemValue", "TraitGem",
     }) do
@@ -1036,7 +1032,7 @@ end
 --   packModel.GuiHolder.BillboardGuiInfo.Mutation → child named after mutation (e.g. "Normal")
 
 -- Get the raw price text from the pack's billboard GUI (used only as last resort).
-function getPackPriceText(packModel)
+local function getPackPriceText(packModel)
     if not packModel then return nil end
     local gui = packModel:FindFirstChild("GuiHolder", true)
     local info = gui and gui:FindFirstChild("BillboardGuiInfo", true)
@@ -1068,7 +1064,7 @@ end
 -- Writes a warnOnce if every source fails so the failure is visible in console.
 local PRICE_ATTR_NAMES = { "Price", "Cost", "CashCost", "CashPrice", "cash", "price" }
 
-function getPackPrice(packModel)
+local function getPackPrice(packModel)
     if not packModel then return nil end
 
     -- 1. Model attributes — exact number, no parsing needed.
@@ -1131,7 +1127,7 @@ local IGNORE_UI_CLASSES = {
     UIGridLayout = true, UIFlexItem = true,
 }
 
-function firstMeaningfulChildName(container)
+local function firstMeaningfulChildName(container)
     if not container then return nil end
     for _, child in ipairs(container:GetChildren()) do
         if not IGNORE_UI_CLASSES[child.ClassName] then
@@ -1142,7 +1138,7 @@ function firstMeaningfulChildName(container)
     return nil
 end
 
-function firstMeaningfulTextLabel(container)
+local function firstMeaningfulTextLabel(container)
     if not container then return nil end
     for _, child in ipairs(container:GetChildren()) do
         if not IGNORE_UI_CLASSES[child.ClassName] then
@@ -1157,7 +1153,7 @@ end
 
 -- Get the rarity string from the pack's billboard GUI.
 -- Path: packModel.GuiHolder.BillboardGuiInfo.Rarity.<child name> (e.g. "Epic")
-function getPackRarity(packModel)
+local function getPackRarity(packModel)
     if not packModel then return nil end
     local gui = packModel:FindFirstChild("GuiHolder")
     local info = gui and gui:FindFirstChild("BillboardGuiInfo")
@@ -1184,7 +1180,7 @@ end
 
 -- Get the mutation string from the pack's billboard GUI.
 -- Path: packModel.GuiHolder.BillboardGuiInfo.Mutation.<child name> (e.g. "Normal")
-function getPackMutation(packModel)
+local function getPackMutation(packModel)
     if not packModel then return nil end
     local gui = packModel:FindFirstChild("GuiHolder")
     local info = gui and gui:FindFirstChild("BillboardGuiInfo")
@@ -1213,7 +1209,7 @@ end
 
 local metadataCache = setmetatable({}, { __mode = "k" })
 
-function readBoxValue(box, names)
+local function readBoxValue(box, names)
     for _, name in ipairs(names) do
         local attribute = box:GetAttribute(name)
         if attribute ~= nil then
@@ -1261,7 +1257,7 @@ function readBoxValue(box, names)
     return nil
 end
 
-function getBoxInfo(box)
+local function getBoxInfo(box)
     if not box then return nil end
 
     local packValue = readBoxValue(box, { "Pack", "PackName", "pack" })
@@ -1311,7 +1307,7 @@ function getBoxInfo(box)
     }
 end
 
-function getItemId(container)
+local function getItemId(container)
     local value = readBoxValue(container, {
         "ItemId", "ItemID", "itemId",
     })
@@ -1348,7 +1344,7 @@ function getItemId(container)
     return nil
 end
 
-function getPackId(container)
+local function getPackId(container)
     if not container then return nil end
     local value = readBoxValue(container, {
         "PackId", "PackID", "packId",
@@ -1360,11 +1356,11 @@ end
 -- PackId is useful for recognizing a conveyor object, but the purchase
 -- endpoint uses ItemId. Keep it separate so PackId can never be sent as
 -- ItemId by mistake.
-function hasPackId(container)
+local function hasPackId(container)
     return getPackId(container) ~= nil
 end
 
-function isPackContainer(container, info)
+local function isPackContainer(container, info)
     if not container then return false end
 
     local name = string.lower(container.Name)
@@ -4951,15 +4947,6 @@ if BossRaidRE then
     BossRaidRE.OnClientEvent:Connect(function(eventName, payload)
         if eventName == "State" and type(payload) == "table" then
             currentRaidBossId = tostring(payload.BossId or "")
-            for _, field in ipairs({
-                "Open", "IsOpen", "Available", "IsAvailable",
-                "CanEnter", "Active",
-            }) do
-                if type(payload[field]) == "boolean" then
-                    raidServerOpen = payload[field]
-                    break
-                end
-            end
         end
     end)
     pcall(function() BossRaidRE:FireServer("RequestState") end)
@@ -5019,10 +5006,6 @@ local function findBossRaidTimer()
 end
 
 local function isBossRaidOpen()
-    if raidServerOpen ~= nil then
-        return raidServerOpen == true
-    end
-
     local timer = findBossRaidTimer()
     local text = readRaidTimerText(timer)
     if not text then return false end
