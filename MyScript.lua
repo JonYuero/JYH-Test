@@ -325,7 +325,7 @@ end
 -- ── Remotes ──────────────────────────────────────────────────
 local Remotes    = ReplicatedStorage:WaitForChild("Remotes")
 local ConveyorRE = Remotes:WaitForChild("ConveyorRE")
-local ItemsREForAutomation = Remotes:FindFirstChild("ItemsRE")
+local ItemsREForAutomation = Remotes:WaitForChild("ItemsRE", 15)
 local PlayTimeRewardRE = Remotes:FindFirstChild("PlayTimeRewardRE")
 local DailyRewardRE    = Remotes:FindFirstChild("DailyRewardRE")
 local UpgradesRE       = Remotes:FindFirstChild("UpgradesRE")
@@ -387,19 +387,19 @@ local PACKS = {
     "Hunter Pack", "Soul Pack", "Swordsman Pack", "Gamer Pack",
     "Revenge Pack", "Chainsaw Pack", "Eternity Pack", "Academy Pack",
     "Dynasty Pack", "Grail Pack", "Conquest Pack", "Blaze Pack",
-    "Devour Pack",
+    "Devour Pack", "Raven Pack", "Arcane Pack", "Nightfall Pack",
 }
 
 local POTIONS = {
     "LuckPotion1", "LuckPotion2", "LuckPotion3",
     "CashPotion1", "CashPotion2", "CashPotion3",
-    "MutationPotion1",
+    "MutationPotion1", "MutationPotion2", "MutationPotion3",
     "ProductionPotion1", "ProductionPotion2",
 }
 
 -- Keep the strongest time potion first so pack automation always spends the
 -- best available skip potion before falling back to a weaker one.
-local TIME_POTIONS = { "TimePotion2", "TimePotion1" }
+local TIME_POTIONS = { "TimePotion3", "TimePotion2", "TimePotion1" }
 
 local function normalizeGeneralPotionSelection(selection)
     local valid = {}
@@ -500,10 +500,9 @@ local Config = {
     AutoUpgrade       = false,
     UpgradeDelay      = 0.15,
     CardActionDelay   = 0.6,
-    AutoSell          = false,
     AutoTraitRoll     = false,
     SelectedRankCards = { "All" },
-    TargetRank        = { "UR" },
+    TargetRank        = {},
     SelectedTraitCards = { "All" },
     TargetTraits      = {},
     RankUseGems       = true,
@@ -801,19 +800,26 @@ local function normalizeFilterSelection(value)
 
     local function add(option)
         local normalized = normalizeFilterValue(option)
-        if normalized and normalized ~= "any" and normalized ~= "all" then
+        if normalized == "any" or normalized == "all" then
+            -- "Any" is an explicit wildcard.  Rayfield can return the
+            -- previous selections together with the newly selected wildcard,
+            -- so it must win over those stale values.
+            return true
+        end
+        if normalized then
             selected[normalized] = true
         end
+        return false
     end
 
     local hadArrayValues = false
     for _, option in ipairs(value) do
         hadArrayValues = true
-        add(option)
+        if add(option) then return {} end
     end
     if not hadArrayValues then
         for option, enabled in pairs(value) do
-            if enabled then add(option) end
+            if enabled and add(option) then return {} end
         end
     end
 
@@ -859,7 +865,7 @@ local function normalizePackName(value)
 end
 
 -- Decode Anime Card Farm compact cash strings:
--- K, M, B, T, Qd, Qn, Sx, Sp, O, N, Dc.
+-- K, M, B, T, Qd, Qn, Sx, Sp, O, N, Dc, Ud, Dd, Td.
 -- Returns a number on success, nil on failure.
 local function parseCompactCash(text)
     if type(text) ~= "string" then return nil end
@@ -879,6 +885,9 @@ local function parseCompactCash(text)
         o = 1e27,
         n = 1e30,
         dc = 1e33,
+        ud = 1e36,
+        dd = 1e39,
+        td = 1e42,
     }
 
     -- Try two-letter suffix first, then one-letter suffix, then plain number.
@@ -1562,40 +1571,60 @@ end
 -- Fallback: scan descendants for any enabled buy prompt.
 local function getBuyPrompt(packModel)
     if not packModel then return nil end
-    -- Confirmed exact path from screenshots.
+    -- Confirmed exact path from screenshots. Prefer it when it is explicitly
+    -- a buy prompt, but do not let a generic/disabled prompt hide a better
+    -- matching prompt elsewhere in the same pack.
+    local exactPrompt = nil
     local main = packModel:FindFirstChild("Main")
     if main then
         local prompt = main:FindFirstChild("ProximityPrompt")
         if prompt and prompt:IsA("ProximityPrompt") then
-            -- Accept even if Enabled==false so we can watch it become true.
-            return prompt
+            exactPrompt = prompt
+            if isBuyPrompt(prompt) and prompt.Enabled ~= false then
+                return prompt
+            end
         end
     end
-    -- Recursive fallback: scan all descendants.
-    local firstAny = nil
+
+    -- Recursive fallback: prefer an enabled prompt whose text identifies the
+    -- purchase action. If the confirmed Main prompt exists, keep using it
+    -- before falling back to unrelated enabled prompts.
+    local firstBuyPrompt = nil
+    local firstEnabled = nil
     for _, desc in ipairs(packModel:GetDescendants()) do
         if desc:IsA("ProximityPrompt") then
-            if isBuyPrompt(desc) then return desc end
-            if not firstAny then firstAny = desc end
+            if isBuyPrompt(desc) then
+                if desc.Enabled ~= false then return desc end
+                if not firstBuyPrompt then firstBuyPrompt = desc end
+            end
+            if desc.Enabled ~= false and not firstEnabled then
+                firstEnabled = desc
+            end
         end
     end
-    return firstAny
+    return exactPrompt or firstBuyPrompt or firstEnabled
 end
 
 -- Legacy alias used by prompt-watcher helpers below.
 local findBestBuyPrompt = getBuyPrompt
 
 -- ── Cash safety check ─────────────────────────────────────────────────
--- Returns true when the player has enough cash (and enough reserve) to buy.
--- Returns false, reason string on any failure.
+-- Returns true when the player has enough known cash (and enough reserve) to
+-- buy. Unknown client-side cash/price is allowed through to the server, which
+-- remains authoritative.
 local function canBuyWithCash(record)
     local cash = getPlayerCash()
     if cash == nil then
-        return false, "MissingCashValue"
+        -- Cash can be exposed only through a late-replicating HUD or can be
+        -- represented by a server-side value that the client cannot read.
+        -- The purchase prompt/remote still performs the authoritative check.
+        return true, "CashValueUnavailable"
     end
     local price = record.price
     if price == nil then
-        return false, "InvalidPrice"
+        -- Do not discard a matching pack while its BillboardGui/Cost value is
+        -- still replicating.  The server knows the actual price.
+        return true, "PriceUnavailable"
     end
     if cash < price then
         return false, "NotEnoughCash"
@@ -1651,8 +1680,23 @@ refreshRecordMetadata = function(record, force)
     record.lastMetadataRefresh = now
 
     -- ── NEW: read from confirmed BillboardGuiInfo structure ──────────
-    -- Pack name comes from the model name itself.
-    record.packName = record.model.Name
+    -- Prefer a canonical pack name or the name recovered by getBoxInfo.
+    -- Some live conveyor models are generic names such as BoxBaseModel;
+    -- replacing a resolved pack with that generic name breaks specific pack
+    -- filters while "Any" appears to work.
+    local liveInfo = getBoxInfo(record.model)
+    local modelNameKey = filterCompareKey(record.model.Name)
+    local canonicalPackName = nil
+    for _, packName in ipairs(PACKS) do
+        if filterCompareKey(packName) == modelNameKey then
+            canonicalPackName = packName
+            break
+        end
+    end
+    record.packName = canonicalPackName
+        or (liveInfo and liveInfo.pack)
+        or record.packName
+        or record.model.Name
 
     -- Rarity, mutation from BillboardGuiInfo children.
     local freshRarity   = getPackRarity(record.model)
@@ -1789,7 +1833,8 @@ end
 -- PRIMARY PATH: fireproximityprompt(packModel.Main.ProximityPrompt)
 -- FALLBACK:     ConveyorRE:FireServer("TryBuy", { ItemId = itemId })
 --               only when the prompt path is unavailable.
--- SAFETY RULE:  never fire when cash < price; never fire when price is nil.
+-- SAFETY RULE: never fire when known cash < known price. Unknown values are
+-- allowed through because the server validates the actual transaction.
 tryBuyRecord = function(record)
     if not record or not record.model or record.state ~= "Queued" then
         return false
@@ -2045,7 +2090,7 @@ local function registerPack(packModel)
         info                = info,
 
         -- NEW: confirmed structure fields (populated by refreshRecordMetadata)
-        packName            = packModel.Name,
+        packName            = (info and info.pack) or packModel.Name,
         rarity              = nil,
         mutation            = nil,
         price               = nil,
@@ -2834,23 +2879,6 @@ task.spawn(function()
     end
 end)
 
--- Auto Sell
-task.spawn(function()
-    while true do
-        task.wait(0.75)
-        if not Config.AutoSell then continue end
-        local backpack = player:FindFirstChild("Backpack")
-        if not backpack then continue end
-        for _, item in ipairs(backpack:GetChildren()) do
-            local lvl = item:FindFirstChild("CardLevel")
-            if lvl and lvl.Value >= MAX_CARD_LEVEL then
-                fireRemote("CardSlotRE", "Sell", item.Name)
-                task.wait(0.1)
-            end
-        end
-    end
-end)
-
 -- Auto Potions
 -- Uses ItemsRE.OnClientEvent (same events the game's ItemsClient listens to)
 -- for reliable inventory counts and active boost tracking. The replacement
@@ -3124,20 +3152,38 @@ do
             return tier > active.tier
         end
 
-        -- Mirror the same event the ItemsClient script handles
+        -- Mirror the same events the ItemsClient script handles. The game
+        -- has used both FullInventory and InventoryUpdate for this snapshot,
+        -- so Auto Use Time Potion must understand both versions.
         ItemsRE.OnClientEvent:Connect(function(action, data)
-            if action == "FullInventory" and type(data) == "table" then
-                table.clear(potionCounts)
-                if type(data.Items) == "table" then
-                    for itemId, qty in pairs(data.Items) do
-                        potionCounts[itemId] = qty
+            if (action == "FullInventory" or action == "InventoryUpdate")
+                and type(data) == "table" then
+                if data.ItemId ~= nil then
+                    potionCounts[data.ItemId] = data.Quantity
+                        or data.QuantityValue or data.Amount
+                        or data.Count or 0
+                else
+                    local items = data.Items or data.Inventory or data.ItemsData
+                    if type(items) ~= "table" then
+                        -- Some game versions send the item map directly.
+                        items = data
+                    end
+                    if action == "FullInventory" then
+                        table.clear(potionCounts)
+                    end
+                    for itemId, quantity in pairs(items) do
+                        if itemId ~= "Items" and itemId ~= "Inventory"
+                            and itemId ~= "ItemsData" then
+                            potionCounts[itemId] = quantity
+                        end
                     end
                 end
                 applyBoosts(data.Boosts)
                 pendingPotion = nil
 
             elseif action == "ItemUpdate" and type(data) == "table" then
-                potionCounts[data.ItemId] = data.Quantity or 0
+                potionCounts[data.ItemId] = data.Quantity or data.QuantityValue
+                or data.Amount or data.Count or 0
 
             elseif action == "BoostUpdate" then
                 applyBoosts(data)
@@ -4056,11 +4102,11 @@ end)
 task.spawn(function()
     while true do
         task.wait(0.15)
-        -- Card Ranking always owns the reroll worker first. Traits starts
-        -- automatically after ranking has been stopped/completed.
-        if not Config.AutoTraitRoll
-            or Config.AutoRankRoll
-            or rankRollPending then
+        -- Trait and ranking rerolls use separate remotes and may run at the
+        -- same time.  Do not use ActiveAutoRoll or the other script toggle as
+        -- a shared mutex: the game's built-in auto-roll uses that attribute
+        -- to coordinate only its own two UI workers.
+        if not Config.AutoTraitRoll then
             continue
         end
         if not TraitRollRE then
@@ -4083,10 +4129,10 @@ task.spawn(function()
         local progressed = false
         local cardsRemaining = false
         for _, tool in ipairs(cards) do
-            if not Config.AutoTraitRoll or Config.AutoRankRoll then break end
+            if not Config.AutoTraitRoll then break end
             if not tool.Parent then continue end
-            while Config.AutoTraitRoll and not Config.AutoRankRoll
-                and tool.Parent and not traitHasTarget(tool) do
+            while Config.AutoTraitRoll and tool.Parent
+                and not traitHasTarget(tool) do
                 cardsRemaining = true
                 local gemCost = getTraitGemsCost()
                 if getTraitGems() < gemCost then
@@ -4102,8 +4148,8 @@ task.spawn(function()
                 end)
 
                 local deadline = os.clock() + 8
-                while Config.AutoTraitRoll and not Config.AutoRankRoll
-                    and traitRollPending and not traitRollResponse
+                while Config.AutoTraitRoll and traitRollPending
+                    and not traitRollResponse
                     and os.clock() < deadline do
                     task.wait(0.1)
                 end
@@ -4216,15 +4262,68 @@ end)
 -- Time potions are not category boosts.  They reduce pack cooldowns, so
 -- they are handled separately from Misc > Auto Use Potions.
 task.spawn(function()
+    -- Inventory item ids have used both compact ids (TimePotion3) and
+    -- display-style ids (Time Potion III) across game revisions. Keep the
+    -- configured compact names, but send the exact key received from server.
+    local function normalizePotionInventoryId(value)
+        local text = string.lower(tostring(value or ""))
+        text = string.gsub(text, "[^%w]", "")
+        if string.sub(text, -3) == "iii" then
+            text = string.sub(text, 1, -4) .. "3"
+        elseif string.sub(text, -2) == "ii" then
+            text = string.sub(text, 1, -3) .. "2"
+        elseif string.sub(text, -1) == "i" then
+            text = string.sub(text, 1, -2) .. "1"
+        end
+        return text
+    end
+
+    local function inventoryQuantity(value)
+        if type(value) == "table" then
+            return tonumber(
+                value.Quantity or value.quantity
+                    or value.Amount or value.amount
+                    or value.Count or value.count
+            ) or 0
+        end
+        return tonumber(value) or 0
+    end
+
+    local function findPotionInventoryItem(preferredId)
+        local preferredKey = normalizePotionInventoryId(preferredId)
+        local directQuantity = inventoryQuantity(
+            potionInventoryCounts[preferredId]
+        )
+        if directQuantity > 0 then
+            return preferredId, directQuantity
+        end
+
+        for itemId, quantity in pairs(potionInventoryCounts) do
+            local amount = inventoryQuantity(quantity)
+            if amount > 0
+                and normalizePotionInventoryId(itemId) == preferredKey then
+                return itemId, amount
+            end
+        end
+        return nil, 0
+    end
+
+    local nextInventorySync = 0
     while true do
         task.wait(1)
         if not Config.AutoTimePotion then continue end
-        if not Config.AutoPlacePack or not Config.AutoOpenPack then continue end
-        if os.clock() < nextTimePotionUse then continue end
         if not ItemsREForAutomation then continue end
 
-        local packs = getAllPacksInBackpack()
-        if #packs == 0 then continue end
+        local now = os.clock()
+        -- Keep this feature independent from Misc > Auto Use Potions. The
+        -- time-potion toggle can be enabled by itself and still receives
+        -- current inventory data.
+        if now >= nextInventorySync then
+            pcall(function() ItemsREForAutomation:FireServer("Init") end)
+            nextInventorySync = now + 5
+        end
+
+        if now < nextTimePotionUse then continue end
         if not areAllCardSlotsOccupied() then continue end
 
         local hasCooldown = false
@@ -4238,14 +4337,15 @@ task.spawn(function()
 
         local selectedPotion
         for _, potion in ipairs(TIME_POTIONS) do
-            if (potionInventoryCounts[potion] or 0) > 0 then
-                selectedPotion = potion
+            local inventoryItem, quantity = findPotionInventoryItem(potion)
+            if inventoryItem and quantity > 0 then
+                selectedPotion = inventoryItem
                 break
             end
         end
         if not selectedPotion then continue end
 
-        pcall(function()
+        local used = pcall(function()
             ItemsREForAutomation:FireServer("UseItem", {
                 ItemId = selectedPotion,
                 Amount = 1,
@@ -4253,7 +4353,7 @@ task.spawn(function()
         end)
         -- Give ItemUpdate/UseOk time to arrive before considering another
         -- time potion. This prevents remote spam if the server is slow.
-        nextTimePotionUse = os.clock() + 1.5
+        nextTimePotionUse = os.clock() + (used and 3 or 1)
     end
 end)
 
@@ -4434,11 +4534,13 @@ end
 
 clickGuiButton = function(button)
     if not button or not button:IsA("GuiButton") then return false end
+    -- Do not fire hidden duplicate buttons. Combat screens keep several
+    -- copies of Exit/Battle controls in the hierarchy across UI states.
+    if button:IsA("GuiObject") and not button.Visible then return false end
     if firesignal then
         local ok = pcall(firesignal, button.MouseButton1Click)
         if ok then return true end
     end
-    if button:IsA("GuiObject") and not button.Visible then return false end
     return pcall(function() button:Activate() end)
 end
 
@@ -4688,16 +4790,16 @@ end
 
 local RAID_DIFFICULTY_INFO = {
     Easy = {
-        damage = "1.3B",
-        description = "At least 1.3B damage per card.",
+        damage = "2.1B",
+        description = "At least 2.1B damage per card.",
     },
     Medium = {
-        damage = "24.4Qn",
-        description = "At least 24.4Qn damage per card.",
+        damage = "412.9Qn",
+        description = "At least 412.9Qn damage per card.",
     },
     Hard = {
-        damage = "4.7O",
-        description = "At least 4.7O damage per card.",
+        damage = "617.7O",
+        description = "At least 617.7O damage per card.",
     },
     Nightmare = {
         damage = "13.1O",
@@ -4793,43 +4895,44 @@ local function readRaidTimerText(timer)
     return nil
 end
 
-local function findBossRaidTimer()
-    local bossRaidModel = workspace:FindFirstChild("BossRaidModel", true)
-    if not bossRaidModel then
-        bossRaidModel = playerGui:FindFirstChild("BossRaidModel", true)
+function findBossRaidTimer()
+    local roots = {
+        workspace:FindFirstChild("BossRaidModel", true),
+        workspace:FindFirstChild("BossRaid", true),
+        playerGui:FindFirstChild("BossRaidModel", true),
+        playerGui:FindFirstChild("BossRaidGui", true),
+        getCombatGui("BossRaid"),
+    }
+    local timerNames = {
+        "Timer", "TimeLeft", "TimeRemaining", "Countdown",
+    }
+
+    for _, root in ipairs(roots) do
+        if root then
+            for _, name in ipairs(timerNames) do
+                local timer = findGuiByName(root, name)
+                    or root:FindFirstChild(name, true)
+                if timer then return timer end
+            end
+        end
     end
-    return bossRaidModel and bossRaidModel:FindFirstChild("Timer", true)
+    return nil
 end
 
-local function isBossRaidOpen()
-    local timer = findBossRaidTimer()
-    local text = readRaidTimerText(timer)
-    if not text then return false end
-
-    local normalized = string.lower(text)
-    return string.find(normalized, "end in", 1, true) ~= nil
-end
-
-local function resetRaidAttemptAfterClosedWindow()
-    if isBossRaidOpen() then
-        raidClosedSince = nil
-        return
-    end
-
-    local now = os.clock()
-    raidClosedSince = raidClosedSince or now
-    -- Require a stable closed state before re-arming. This avoids a brief
-    -- timer/UI replication gap reopening the same hourly attempt.
-    if now - raidClosedSince >= 3 then
-        raidAttemptConsumed = false
-        clearCompletedRaidDifficulties()
-    end
+function isBossRaidOpen()
+    -- Use the exact timer text shown in the Boss Raid description. This keeps
+    -- the UI and the combat-priority decision on one source of truth.
+    return string.find(
+        string.lower(raidTimerText or ""),
+        "end in",
+        1,
+        true
+    ) ~= nil
 end
 
 task.spawn(function()
     while true do
         task.wait(0.5)
-        resetRaidAttemptAfterClosedWindow()
         local timer = findBossRaidTimer()
         local text = readRaidTimerText(timer)
         if text and text ~= "" then
@@ -4839,34 +4942,26 @@ task.spawn(function()
         else
             raidTimerText = "Boss Raid is currently unavailable"
         end
+
+        -- Update the shared description value before checking readiness. The
+        -- scheduler and the visible Boss Raid description now read the same
+        -- timer text on every pass.
+        if isBossRaidOpen() then
+            raidClosedSince = nil
+        else
+            local now = os.clock()
+            raidClosedSince = raidClosedSince or now
+            -- Require a stable closed state before re-arming. This avoids a brief
+            -- timer/UI replication gap reopening the same hourly attempt.
+            if now - raidClosedSince >= 3 then
+                raidAttemptConsumed = false
+                clearCompletedRaidDifficulties()
+            end
+        end
+
         updateRaidInfoDisplay(Config.RaidDifficulties)
     end
 end)
-
-local function clickBackpackEquipBest()
-    return doEquipBestCards(4) ~= nil
-end
-
-local function equipBestCardsWithRetry()
-    for _ = 1, 2 do
-        local placed = doEquipBestCards(4)
-        if placed and placed > 0 then
-            return true
-        end
-        task.wait(CARD_REMOVAL_DELAY)
-    end
-    return false
-end
-
-local function waitForBossRaidConfirmation()
-    for _ = 1, 20 do
-        if player:GetAttribute("BossRaidInBattle") == true then
-            return true
-        end
-        task.wait(0.15)
-    end
-    return false
-end
 
 startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     -- BossRaidRewardClient claims the reward from its CLOSE button. Never
@@ -4922,7 +5017,15 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
         -- Do not wait for the battle attribute: a rejected/failed start must
         -- not cause the polling loop to spam the server repeatedly.
         raidAttemptConsumed = true
-        if waitForBossRaidConfirmation() then
+        local raidConfirmed = false
+        for _ = 1, 20 do
+            if player:GetAttribute("BossRaidInBattle") == true then
+                raidConfirmed = true
+                break
+            end
+            task.wait(0.15)
+        end
+        if raidConfirmed then
             completedRaidDifficulties[raidDifficulty] = true
         else
             return false
@@ -4940,7 +5043,7 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     return true
 end
 
-local combatBusy = false
+combatBusy = false
 
 -- One scheduler owns both modes.  Boss Raid is evaluated first on every
 -- pass, including while Tower is active, so "End in" cannot be missed.
@@ -4972,7 +5075,16 @@ task.spawn(function()
 
             if not isCombatActive() then
                 if Config.AutoTeamCardCycle then
-                    if equipBestCardsWithRetry() then
+                    local cardsEquipped = false
+                    for _ = 1, 2 do
+                        local placed = doEquipBestCards(4)
+                        if placed and placed > 0 then
+                            cardsEquipped = true
+                            break
+                        end
+                        task.wait(CARD_REMOVAL_DELAY)
+                    end
+                    if cardsEquipped then
                         startCombatBattle(
                             "BossRaid",
                             Config.AutoRaidEquip,
@@ -4995,7 +5107,16 @@ task.spawn(function()
         if towerEnabled and not isCombatActive() then
             combatBusy = true
             if Config.AutoTeamCardCycle then
-                if equipBestCardsWithRetry() then
+                local cardsEquipped = false
+                for _ = 1, 2 do
+                    local placed = doEquipBestCards(4)
+                    if placed and placed > 0 then
+                        cardsEquipped = true
+                        break
+                    end
+                    task.wait(CARD_REMOVAL_DELAY)
+                end
+                if cardsEquipped then
                     startCombatBattle(
                         "InfinityTower",
                         Config.AutoInfinityEquip,
@@ -5021,7 +5142,7 @@ end)
 -- Luau limits the number of local registers in the top-level chunk; without
 -- this boundary the many UI controls added below make the whole script fail
 -- during compilation with "Out of local registers".
-local function buildUserInterface()
+function buildUserInterface()
 
 local ConfigManager = {
     ConfigName        = "",
@@ -5095,7 +5216,6 @@ local function buildSerializableConfig()
         AutoUpgrade       = Config.AutoUpgrade,
         UpgradeDelay      = Config.UpgradeDelay,
         CardActionDelay   = Config.CardActionDelay,
-        AutoSell          = Config.AutoSell,
         AutoTraitRoll     = Config.AutoTraitRoll,
         SelectedRankCards  = Config.SelectedRankCards,
         TargetRank         = Config.TargetRank,
@@ -5243,7 +5363,7 @@ local function loadConfig(name, isAutoload)
         "AutoSpawnPack", "SpawnDelay", "AutoStopSpawn", "AutoBuyMatching",
         "AutoCarryBox", "AutoSellBox", "AutoSellDelay",
         "SelectedRarities", "SelectedMutations", "SelectedPacks",
-        "AutoUpgrade", "UpgradeDelay", "CardActionDelay", "AutoSell",
+        "AutoUpgrade", "UpgradeDelay", "CardActionDelay",
         "AutoTraitRoll", "SelectedRankCards", "TargetRank",
         "SelectedTraitCards", "TargetTraits",
         "RankUseGems", "RankUseCash", "AutoRankRoll",
@@ -5479,7 +5599,7 @@ Controls.SelectedMutations = spawnTab:CreateDropdown({
 -- ══════════════════════════════════════════════════════════════
 --  TAB 2 – Cards
 -- ══════════════════════════════════════════════════════════════
-local cardsTab = Window:CreateTab("⬆️ Cards", 0)
+local cardsTab = Window:CreateTab("🃏 Cards", 0)
 
 cardsTab:CreateSection("Card Management")
 
@@ -5509,9 +5629,15 @@ Controls.AutoTimePotion = cardsTab:CreateToggle({
     Callback     = function(v) Config.AutoTimePotion = v end,
 })
 
-cardsTab:CreateParagraph({
-    Title   = "Auto Time Potion behavior",
-    Content = "After all pack slots are occupied, Time Potions are used only while packs remain in your backpack and at least one placed pack is still on cooldown.",
+cardsTab:CreateButton({
+    Name     = "Equip Best Cards",
+    Callback = function()
+        local ok = fireRemote("CardSlotRE", "EquipBest")
+        notify(
+            "Equip Best Cards",
+            ok and "Equip Best request sent." or "Could not send Equip Best request."
+        )
+    end,
 })
 
 cardsTab:CreateButton({
@@ -5553,10 +5679,166 @@ Controls.UpgradeDelay = cardsTab:CreateSlider({
     Callback     = function(v) Config.UpgradeDelay = v end,
 })
 
+local sellConfirmationGui
+
+local function closeSellConfirmation()
+    if sellConfirmationGui then
+        pcall(function() sellConfirmationGui:Destroy() end)
+        sellConfirmationGui = nil
+    end
+end
+
+local function confirmSellAction(label, action)
+    closeSellConfirmation()
+
+    local messageByAction = {
+        SellAll = "Are you sure you want to sell all?",
+        SellCards = "Are you sure you want to sell all cards?",
+        SellPacks = "Are you sure you want to sell all packs?",
+    }
+
+    local confirmationGui = Instance.new("ScreenGui")
+    confirmationGui.Name = "JYH_SellConfirmation"
+    confirmationGui.DisplayOrder = 10000
+    confirmationGui.ResetOnSpawn = false
+    confirmationGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    confirmationGui.Parent = playerGui
+    sellConfirmationGui = confirmationGui
+
+    local overlay = Instance.new("Frame")
+    overlay.Name = "Overlay"
+    overlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    overlay.BackgroundTransparency = 0.45
+    overlay.BorderSizePixel = 0
+    overlay.Size = UDim2.fromScale(1, 1)
+    overlay.Parent = confirmationGui
+
+    local panel = Instance.new("Frame")
+    panel.Name = "Panel"
+    panel.AnchorPoint = Vector2.new(0.5, 0.5)
+    panel.Position = UDim2.fromScale(0.5, 0.5)
+    panel.Size = UDim2.fromOffset(360, 170)
+    panel.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+    panel.BorderSizePixel = 0
+    panel.Parent = overlay
+
+    local panelCorner = Instance.new("UICorner")
+    panelCorner.CornerRadius = UDim.new(0, 10)
+    panelCorner.Parent = panel
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.fromOffset(20, 16)
+    title.Size = UDim2.new(1, -40, 0, 28)
+    title.Font = Enum.Font.GothamBold
+    title.Text = "Confirm sale"
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.TextSize = 20
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = panel
+
+    local message = Instance.new("TextLabel")
+    message.Name = "Message"
+    message.BackgroundTransparency = 1
+    message.Position = UDim2.fromOffset(20, 52)
+    message.Size = UDim2.new(1, -40, 0, 40)
+    message.Font = Enum.Font.Gotham
+    message.Text = messageByAction[action] or ("Are you sure you want to " .. label .. "?")
+    message.TextColor3 = Color3.fromRGB(220, 220, 225)
+    message.TextSize = 16
+    message.TextWrapped = true
+    message.TextXAlignment = Enum.TextXAlignment.Left
+    message.Parent = panel
+
+    local function makeButton(name, text, color, position)
+        local button = Instance.new("TextButton")
+        button.Name = name
+        button.Position = position
+        button.Size = UDim2.fromOffset(145, 38)
+        button.BackgroundColor3 = color
+        button.BorderSizePixel = 0
+        button.Font = Enum.Font.GothamBold
+        button.Text = text
+        button.TextColor3 = Color3.fromRGB(255, 255, 255)
+        button.TextSize = 16
+        button.Parent = panel
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 7)
+        corner.Parent = button
+        return button
+    end
+
+    local noButton = makeButton(
+        "No",
+        "No",
+        Color3.fromRGB(75, 75, 85),
+        UDim2.new(0, 20, 1, -54)
+    )
+    local yesButton = makeButton(
+        "Yes",
+        "Yes",
+        Color3.fromRGB(205, 65, 75),
+        UDim2.new(1, -165, 1, -54)
+    )
+
+    local finished = false
+    local function finish(confirmed)
+        if finished then return end
+        finished = true
+        closeSellConfirmation()
+        if not confirmed then return end
+
+        local ok = fireRemote("SellRE", action)
+        notify(
+            label,
+            ok and "Sell request sent." or "Could not send sell request."
+        )
+    end
+
+    yesButton.Activated:Connect(function() finish(true) end)
+    noButton.Activated:Connect(function() finish(false) end)
+end
+
+cardsTab:CreateSection("Sell")
+
+cardsTab:CreateButton({
+    Name     = "Auto Sell All",
+    Callback = function()
+        confirmSellAction("Auto Sell All", "SellAll")
+    end,
+})
+
+cardsTab:CreateButton({
+    Name     = "Auto Sell Cards",
+    Callback = function()
+        confirmSellAction("Auto Sell Cards", "SellCards")
+    end,
+})
+
+cardsTab:CreateButton({
+    Name     = "Auto Sell Packs",
+    Callback = function()
+        confirmSellAction("Auto Sell Packs", "SellPacks")
+    end,
+})
+
+cardsTab:CreateButton({
+    Name     = "Auto Sell on Hand",
+    Callback = function()
+        local ok = fireRemote("SellRE", "SellHand")
+        notify(
+            "Auto Sell on Hand",
+            ok and "Sell request sent." or "Could not send sell request."
+        )
+    end,
+})
+
 -- ══════════════════════════════════════════════════════════════
---  TAB 3 – Auto Sell
+--  TAB 3 – Box & Craft
 -- ══════════════════════════════════════════════════════════════
-local autoSellTab = Window:CreateTab("📦 Auto Sell", 0)
+local autoSellTab = Window:CreateTab("📦 Box & Craft", 0)
 
 autoSellTab:CreateSection("Box Handling")
 
@@ -5582,15 +5864,6 @@ Controls.AutoSellDelay = autoSellTab:CreateSlider({
     CurrentValue = Config.AutoSellDelay,
     Flag         = "AutoSellDelay",
     Callback     = function(v) Config.AutoSellDelay = v end,
-})
-
-autoSellTab:CreateSection("Cards")
-
-autoSellTab:CreateToggle({
-    Name         = "Auto Sell Cards",
-    CurrentValue = Config.AutoSell,
-    Flag         = "AutoSell",
-    Callback     = function(v) Config.AutoSell = v end,
 })
 
 -- ══════════════════════════════════════════════════════════════
@@ -5693,7 +5966,7 @@ local rerollTab = Window:CreateTab("🔄 Reroll", 0)
 
 rerollTab:CreateParagraph({
     Title   = "⚠️ Before You Reroll",
-    Content = "Do not hold or equip a card while rerolling is active. Held or equipped cards are removed from your backpack, making them invisible to the script — those cards will be skipped entirely until you put them away.",
+    Content = "Do not hold or equip a card while rerolling is active. Held or equipped cards are skipped entirely.",
 })
 
 rerollTab:CreateSection("Card Ranking")
@@ -5725,7 +5998,7 @@ local validTargets = {}
 for _, r in ipairs(Config.TargetRank) do
     if validRankSet[r] then table.insert(validTargets, r) end
 end
-Config.TargetRank = #validTargets > 0 and validTargets or { rankOptions[1] or "UR" }
+Config.TargetRank = validTargets
 
 Controls.TargetRank = rerollTab:CreateDropdown({
     Name            = "Target Ranking",
@@ -5735,7 +6008,7 @@ Controls.TargetRank = rerollTab:CreateDropdown({
     Flag            = "TargetRank",
     Callback        = function(v)
         if type(v) == "string" then v = { v } end
-        Config.TargetRank = (type(v) == "table" and #v > 0) and v or { rankOptions[1] or "UR" }
+        Config.TargetRank = (type(v) == "table" and #v > 0) and v or {}
     end,
 })
 
@@ -5767,11 +6040,6 @@ Controls.AutoRankRoll = rerollTab:CreateToggle({
             notify("Card Ranking", "GradeRollRE was not found.")
         end
     end,
-})
-
-rerollTab:CreateParagraph({
-    Title   = "Card Ranking behavior",
-    Content = "Selected cards are rerolled one at a time until they reach the target ranking. Gems are used first; cash is used only after gems reach zero.",
 })
 
 rerollTab:CreateSection("Traits")
@@ -5843,11 +6111,6 @@ Controls.AutoTraitRoll = rerollTab:CreateToggle({
     end,
 })
 
-rerollTab:CreateParagraph({
-    Title   = "Traits behavior",
-    Content = "Selected cards are rerolled until they reach one of the selected traits. Trait rerolls use Trait Gems only and stop immediately when no Trait Gems remain. If both rerolls are enabled, Card Ranking runs first.",
-})
-
 -- ══════════════════════════════════════════════════════════════
 --  TAB 6 – Misc
 -- ══════════════════════════════════════════════════════════════
@@ -5876,11 +6139,6 @@ Controls.AutoPotion = miscTab:CreateToggle({
     CurrentValue = Config.AutoPotion,
     Flag         = "AutoPotion",
     Callback     = function(v) Config.AutoPotion = v end,
-})
-
-miscTab:CreateParagraph({
-    Title   = "Potion behavior",
-    Content = "Only selected potions that you own are used. A potion waits until its category timer reaches zero; a higher tier can replace a lower tier and its confirmation is accepted automatically.",
 })
 
 miscTab:CreateSection("Auto Buy Boost")
