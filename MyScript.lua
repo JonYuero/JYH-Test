@@ -362,6 +362,7 @@ local RuntimeState = {
     playtimeReadyRewards  = {},
     playtimeStateReceived = false,
     potionInventoryCounts = {},
+    potionInventoryReceived = false,
     nextTimePotionUse     = 0,
     pendingTimePotion     = nil,
 }
@@ -3225,8 +3226,10 @@ do
             -- A running potion in the same category blocks an equal or
             -- weaker potion.  A higher tier is allowed through so the live
             -- game's confirmation dialog can ask whether to replace it.
+            -- Some game revisions omit the active potion tier; in that case
+            -- let the server decide instead of silently disabling automation.
             if not tier or not active.tier then
-                return false
+                return true
             end
             return tier > active.tier
         end
@@ -3323,6 +3326,7 @@ do
                     mirrorInventoryItems(items)
                 end
                 applyBoosts(data.Boosts)
+                RuntimeState.potionInventoryReceived = true
                 pendingPotion = nil
 
             elseif action == "ItemUpdate" and type(data) == "table" then
@@ -3374,7 +3378,19 @@ do
                 local now = os.clock()
                 if now >= nextInventorySync then
                     pcall(function() ItemsRE:FireServer("Init") end)
-                    nextInventorySync = now + 5
+                    -- Keep requesting until the event handler has received a
+                    -- snapshot. This matters when the script is executed
+                    -- after the game's ItemsClient already initialized.
+                    nextInventorySync = now
+                        + (RuntimeState.potionInventoryReceived and 5 or 1)
+                end
+
+                if not RuntimeState.potionInventoryReceived then
+                    warnOnce(
+                        "AutoPotion:no-inventory-snapshot",
+                        "Auto Potion is waiting for ItemsRE FullInventory."
+                    )
+                    continue
                 end
 
                 if pendingPotion then
@@ -3402,10 +3418,24 @@ do
                     return (leftTier or 0) > (rightTier or 0)
                 end)
 
+                if #candidates == 0 then
+                    warnOnce(
+                        "AutoPotion:no-selected-inventory-item",
+                        "Auto Potion found no selected potion in the inventory."
+                    )
+                end
+
                 for _, candidate in ipairs(candidates) do
                     local potion = candidate.configuredId
                     local inventoryId = candidate.inventoryId
-                    if not canUsePotion(potion) then continue end
+                    if not canUsePotion(potion) then
+                        warnOnce(
+                            "AutoPotion:blocked-" .. tostring(potion),
+                            "Auto Potion skipped " .. tostring(potion)
+                                .. " because an equal or stronger boost is active."
+                        )
+                        continue
+                    end
                     -- Match the Items UI: spend five when possible, otherwise
                     -- fall back to a single potion.
                     local amount = candidate.quantity >= 5 and 5 or 1
