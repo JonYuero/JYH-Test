@@ -4741,6 +4741,41 @@ exitInfinityTowerBattle = function()
         return true
     end
 
+    local hideBattleRoot = getCombatGui("HideBattle")
+
+    -- Auto Hide Battle leaves the tower running behind the compact
+    -- HideBattle control.  In that state the Exit button is not available
+    -- until the same button is clicked to show the battle again.
+    local function clickShowBattleButton(root)
+        if not root then return false end
+
+        local function isShowBattleText(button)
+            if not button:IsA("TextButton") then return false end
+            local text = string.lower(tostring(button.Text or ""))
+            return string.find(text, "show", 1, true) ~= nil
+                and string.find(text, "battle", 1, true) ~= nil
+        end
+
+        local namedButton = findGuiByName(root, "Hide")
+        if namedButton and isShowBattleText(namedButton)
+            and clickGuiButton(namedButton) then
+            return true
+        end
+
+        for _, descendant in ipairs(root:GetDescendants()) do
+            if isShowBattleText(descendant)
+                and clickGuiButton(descendant) then
+                return true
+            end
+        end
+        return false
+    end
+
+    if clickShowBattleButton(hideBattleRoot) then
+        -- Let the full battle controls replicate before looking for Exit.
+        task.wait(0.25)
+    end
+
     local roots = {
         getCombatGui("InfinityTower"),
         getCombatGui("HideBattle"),
