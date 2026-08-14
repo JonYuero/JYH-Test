@@ -3110,36 +3110,35 @@ do
 
         local function potionDetails(itemId)
             local name = string.lower(tostring(itemId or ""))
-            -- Inventory keys are not consistent between game versions.
-            -- Besides LuckPotion1 / "Luck Potion I", some versions expose
-            -- display-style ids such as "Luck I" or "Cash_II".  Match the
-            -- family and tier after removing separators so all of those
-            -- representations resolve to the same potion.
-            local compactName = string.gsub(name, "[^%w]", "")
             local family
-            if string.find(compactName, "luck", 1, true) then
+            if string.find(name, "luckpotion", 1, true)
+                or string.find(name, "luck potion", 1, true) then
                 family = "luck"
-            elseif string.find(compactName, "cash", 1, true) then
+            elseif string.find(name, "cashpotion", 1, true)
+                or string.find(name, "cash potion", 1, true) then
                 family = "cash"
-            elseif string.find(compactName, "time", 1, true) then
+            elseif string.find(name, "timepotion", 1, true)
+                or string.find(name, "time potion", 1, true) then
                 family = "time"
-            elseif string.find(compactName, "mutation", 1, true) then
+            elseif string.find(name, "mutationpotion", 1, true)
+                or string.find(name, "mutation potion", 1, true) then
                 family = "mutation"
-            elseif string.find(compactName, "production", 1, true) then
+            elseif string.find(name, "productionpotion", 1, true)
+                or string.find(name, "production potion", 1, true) then
                 family = "production"
             end
             if not family then return nil, nil end
 
-            local tier = tonumber(string.match(compactName, "(%d+)$"))
+            local tier = tonumber(string.match(name, "(%d+)$"))
             if not tier then
-                local roman = string.match(compactName, "(iii)$")
+                local roman = string.match(name, "(iii)$")
                 if roman then
                     tier = 3
                 else
-                    roman = string.match(compactName, "(ii)$")
+                    roman = string.match(name, "(ii)$")
                     if roman then
                         tier = 2
-                    elseif string.match(compactName, "([^iv]|^)i$") then
+                    elseif string.match(name, "([^iv]|^)i$") then
                         tier = 1
                     end
                 end
@@ -3301,15 +3300,9 @@ do
                     local nestedQuantity = readItemQuantity(quantity)
                     if nestedItemId ~= nil and nestedQuantity ~= nil then
                         storePotionQuantity(nestedItemId, nestedQuantity)
-                    elseif potionDetails(itemId) then
-                        -- Some snapshots use display-style item ids as the
-                        -- map key and put the count inside a nested record.
-                        storePotionQuantity(itemId, quantity)
                     elseif itemId ~= "Items" and itemId ~= "Inventory"
                         and itemId ~= "ItemsData" then
-                        -- Keep walking unknown containers.  This covers
-                        -- versions that wrap the item map one level deeper.
-                        mirrorInventoryItems(quantity)
+                        storePotionQuantity(itemId, quantity)
                     end
                 elseif itemId ~= "Items" and itemId ~= "Inventory"
                     and itemId ~= "ItemsData" then
@@ -4579,9 +4572,9 @@ task.spawn(function()
     end
 end)
 
--- ── Auto Use Time Potion ──────────────────────────────────────
--- Time potions are not category boosts.  They are handled separately from
--- Misc > Auto Use Potions and are used whenever this toggle is enabled.
+-- ── Auto Use Time Potion for full plots ───────────────────────
+-- Time potions are not category boosts.  They reduce pack cooldowns, so
+-- they are handled separately from Misc > Auto Use Potions.
 task.spawn(function()
     -- Inventory item ids have used both compact ids (TimePotion3) and
     -- display-style ids (Time Potion III) across game revisions. Keep the
@@ -4652,6 +4645,10 @@ task.spawn(function()
         end
 
         if now < RuntimeState.nextTimePotionUse then continue end
+        -- Only spend a time potion while at least one pack exposes an active
+        -- Skip prompt/cooldown.  Do not require every card slot to be filled:
+        -- one pack is enough to reduce its cooking time.
+        if not hasCardCooldownToSkip() then continue end
 
         local selectedPotion
         for _, potion in ipairs(TIME_POTIONS) do
