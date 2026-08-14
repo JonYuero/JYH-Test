@@ -3612,44 +3612,49 @@ end
 local function slotIsOnCooldown(slotModel)
     if not slotModel then return false end
 
-    local function inspectAttributes(instance)
-        for name, value in pairs(instance:GetAttributes()) do
-            local field = isCooldownFieldName(name)
-            local lowerName = string.lower(tostring(name))
-            if field or string.find(lowerName, "isoncooldown", 1, true)
-                or string.find(lowerName, "cooldownactive", 1, true) then
-                if type(value) == "boolean" then
-                    if value then return true end
-                elseif cooldownTextIsActive(value, true) then
-                    return true
-                end
-            end
-        end
-        return false
-    end
+    -- Confirmed live game structure:
+    --
+    -- CardSlot
+    --   └─ PromptHolder
+    --       └─ ProximityPrompt
+    --
+    -- While a placed pack is opening, the prompt ActionText is shown as
+    -- something like "Skip 30min".  Use that prompt as the authoritative
+    -- cooldown signal instead of guessing from timer labels/attributes.
+    local promptHolder = slotModel:FindFirstChild("PromptHolder", true)
 
-    if inspectAttributes(slotModel) then return true end
-    for _, desc in ipairs(slotModel:GetDescendants()) do
-        if inspectAttributes(desc) then return true end
+    if promptHolder then
+        local prompt = promptHolder:FindFirstChildWhichIsA(
+            "ProximityPrompt",
+            true
+        )
 
-        local field = isCooldownFieldName(desc.Name)
-        if desc:IsA("ValueBase") and field
-            and cooldownTextIsActive(desc.Value, true) then
-            return true
-        end
+        if prompt then
+            local actionText = string.lower(
+                tostring(prompt.ActionText or "")
+            )
 
-        if desc:IsA("TextLabel") or desc:IsA("TextButton")
-            or desc:IsA("TextBox") then
-            if cooldownTextIsActive(desc.Text, field) then
-                return true
-            end
-        elseif desc:IsA("ProximityPrompt") then
-            if cooldownTextIsActive(desc.ActionText, false)
-                or cooldownTextIsActive(desc.ObjectText, false) then
+            if string.find(actionText, "skip", 1, true) then
                 return true
             end
         end
     end
+
+    -- Compatibility fallback: if the game moves PromptHolder but still keeps
+    -- a ProximityPrompt under the slot, only accept prompts whose ActionText
+    -- explicitly contains "skip".
+    for _, descendant in ipairs(slotModel:GetDescendants()) do
+        if descendant:IsA("ProximityPrompt") then
+            local actionText = string.lower(
+                tostring(descendant.ActionText or "")
+            )
+
+            if string.find(actionText, "skip", 1, true) then
+                return true
+            end
+        end
+    end
+
     return false
 end
 
