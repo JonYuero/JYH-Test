@@ -372,6 +372,33 @@ local raidState = {
     RetryAt = 0,
 }
 
+-- Card Craft is driven by the same CardCraftRE used by the game's own
+-- CardCraftClient. Keep all live values in one table so the automation does
+-- not add a large number of top-level locals to this already-large script.
+local cardCraftState = {
+    Remote = Remotes:WaitForChild("CardCraftRE", 15),
+    Module = nil,
+    Received = false,
+    Active = false,
+    Job = nil,
+    ServerNow = os.time(),
+    LocalClock = os.clock(),
+    Requesting = false,
+    Claiming = false,
+    NextAttemptAt = 0,
+    StatusParagraph = nil,
+    RecipeMap = {},
+    RecipeOptions = { "No recipes found" },
+    MutationOptions = { "All" },
+    SelectedRecipeId = nil,
+    LastMessage = nil,
+}
+if Modules and Modules:WaitForChild("CardCraftConfig", 15) then
+    pcall(function()
+        cardCraftState.Module = require(Modules.CardCraftConfig)
+    end)
+end
+
 -- ── Data lists ───────────────────────────────────────────────
 local RARITIES = {
     "Common", "Uncommon", "Rare", "Epic",
@@ -505,6 +532,11 @@ local Config = {
     AutoCarryBox    = false,
     AutoSellBox     = false,
     AutoSellDelay   = 30,
+    CardCraftRecipeId = nil,
+    CardCraftCard   = "",
+    CardCraftMutations = { "All" },
+    AutoCardCraft    = false,
+    AutoClaimCardCraft = false,
     PlotNumber      = 1,    -- will be overwritten by auto-detect at startup
 
     -- Filter
@@ -4882,6 +4914,46 @@ exitInfinityTowerBattle = function()
             end
         end
     end
+
+    -- Some revisions place the battle controls under a generic frame rather
+    -- than under InfinityTower. Search visible buttons globally as a final UI
+    -- fallback, but only accept buttons whose name/text clearly means exit.
+    for _, descendant in ipairs(playerGui:GetDescendants()) do
+        if descendant:IsA("GuiButton")
+            and descendant:IsA("GuiObject")
+            and descendant.Visible then
+            local buttonName = string.lower(tostring(descendant.Name or ""))
+            local buttonText = descendant:IsA("TextButton")
+                and string.lower(tostring(descendant.Text or ""))
+                or ""
+            local looksLikeExit = buttonName == "exit"
+                or buttonName == "exitbattle"
+                or buttonName == "exittower"
+                or buttonName == "leave"
+                or buttonName == "leavebattle"
+                or buttonName == "quit"
+                or buttonText == "exit"
+                or buttonText == "leave"
+                or buttonText == "quit"
+            if looksLikeExit and activateExitButton(descendant) then
+                return true
+            end
+        end
+    end
+
+    -- The UI button is the preferred path. A few game revisions expose the
+    -- same action only through InfinityTowerRE; use it only after all visible
+    -- button paths failed and verify the replicated battle attribute.
+    local towerRemote = Remotes and Remotes:FindFirstChild("InfinityTowerRE")
+    if towerRemote and towerRemote:IsA("RemoteEvent") then
+        for _, action in ipairs({ "Exit", "ExitBattle", "Leave", "Quit" }) do
+            pcall(function() towerRemote:FireServer(action) end)
+            task.wait(0.25)
+            if player:GetAttribute("InfinityTowerInBattle") ~= true then
+                return true
+            end
+        end
+    end
     return false
 end
 
@@ -5083,7 +5155,10 @@ if BossRaidRE then
         if eventName == "State" and type(payload) == "table" then
             raidState.Received = true
             raidState.Open = payload.Open == true
+                or payload.IsOpen == true
+                or payload.Available == true
             raidState.AlreadyUsed = payload.AlreadyUsed == true
+                or payload.Used == true
             raidState.BossId = tostring(payload.BossId or "")
         end
     end)
@@ -5150,7 +5225,19 @@ function isBossRaidOpen()
     -- timer is only presentation text and can be missing or belong to another
     -- UI during replication.
     if BossRaidRE then
-        return raidState.Received and raidState.Open and not raidState.AlreadyUsed
+        if raidState.Received and raidState.Open and not raidState.AlreadyUsed then
+            return true
+        end
+
+        -- Older BossRaidClient revisions do not always deliver the State
+        -- event to scripts that start after the raid window opened. The live
+        -- countdown is still a valid readiness signal in that case.
+        local timerText = string.lower(tostring(raidTimerText or ""))
+        if not raidState.AlreadyUsed
+            and string.find(timerText, "end in", 1, true) then
+            return true
+        end
+        return false
     end
 
     -- Fallback for older game revisions that do not expose BossRaidRE.
@@ -5410,6 +5497,367 @@ task.spawn(function()
 end)
 
 -- ══════════════════════════════════════════════════════════════
+--  CARD CRAFT AUTOMATION
+-- ══════════════════════════════════════════════════════════════
+-- CardCraftClient confirms the server contract:
+--   • RequestState
+--   • StartCraft, { RecipeId = ..., Selections = { [requirement] = tools } }
+--   • Claim
+-- State.Job contains OutputCardName, StartedAt, ReadyAt and Duration.
+-- The mutation list is a target/filter for the repeated craft setting. The
+-- game rolls the output mutation server-side, so it is intentionally not
+-- added to StartCraft as a fake client-controlled argument.
+function cardCraftState.getRecipesSorted()
+    local module = cardCraftState.Module
+    if not module or type(module.GetRecipesSorted) ~= "function" then
+        return {}
+    end
+    local ok, recipes = pcall(module.GetRecipesSorted)
+    return ok and type(recipes) == "table" and recipes or {}
+end
+
+function cardCraftState.getRecipe(recipeId)
+    local module = cardCraftState.Module
+    if not module or type(module.GetRecipe) ~= "function" or recipeId == nil then
+        return nil
+    end
+    local ok, recipe = pcall(module.GetRecipe, recipeId)
+    return ok and type(recipe) == "table" and recipe or nil
+end
+
+function cardCraftState.refreshRecipes()
+    local options = {}
+    local map = {}
+    for _, entry in ipairs(cardCraftState.getRecipesSorted()) do
+        local recipe = entry.Recipe or entry
+        local id = entry.Id or entry.RecipeId or recipe.Id
+        local cardName = recipe and recipe.OutputCardName
+        if id ~= nil and cardName ~= nil then
+            local label = tostring(cardName)
+            local key = string.lower(label)
+            if not map[key] then
+                map[key] = {
+                    Id = id,
+                    CardName = label,
+                    Recipe = recipe,
+                }
+                table.insert(options, label)
+            end
+        end
+    end
+    if #options == 0 then
+        options = { "No recipes found" }
+    end
+    cardCraftState.RecipeMap = map
+    cardCraftState.RecipeOptions = options
+    return options
+end
+
+function cardCraftState.selectedRecipe()
+    local wantedId = Config.CardCraftRecipeId or cardCraftState.SelectedRecipeId
+    local wantedCard = tostring(Config.CardCraftCard or "")
+    if wantedId ~= nil then
+        local recipe = cardCraftState.getRecipe(wantedId)
+        if recipe then return wantedId, recipe end
+    end
+    if wantedCard ~= "" then
+        local entry = cardCraftState.RecipeMap[string.lower(wantedCard)]
+        if entry then
+            Config.CardCraftRecipeId = entry.Id
+            return entry.Id, entry.Recipe
+        end
+    end
+    return nil, nil
+end
+
+function cardCraftState.refreshMutationOptions(recipeId)
+    local options = { "All" }
+    local recipe = cardCraftState.getRecipe(recipeId)
+    local module = cardCraftState.Module
+    if recipe and module and type(module.ComputeMutationChances) == "function" then
+        local ok, chances = pcall(module.ComputeMutationChances, recipe, {})
+        if ok and type(chances) == "table" then
+            for _, entry in ipairs(chances) do
+                local mutation = entry.Mutation or entry.Name
+                if mutation ~= nil and tostring(mutation) ~= "" then
+                    table.insert(options, tostring(mutation))
+                end
+            end
+        end
+    end
+    if #options == 1 then
+        for _, mutation in ipairs(MUTATIONS) do
+            table.insert(options, mutation)
+        end
+    end
+    cardCraftState.MutationOptions = options
+    return options
+end
+
+function cardCraftState.normalizeMutations(value)
+    local values = type(value) == "table" and value or { value }
+    local selected = {}
+    local seen = {}
+    for _, mutation in ipairs(values) do
+        mutation = tostring(mutation or "")
+        if mutation == "All" then
+            return { "All" }
+        end
+        if mutation ~= "" and not seen[mutation] then
+            seen[mutation] = true
+            table.insert(selected, mutation)
+        end
+    end
+    return #selected > 0 and selected or { "All" }
+end
+
+function cardCraftState.now()
+    return (tonumber(cardCraftState.ServerNow) or os.time())
+        + (os.clock() - (tonumber(cardCraftState.LocalClock) or os.clock()))
+end
+
+function cardCraftState.formatDuration(seconds)
+    local total = math.max(0, math.floor(tonumber(seconds) or 0))
+    local hours = math.floor(total / 3600)
+    local minutes = math.floor((total % 3600) / 60)
+    local remainder = total % 60
+    return string.format("%02d:%02d:%02d", hours, minutes, remainder)
+end
+
+function cardCraftState.amountFor(requirement)
+    local amount = tonumber(requirement and requirement.Amount) or 1
+    return math.max(1, math.floor(amount))
+end
+
+function cardCraftState.updateStatus()
+    local paragraph = cardCraftState.StatusParagraph
+    if not paragraph or not paragraph.Set then return end
+
+    local recipeId, recipe = cardCraftState.selectedRecipe()
+    local job = cardCraftState.Job
+    local cardName = (job and job.OutputCardName)
+        or (recipe and recipe.OutputCardName)
+        or Config.CardCraftCard
+        or "No card selected"
+    local lines = {}
+
+    if cardCraftState.Active and type(job) == "table" then
+        local now = cardCraftState.now()
+        local startedAt = tonumber(job.StartedAt) or now
+        local readyAt = tonumber(job.ReadyAt) or now
+        local duration = math.max(1, tonumber(job.Duration) or (readyAt - startedAt))
+        local elapsed = math.clamp(now - startedAt, 0, duration)
+        local remaining = math.max(0, readyAt - now)
+        local status = remaining <= 0 and "Ready to claim" or "Crafting"
+        table.insert(lines, tostring(cardName) .. " - "
+            .. cardCraftState.formatDuration(elapsed) .. " / "
+            .. cardCraftState.formatDuration(duration) .. " - " .. status)
+
+        local activeRecipe = recipe
+        if not activeRecipe and recipeId then
+            activeRecipe = cardCraftState.getRecipe(recipeId)
+        end
+        for index, requirement in ipairs(activeRecipe and activeRecipe.Requirements or {}) do
+            table.insert(lines, "Recipe " .. tostring(index) .. " - "
+                .. tostring(requirement.CardName or "Card") .. " - "
+                .. tostring(cardCraftState.amountFor(requirement))
+                .. "/" .. tostring(cardCraftState.amountFor(requirement)))
+        end
+    else
+        table.insert(lines, tostring(cardName)
+            .. " - 00:00:00 / 00:00:00 - Idle")
+        for index, requirement in ipairs(recipe and recipe.Requirements or {}) do
+            table.insert(lines, "Recipe " .. tostring(index) .. " - "
+                .. tostring(requirement.CardName or "Card") .. " - 0/"
+                .. tostring(cardCraftState.amountFor(requirement)))
+        end
+        table.insert(lines, "Target mutation: "
+            .. table.concat(cardCraftState.normalizeMutations(
+                Config.CardCraftMutations
+            ), ", "))
+        if cardCraftState.LastMessage then
+            table.insert(lines, tostring(cardCraftState.LastMessage))
+        end
+    end
+
+    pcall(function()
+        paragraph:Set({
+            Title = "Card Crafting",
+            Content = table.concat(lines, "\n"),
+        })
+    end)
+end
+
+function cardCraftState.applyState(state)
+    if type(state) ~= "table" then return end
+    cardCraftState.Received = true
+    cardCraftState.Active = state.Active == true
+    cardCraftState.Job = type(state.Job) == "table" and state.Job or nil
+    cardCraftState.ServerNow = tonumber(state.ServerNow) or os.time()
+    cardCraftState.LocalClock = os.clock()
+    if not cardCraftState.Active then
+        cardCraftState.Claiming = false
+    end
+    cardCraftState.updateStatus()
+end
+
+function cardCraftState.availableCards()
+    local result = {}
+    local seen = {}
+    local function collect(container)
+        if not container then return end
+        for _, tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") and not seen[tool]
+                and tool:GetAttribute("CardName") ~= nil
+                and tool:GetAttribute("GiftPending") ~= true
+                and tool:GetAttribute("InventoryOpLock") ~= true
+                and tool:GetAttribute("BeingPlaced") ~= true
+                and tool:GetAttribute("BeingSold") ~= true then
+                seen[tool] = true
+                table.insert(result, tool)
+            end
+        end
+    end
+    collect(player:FindFirstChild("Backpack"))
+    collect(player.Character)
+    return result
+end
+
+function cardCraftState.buildSelections(recipe)
+    if not recipe or type(recipe.Requirements) ~= "table" then
+        return nil, "Invalid recipe."
+    end
+
+    local byName = {}
+    for _, tool in ipairs(cardCraftState.availableCards()) do
+        local name = tostring(tool:GetAttribute("CardName") or "")
+        byName[name] = byName[name] or {}
+        table.insert(byName[name], tool)
+    end
+
+    local selections = {}
+    local missing = {}
+    for index, requirement in ipairs(recipe.Requirements) do
+        local wanted = tostring(requirement.CardName or "")
+        local available = byName[wanted] or {}
+        local needed = cardCraftState.amountFor(requirement)
+        if #available < needed then
+            table.insert(missing, wanted .. " " .. tostring(#available)
+                .. "/" .. tostring(needed))
+        else
+            selections[index] = {}
+            for cardIndex = 1, needed do
+                table.insert(selections[index], available[cardIndex])
+            end
+        end
+    end
+    if #missing > 0 then
+        return nil, "Missing: " .. table.concat(missing, ", ")
+    end
+    return selections
+end
+
+function cardCraftState.requestState()
+    local remote = cardCraftState.Remote
+    if remote and remote:IsA("RemoteEvent") then
+        pcall(function() remote:FireServer("RequestState") end)
+    end
+end
+
+function cardCraftState.start()
+    local remote = cardCraftState.Remote
+    if not remote or not remote:IsA("RemoteEvent") then
+        cardCraftState.LastMessage = "CardCraftRE was not found."
+        return false
+    end
+    local recipeId, recipe = cardCraftState.selectedRecipe()
+    if not recipe then
+        cardCraftState.LastMessage = "Select a card to craft first."
+        return false
+    end
+    local selections, reason = cardCraftState.buildSelections(recipe)
+    if not selections then
+        cardCraftState.LastMessage = reason
+        return false
+    end
+
+    cardCraftState.Requesting = true
+    cardCraftState.LastMessage = nil
+    pcall(function()
+        remote:FireServer("StartCraft", {
+            RecipeId = recipeId,
+            Selections = selections,
+        })
+    end)
+    task.delay(5, function()
+        cardCraftState.Requesting = false
+    end)
+    return true
+end
+
+function cardCraftState.tryClaim()
+    if not Config.AutoClaimCardCraft or not cardCraftState.Active
+        or cardCraftState.Claiming or not cardCraftState.Job then
+        return
+    end
+    local remaining = (tonumber(cardCraftState.Job.ReadyAt) or 0)
+        - cardCraftState.now()
+    if remaining > 0 then return end
+
+    local remote = cardCraftState.Remote
+    if not remote or not remote:IsA("RemoteEvent") then return end
+    cardCraftState.Claiming = true
+    pcall(function() remote:FireServer("Claim") end)
+    task.delay(5, function()
+        cardCraftState.Claiming = false
+    end)
+end
+
+if cardCraftState.Remote and cardCraftState.Remote:IsA("RemoteEvent") then
+    cardCraftState.Remote.OnClientEvent:Connect(function(eventName, payload)
+        local data = type(payload) == "table" and payload or {}
+        if eventName == "State" then
+            cardCraftState.applyState(data)
+        elseif eventName == "Started" then
+            cardCraftState.Requesting = false
+            if data.State then
+                cardCraftState.applyState(data.State)
+            else
+                cardCraftState.requestState()
+            end
+        elseif eventName == "Claimed" then
+            cardCraftState.Claiming = false
+            if data.State then
+                cardCraftState.applyState(data.State)
+            else
+                cardCraftState.requestState()
+            end
+        elseif eventName == "SkipApplied" then
+            if data.State then cardCraftState.applyState(data.State) end
+        elseif eventName == "Failed" then
+            cardCraftState.Requesting = false
+            cardCraftState.Claiming = false
+            cardCraftState.LastMessage = tostring(data.Message or "Card craft request failed.")
+        end
+    end)
+    task.delay(0.35, function() cardCraftState.requestState() end)
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.25)
+        cardCraftState.updateStatus()
+        if cardCraftState.Active then
+            cardCraftState.tryClaim()
+        elseif Config.AutoCardCraft and not cardCraftState.Requesting
+            and os.clock() >= cardCraftState.NextAttemptAt then
+            cardCraftState.NextAttemptAt = os.clock() + 1
+            cardCraftState.start()
+        end
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════════
 --  Config Manager State & Helper Functions
 -- ══════════════════════════════════════════════════════════════
 -- Keep the complete UI/config construction in its own function scope.
@@ -5484,6 +5932,11 @@ local function buildSerializableConfig()
         AutoCarryBox      = Config.AutoCarryBox,
         AutoSellBox       = Config.AutoSellBox,
         AutoSellDelay     = Config.AutoSellDelay,
+        CardCraftRecipeId = Config.CardCraftRecipeId,
+        CardCraftCard     = Config.CardCraftCard,
+        CardCraftMutations = Config.CardCraftMutations,
+        AutoCardCraft     = Config.AutoCardCraft,
+        AutoClaimCardCraft = Config.AutoClaimCardCraft,
         SelectedRarities  = Config.SelectedRarities,
         SelectedMutations = Config.SelectedMutations,
         SelectedPacks     = Config.SelectedPacks,
@@ -5643,6 +6096,8 @@ local function loadConfig(name, isAutoload)
     local knownKeys = {
         "AutoSpawnPack", "SpawnDelay", "AutoStopSpawn", "AutoBuyMatching",
         "AutoCarryBox", "AutoSellBox", "AutoSellDelay",
+        "CardCraftRecipeId", "CardCraftCard", "CardCraftMutations",
+        "AutoCardCraft", "AutoClaimCardCraft",
         "SelectedRarities", "SelectedMutations", "SelectedPacks",
         "AutoUpgrade", "UpgradeDelay", "CardActionDelay",
         "AutoTraitRoll", "SelectedRankCards", "TargetRank",
@@ -5668,6 +6123,9 @@ local function loadConfig(name, isAutoload)
             end
             if key == "RaidDifficulties" then
                 value = normalizeRaidDifficulties(value)
+            end
+            if key == "CardCraftMutations" then
+                value = cardCraftState.normalizeMutations(value)
             end
             Config[key] = value
             local control = Controls[key]
@@ -6340,6 +6798,106 @@ Controls.AutoSellDelay = autoSellTab:CreateSlider({
     CurrentValue = Config.AutoSellDelay,
     Flag         = "AutoSellDelay",
     Callback     = function(v) Config.AutoSellDelay = v end,
+})
+
+autoSellTab:CreateSection("Card Crafting")
+
+local cardCraftCardOptions = cardCraftState.refreshRecipes()
+local cardCraftInitialCard = Config.CardCraftCard
+if type(cardCraftInitialCard) ~= "string" or cardCraftInitialCard == ""
+    or not cardCraftState.RecipeMap[string.lower(cardCraftInitialCard)] then
+    cardCraftInitialCard = cardCraftCardOptions[1]
+    if cardCraftInitialCard == "No recipes found" then
+        cardCraftInitialCard = ""
+    end
+    Config.CardCraftCard = cardCraftInitialCard
+end
+
+local cardCraftInitialEntry = cardCraftState.RecipeMap[
+    string.lower(tostring(cardCraftInitialCard or ""))
+]
+if cardCraftInitialEntry then
+    Config.CardCraftRecipeId = cardCraftInitialEntry.Id
+end
+cardCraftState.refreshMutationOptions(Config.CardCraftRecipeId)
+
+cardCraftState.StatusParagraph = autoSellTab:CreateParagraph({
+    Title   = "Card Crafting",
+    Content = "Loading Card Craft state...",
+})
+cardCraftState.updateStatus()
+
+Controls.CardCraftCard = autoSellTab:CreateDropdown({
+    Name          = "Select Card",
+    Options       = cardCraftCardOptions,
+    CurrentOption = cardCraftInitialCard ~= "" and cardCraftInitialCard
+        or cardCraftCardOptions[1],
+    MultipleOptions = false,
+    Flag          = "CardCraftCard",
+    Callback      = function(value)
+        if type(value) == "table" then value = value[1] end
+        local cardName = tostring(value or "")
+        local entry = cardCraftState.RecipeMap[string.lower(cardName)]
+        if not entry then return end
+        Config.CardCraftCard = entry.CardName
+        Config.CardCraftRecipeId = entry.Id
+        cardCraftState.SelectedRecipeId = entry.Id
+        local mutationOptions = cardCraftState.refreshMutationOptions(entry.Id)
+        Config.CardCraftMutations = { "All" }
+        if Controls.CardCraftMutation and Controls.CardCraftMutation.Refresh then
+            pcall(function()
+                Controls.CardCraftMutation:Refresh(mutationOptions, { "All" })
+            end)
+        end
+        if Controls.CardCraftMutation and Controls.CardCraftMutation.Set then
+            pcall(function() Controls.CardCraftMutation:Set({ "All" }) end)
+        end
+        cardCraftState.updateStatus()
+    end,
+})
+
+local cardCraftMutationOptions = cardCraftState.MutationOptions
+local cardCraftInitialMutations = cardCraftState.normalizeMutations(
+    Config.CardCraftMutations
+)
+Controls.CardCraftMutation = autoSellTab:CreateDropdown({
+    Name          = "Mutation",
+    Options       = cardCraftMutationOptions,
+    CurrentOption = cardCraftInitialMutations,
+    MultipleOptions = true,
+    Flag          = "CardCraftMutations",
+    Callback      = function(value)
+        Config.CardCraftMutations = cardCraftState.normalizeMutations(value)
+    end,
+})
+
+Controls.AutoCardCraft = autoSellTab:CreateToggle({
+    Name         = "Auto Craft",
+    CurrentValue = Config.AutoCardCraft,
+    Flag         = "AutoCardCraft",
+    Callback     = function(value)
+        Config.AutoCardCraft = value == true
+        if Config.AutoCardCraft then
+            cardCraftState.LastMessage = nil
+            cardCraftState.NextAttemptAt = 0
+            if not cardCraftState.Remote then
+                Config.AutoCardCraft = false
+                if Controls.AutoCardCraft and Controls.AutoCardCraft.Set then
+                    pcall(function() Controls.AutoCardCraft:Set(false) end)
+                end
+                notify("Card Crafting", "CardCraftRE was not found.")
+            end
+        end
+    end,
+})
+
+Controls.AutoClaimCardCraft = autoSellTab:CreateToggle({
+    Name         = "Auto Claim",
+    CurrentValue = Config.AutoClaimCardCraft,
+    Flag         = "AutoClaimCardCraft",
+    Callback     = function(value)
+        Config.AutoClaimCardCraft = value == true
+    end,
 })
 
 -- ══════════════════════════════════════════════════════════════
