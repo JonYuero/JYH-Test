@@ -357,7 +357,14 @@ if Modules and Modules:FindFirstChild("GuiManager") then
         GuiManager = require(Modules.GuiManager)
     end)
 end
-local currentRaidBossId = ""
+local RuntimeState = {
+    currentRaidBossId     = "",
+    playtimeReadyRewards  = {},
+    playtimeStateReceived = false,
+    potionInventoryCounts = {},
+    nextTimePotionUse     = 0,
+    pendingTimePotion     = nil,
+}
 
 -- ── Data lists ───────────────────────────────────────────────
 local RARITIES = {
@@ -540,12 +547,6 @@ local Config = {
 local Controls = {}
 
 -- Playtime state is pushed by the game's client remote.
-local playtimeReadyRewards = {}
-local playtimeStateReceived = false
-local potionInventoryCounts = {}
-local nextTimePotionUse = 0
-local pendingTimePotion = nil
-
 -- Forward declarations
 local clickGuiButton
 local startCombatBattle
@@ -643,8 +644,8 @@ end
 
 local function refreshPlaytimeReadyRewards(state)
     if type(state) ~= "table" then return end
-    playtimeStateReceived = true
-    table.clear(playtimeReadyRewards)
+    RuntimeState.playtimeStateReceived = true
+    table.clear(RuntimeState.playtimeReadyRewards)
     local rewards = state.Rewards or state
     if type(rewards) ~= "table" then return end
     for index = 1, 12 do
@@ -652,7 +653,7 @@ local function refreshPlaytimeReadyRewards(state)
         if type(reward) == "table"
             and reward.Claimed ~= true
             and reward.Ready == true then
-            playtimeReadyRewards[index] = true
+            RuntimeState.playtimeReadyRewards[index] = true
         end
     end
 end
@@ -663,7 +664,7 @@ if PlayTimeRewardRE and PlayTimeRewardRE:IsA("RemoteEvent") then
             refreshPlaytimeReadyRewards(payload)
         elseif eventName == "ClaimSuccess" and type(payload) == "table" then
             local index = tonumber(payload.RewardIndex)
-            if index then playtimeReadyRewards[index] = nil end
+            if index then RuntimeState.playtimeReadyRewards[index] = nil end
         end
     end)
 end
@@ -2962,7 +2963,7 @@ do
         -- potionCounts[itemId] = number owned
         -- activeBoosts[family] = tier/expiry while that boost is running
         -- Keep this inventory mirror available to the pack automation below.
-        local potionCounts = potionInventoryCounts
+        local potionCounts = RuntimeState.potionInventoryCounts
         -- activeBoosts is indexed by potion family (luck/cash/etc.), not by
         -- the raw stat key.  That lets CashPotion I/II/III share one timer.
         local activeBoosts = {}
@@ -3300,15 +3301,15 @@ do
                 pendingPotion = nil
             elseif action == "UseOk" then
                 pendingPotion = nil
-                if pendingTimePotion then
-                    pendingTimePotion = nil
-                    nextTimePotionUse = os.clock() + 2
+                if RuntimeState.pendingTimePotion then
+                    RuntimeState.pendingTimePotion = nil
+                    RuntimeState.nextTimePotionUse = os.clock() + 2
                 end
             elseif action == "UseFailed" then
                 pendingPotion = nil
-                if pendingTimePotion then
-                    pendingTimePotion = nil
-                    nextTimePotionUse = os.clock() + 1
+                if RuntimeState.pendingTimePotion then
+                    RuntimeState.pendingTimePotion = nil
+                    RuntimeState.nextTimePotionUse = os.clock() + 1
                 end
             end
         end)
@@ -3412,13 +3413,14 @@ task.spawn(function()
         task.wait(0.5)
         if not Config.AutoClaimPlaytime or not PlayTimeRewardRE then continue end
         local now = os.clock()
-        if not playtimeStateReceived or now >= nextStateRequest then
+        if not RuntimeState.playtimeStateReceived
+            or now >= nextStateRequest then
             pcall(function() PlayTimeRewardRE:FireServer("RequestState") end)
             nextStateRequest = now + 10
         end
         for rewardIndex = 1, 12 do
-            if playtimeReadyRewards[rewardIndex] then
-                playtimeReadyRewards[rewardIndex] = nil
+            if RuntimeState.playtimeReadyRewards[rewardIndex] then
+                RuntimeState.playtimeReadyRewards[rewardIndex] = nil
                 pcall(function()
                     PlayTimeRewardRE:FireServer("ClaimReward", {
                         RewardIndex = rewardIndex,
@@ -4490,13 +4492,13 @@ task.spawn(function()
     local function findPotionInventoryItem(preferredId)
         local preferredKey = normalizePotionInventoryId(preferredId)
         local directQuantity = inventoryQuantity(
-            potionInventoryCounts[preferredId]
+            RuntimeState.potionInventoryCounts[preferredId]
         )
         if directQuantity > 0 then
             return preferredId, directQuantity
         end
 
-        for itemId, quantity in pairs(potionInventoryCounts) do
+        for itemId, quantity in pairs(RuntimeState.potionInventoryCounts) do
             local amount = inventoryQuantity(quantity)
             if amount > 0
                 and normalizePotionInventoryId(itemId) == preferredKey then
@@ -4510,7 +4512,7 @@ task.spawn(function()
     while true do
         task.wait(1)
         if not Config.AutoTimePotion then
-            pendingTimePotion = nil
+            RuntimeState.pendingTimePotion = nil
             continue
         end
         if not ItemsREForAutomation then continue end
@@ -4524,7 +4526,7 @@ task.spawn(function()
             nextInventorySync = now + 5
         end
 
-        if now < nextTimePotionUse then continue end
+        if now < RuntimeState.nextTimePotionUse then continue end
         if not areAllCardSlotsOccupied() then continue end
 
         local hasCooldown = false
@@ -4556,14 +4558,14 @@ task.spawn(function()
             -- A successful pcall only means the client sent the request. Wait
             -- for UseOk/UseFailed when available, with a timeout for versions
             -- that do not echo those actions.
-            pendingTimePotion = {
+            RuntimeState.pendingTimePotion = {
                 itemId = selectedPotion,
                 sentAt = os.clock(),
             }
-            nextTimePotionUse = os.clock() + 4
+            RuntimeState.nextTimePotionUse = os.clock() + 4
         else
-            pendingTimePotion = nil
-            nextTimePotionUse = os.clock() + 1
+            RuntimeState.pendingTimePotion = nil
+            RuntimeState.nextTimePotionUse = os.clock() + 1
         end
     end
 end)
@@ -4957,18 +4959,35 @@ local function getRaidDifficultyOptions()
     return options
 end
 
-local raidDifficultyOptions = { "Easy", "Medium", "Hard", "Nightmare" }
-local raidDifficultySet = {}
-for _, difficulty in ipairs(raidDifficultyOptions) do
-    raidDifficultySet[difficulty] = true
-end
-local completedRaidDifficulties = {}
--- Boss Raid grants one attempt per hourly window. Keep the feature enabled
--- after the first click, but latch the attempt so the polling loops cannot
--- click again until the next window is detected.
-local raidAttemptConsumed = false
-local raidClosedSince = nil
-
+local RaidState = {
+    difficultyOptions = { "Easy", "Medium", "Hard", "Nightmare" },
+    completedDifficulties = {},
+    -- Boss Raid grants one attempt per hourly window. Keep the feature
+    -- enabled after the first click, but latch the attempt so polling loops
+    -- cannot click again until the next window is detected.
+    attemptConsumed = false,
+    closedSince = nil,
+    difficultyInfo = {
+        Easy = {
+            damage = "2.1B",
+            description = "At least 2.1B damage per card.",
+        },
+        Medium = {
+            damage = "412.9Qn",
+            description = "At least 412.9Qn damage per card.",
+        },
+        Hard = {
+            damage = "617.7O",
+            description = "At least 617.7O damage per card.",
+        },
+        Nightmare = {
+            damage = "13.1O",
+            description = "At least 13.1O damage per card.",
+        },
+    },
+    infoParagraph = nil,
+    timerText = "Searching for Boss Raid timer...",
+}
 local function normalizeRaidDifficulties(value)
     local selected = {}
     local selectedSet = {}
@@ -4991,7 +5010,7 @@ local function getSelectedRaidDifficulties()
     end
 
     local ordered = {}
-    for _, difficulty in ipairs(raidDifficultyOptions) do
+    for _, difficulty in ipairs(RaidState.difficultyOptions) do
         if selectedSet[difficulty] then
             table.insert(ordered, difficulty)
         end
@@ -5001,7 +5020,7 @@ end
 
 local function getNextRaidDifficulty()
     for _, difficulty in ipairs(getSelectedRaidDifficulties()) do
-        if not completedRaidDifficulties[difficulty] then
+        if not RaidState.completedDifficulties[difficulty] then
             return difficulty
         end
     end
@@ -5009,8 +5028,8 @@ local function getNextRaidDifficulty()
 end
 
 local function clearCompletedRaidDifficulties()
-    for difficulty in pairs(completedRaidDifficulties) do
-        completedRaidDifficulties[difficulty] = nil
+    for difficulty in pairs(RaidState.completedDifficulties) do
+        RaidState.completedDifficulties[difficulty] = nil
     end
 end
 
@@ -5018,10 +5037,10 @@ local function getRaidRequirement(difficulty)
     if not BossRaidConfig or not BossRaidConfig.GetBossStats then
         return nil
     end
-    if currentRaidBossId == "" then return nil end
+    if RuntimeState.currentRaidBossId == "" then return nil end
     local ok, stats = pcall(
         BossRaidConfig.GetBossStats,
-        currentRaidBossId,
+        RuntimeState.currentRaidBossId,
         difficulty
     )
     if ok and type(stats) == "table" then
@@ -5030,31 +5049,9 @@ local function getRaidRequirement(difficulty)
     return nil
 end
 
-local RAID_DIFFICULTY_INFO = {
-    Easy = {
-        damage = "2.1B",
-        description = "At least 2.1B damage per card.",
-    },
-    Medium = {
-        damage = "412.9Qn",
-        description = "At least 412.9Qn damage per card.",
-    },
-    Hard = {
-        damage = "617.7O",
-        description = "At least 617.7O damage per card.",
-    },
-    Nightmare = {
-        damage = "13.1O",
-        description = "At least 13.1O damage per card.",
-    },
-}
-
-local raidInfoParagraph
-local raidTimerText = "Searching for Boss Raid timer..."
-
 local function getRaidDifficultyInfo(difficulty)
     local wanted = string.lower(tostring(difficulty or ""))
-    for name, info in pairs(RAID_DIFFICULTY_INFO) do
+    for name, info in pairs(RaidState.difficultyInfo) do
         if string.lower(name) == wanted then
             return info
         end
@@ -5063,7 +5060,9 @@ local function getRaidDifficultyInfo(difficulty)
 end
 
 local function updateRaidInfoDisplay(difficulties)
-    if not raidInfoParagraph or not raidInfoParagraph.Set then return end
+    if not RaidState.infoParagraph or not RaidState.infoParagraph.Set then
+        return
+    end
 
     local selected = getSelectedRaidDifficulties()
 
@@ -5078,10 +5077,10 @@ local function updateRaidInfoDisplay(difficulties)
             )
         end
     end
-    table.insert(lines, "Timer: " .. raidTimerText)
+    table.insert(lines, "Timer: " .. RaidState.timerText)
 
     pcall(function()
-        raidInfoParagraph:Set({
+        RaidState.infoParagraph:Set({
             Title = "Boss Raid",
             Content = table.concat(lines, "\n"),
         })
@@ -5100,7 +5099,7 @@ end
 if BossRaidRE then
     BossRaidRE.OnClientEvent:Connect(function(eventName, payload)
         if eventName == "State" and type(payload) == "table" then
-            currentRaidBossId = tostring(payload.BossId or "")
+            RuntimeState.currentRaidBossId = tostring(payload.BossId or "")
         end
     end)
     pcall(function() BossRaidRE:FireServer("RequestState") end)
@@ -5165,7 +5164,7 @@ function isBossRaidOpen()
     -- Use the exact timer text shown in the Boss Raid description. This keeps
     -- the UI and the combat-priority decision on one source of truth.
     return string.find(
-        string.lower(raidTimerText or ""),
+        string.lower(RaidState.timerText or ""),
         "end in",
         1,
         true
@@ -5178,25 +5177,25 @@ task.spawn(function()
         local timer = findBossRaidTimer()
         local text = readRaidTimerText(timer)
         if text and text ~= "" then
-            raidTimerText = text
+            RaidState.timerText = text
         elseif timer then
-            raidTimerText = "Timer found, waiting for countdown..."
+            RaidState.timerText = "Timer found, waiting for countdown..."
         else
-            raidTimerText = "Boss Raid is currently unavailable"
+            RaidState.timerText = "Boss Raid is currently unavailable"
         end
 
         -- Update the shared description value before checking readiness. The
         -- scheduler and the visible Boss Raid description now read the same
         -- timer text on every pass.
         if isBossRaidOpen() then
-            raidClosedSince = nil
+            RaidState.closedSince = nil
         else
             local now = os.clock()
-            raidClosedSince = raidClosedSince or now
+            RaidState.closedSince = RaidState.closedSince or now
             -- Require a stable closed state before re-arming. This avoids a brief
             -- timer/UI replication gap reopening the same hourly attempt.
-            if now - raidClosedSince >= 3 then
-                raidAttemptConsumed = false
+            if now - RaidState.closedSince >= 3 then
+                RaidState.attemptConsumed = false
                 clearCompletedRaidDifficulties()
             end
         end
@@ -5214,7 +5213,7 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     if mode == "BossRaid" and not isBossRaidOpen() then
         return false
     end
-    if mode == "BossRaid" and raidAttemptConsumed then
+    if mode == "BossRaid" and RaidState.attemptConsumed then
         return false
     end
 
@@ -5258,7 +5257,7 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
         -- Consume the hourly attempt as soon as the battle button is clicked.
         -- Do not wait for the battle attribute: a rejected/failed start must
         -- not cause the polling loop to spam the server repeatedly.
-        raidAttemptConsumed = true
+        RaidState.attemptConsumed = true
         local raidConfirmed = false
         for _ = 1, 20 do
             if player:GetAttribute("BossRaidInBattle") == true then
@@ -5268,7 +5267,7 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
             task.wait(0.15)
         end
         if raidConfirmed then
-            completedRaidDifficulties[raidDifficulty] = true
+            RaidState.completedDifficulties[raidDifficulty] = true
         else
             return false
         end
@@ -5296,7 +5295,7 @@ task.spawn(function()
 
         local raidReady = Config.AutoRaid
             and isBossRaidOpen()
-            and not raidAttemptConsumed
+            and not RaidState.attemptConsumed
             and getNextRaidDifficulty() ~= nil
         local towerEnabled = Config.AutoInfinityTower
         local towerActive = player:GetAttribute("InfinityTowerInBattle") == true
@@ -5882,8 +5881,8 @@ Controls.AutoTimePotion = cardsTab:CreateToggle({
     Callback     = function(v)
         Config.AutoTimePotion = v
         if v then
-            pendingTimePotion = nil
-            nextTimePotionUse = 0
+            RuntimeState.pendingTimePotion = nil
+            RuntimeState.nextTimePotionUse = 0
         end
     end,
 })
@@ -6155,7 +6154,7 @@ combatTab:CreateToggle({
 
 combatTab:CreateSection("Boss Raid")
 
-raidInfoParagraph = combatTab:CreateParagraph({
+RaidState.infoParagraph = combatTab:CreateParagraph({
     Title   = "Boss Raid",
     Content = "Loading Boss Raid information...",
 })
@@ -6163,14 +6162,14 @@ updateRaidInfoDisplay(Config.RaidDifficulties)
 
 Controls.RaidDifficulties = combatTab:CreateDropdown({
     Name          = "Select Difficulty",
-    Options       = raidDifficultyOptions,
+    Options       = RaidState.difficultyOptions,
     CurrentOption = Config.RaidDifficulties[1] or "Easy",
     MultipleOptions = false,
     Flag          = "RaidDifficulties",
     Callback      = function(v)
         local selected = normalizeRaidDifficulties(v)
         if #selected == 0 then
-            selected = { raidDifficultyOptions[1] }
+            selected = { RaidState.difficultyOptions[1] }
         end
         Config.RaidDifficulties = selected
         clearCompletedRaidDifficulties()
