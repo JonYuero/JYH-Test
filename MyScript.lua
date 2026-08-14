@@ -15,8 +15,8 @@
 -- ============================================================
 
 -- ── URL constants (single source of truth) ───────────────────
-local LOADER_URL    = "https://raw.githubusercontent.com/JonYuero/Jon-Yuero-Hub/refs/heads/main/JYH%20Loader.lua"
-local ANIME_CARD_FARM_URL = "https://raw.githubusercontent.com/JonYuero/Anime-Card-Farm/refs/heads/main/ACF.lua"
+local LOADER_URL    = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/Loader.lua"
+local ANIME_CARD_FARM_URL = "https://raw.githubusercontent.com/JonYuero/JYH-Test/refs/heads/main/MyScript.lua"
 
 local VALID_LICENSE_TYPES = { FREE = true, ["30D"] = true, LIFETIME = true }
 
