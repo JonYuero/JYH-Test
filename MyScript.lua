@@ -3097,7 +3097,10 @@ do
             end
             if not popup then return false end
 
-            local buttonName = (tonumber(amount) or 1) >= 5 and "USE5x" or "USE"
+            -- The game's potion client uses the single-use action for
+            -- automation.  Sending USE5x here can leave the popup open on
+            -- versions that do not expose the batch-use button.
+            local buttonName = "USE"
             local useButton = popup:FindFirstChild(buttonName, true)
             if not useButton or not clickGuiButton(useButton) then
                 return false
@@ -3322,6 +3325,7 @@ do
                     end
                     if action == "FullInventory" then
                         table.clear(potionCounts)
+                        table.clear(RuntimeState.potionInventoryCounts)
                     end
                     mirrorInventoryItems(items)
                 end
@@ -3436,9 +3440,10 @@ do
                         )
                         continue
                     end
-                    -- Match the Items UI: spend five when possible, otherwise
-                    -- fall back to a single potion.
-                    local amount = candidate.quantity >= 5 and 5 or 1
+                    -- Use one potion at a time.  This matches the reference
+                    -- client and lets the next inventory/boost update decide
+                    -- whether another potion is needed.
+                    local amount = 1
                     local family, tier = potionDetails(potion)
                     local active = family and activeBoosts[family]
                     local isTierReplacement = active
@@ -3729,6 +3734,31 @@ local function slotIsOnCooldown(slotModel)
 end
 
 local function hasCardCooldownToSkip()
+    local function promptIsSkip(prompt)
+        if not prompt or not prompt:IsA("ProximityPrompt")
+            or prompt.Enabled == false then
+            return false
+        end
+
+        local text = string.lower(table.concat({
+            tostring(prompt.Name or ""),
+            tostring(prompt.ActionText or ""),
+            tostring(prompt.ObjectText or ""),
+        }, " "))
+        return string.find(text, "skip", 1, true) ~= nil
+    end
+
+    -- The live game has moved the Skip prompt between the slot model and
+    -- the plot-level interaction holder.  Check the actual prompt first so
+    -- one ready-to-skip pack is enough; a completely full plot is not
+    -- required for this feature.
+    local plot = findPlot(Config.PlotNumber)
+    if plot then
+        for _, desc in ipairs(plot:GetDescendants()) do
+            if promptIsSkip(desc) then return true end
+        end
+    end
+
     for _, slot in ipairs(getAllCardSlots()) do
         if slotIsOccupied(slot) and slotIsOnCooldown(slot) then
             return true
@@ -4615,10 +4645,9 @@ task.spawn(function()
         end
 
         if now < RuntimeState.nextTimePotionUse then continue end
-        if not areAllCardSlotsOccupied() then continue end
-        -- Only spend a time potion while at least one occupied slot still
-        -- reports an active cooldown.  A full plot by itself is not enough:
-        -- when every card is ready, using a potion would waste it.
+        -- Only spend a time potion while at least one pack exposes an active
+        -- Skip prompt/cooldown.  Do not require every card slot to be filled:
+        -- one pack is enough to reduce its cooking time.
         if not hasCardCooldownToSkip() then continue end
 
         local selectedPotion
@@ -4827,6 +4856,20 @@ local function findGuiByName(root, wantedName)
             end
         end
     end
+    -- A few client builds changed only the casing of combat controls
+    -- (for example Battle/BATTLE). Keep the visibility check, but do not
+    -- make the automation depend on that cosmetic difference.
+    local wantedLower = string.lower(tostring(wantedName))
+    if string.lower(tostring(root.Name)) == wantedLower
+        and isGuiActuallyVisible(root) then
+        return root
+    end
+    for _, descendant in ipairs(root:GetDescendants()) do
+        if string.lower(tostring(descendant.Name)) == wantedLower
+            and isGuiActuallyVisible(descendant) then
+            return descendant
+        end
+    end
     -- Do not return a hidden duplicate. Callers use nil to try the next
     -- candidate panel or to wait for the live UI state.
     return nil
@@ -4851,6 +4894,23 @@ local function getCombatGui(mode)
 end
 
 clickGuiButton = function(button)
+    if not button then return false end
+    if not button:IsA("GuiButton") then
+        -- Difficulty entries and some combat controls are Frames whose
+        -- clickable child is named FrameButton. The old code rejected the
+        -- Frame before it could reach that child.
+        local namedButton = button:FindFirstChild("FrameButton", true)
+        if namedButton and namedButton:IsA("GuiButton") then
+            button = namedButton
+        else
+            for _, descendant in ipairs(button:GetDescendants()) do
+                if descendant:IsA("GuiButton") then
+                    button = descendant
+                    break
+                end
+            end
+        end
+    end
     if not button or not button:IsA("GuiButton") then return false end
     -- Do not fire hidden duplicate buttons. Combat screens keep several
     -- copies of Exit/Battle controls in the hierarchy across UI states.
@@ -4929,6 +4989,37 @@ local function clickCombatButton(mode, names)
             local button = findGuiByName(root, name)
             if button and clickGuiButton(button) then
                 return true
+            end
+        end
+
+        -- Some versions name every clickable entry FrameButton and expose
+        -- the action only through the button text or its parent frame name.
+        -- Resolve those controls without reading Text from ImageButtons.
+        for _, descendant in ipairs(root:GetDescendants()) do
+            if descendant:IsA("GuiButton") then
+                local labels = {
+                    string.lower(tostring(descendant.Name or "")),
+                }
+                if descendant:IsA("TextButton") then
+                    table.insert(labels, string.lower(tostring(descendant.Text or "")))
+                end
+                local parent = descendant.Parent
+                while parent and parent ~= root.Parent do
+                    table.insert(labels, string.lower(tostring(parent.Name or "")))
+                    if parent == root then break end
+                    parent = parent.Parent
+                end
+                for _, wanted in ipairs(names) do
+                    local needle = string.lower(tostring(wanted))
+                    for _, label in ipairs(labels) do
+                        if label == needle or string.find(label, needle, 1, true) then
+                            if clickGuiButton(descendant) then
+                                return true
+                            end
+                            break
+                        end
+                    end
+                end
             end
         end
     end
@@ -5043,6 +5134,9 @@ local function getRaidDifficultyOptions()
 end
 
 local RaidState = {
+    -- Keep known defaults available even before the Boss Raid panel has
+    -- replicated. A UI scan at script startup can otherwise return only
+    -- "Normal" and make the default Easy selection look invalid.
     difficultyOptions = { "Easy", "Medium", "Hard", "Nightmare" },
     completedDifficulties = {},
     -- Boss Raid grants one attempt per hourly window. Keep the feature
@@ -5070,6 +5164,7 @@ local RaidState = {
     },
     infoParagraph = nil,
     timerText = "Searching for Boss Raid timer...",
+    serverOpen = nil,
 }
 local function normalizeRaidDifficulties(value)
     local selected = {}
@@ -5183,6 +5278,15 @@ if BossRaidRE then
     BossRaidRE.OnClientEvent:Connect(function(eventName, payload)
         if eventName == "State" and type(payload) == "table" then
             RuntimeState.currentRaidBossId = tostring(payload.BossId or "")
+            for _, field in ipairs({
+                "Open", "IsOpen", "Available", "IsAvailable",
+                "CanEnter", "Active",
+            }) do
+                if type(payload[field]) == "boolean" then
+                    RaidState.serverOpen = payload[field]
+                    break
+                end
+            end
         end
     end)
     pcall(function() BossRaidRE:FireServer("RequestState") end)
@@ -5244,14 +5348,46 @@ function findBossRaidTimer()
 end
 
 function isBossRaidOpen()
-    -- Use the exact timer text shown in the Boss Raid description. This keeps
-    -- the UI and the combat-priority decision on one source of truth.
-    return string.find(
-        string.lower(RaidState.timerText or ""),
-        "end in",
-        1,
-        true
-    ) ~= nil
+    if RaidState.serverOpen ~= nil then
+        return RaidState.serverOpen == true
+    end
+
+    -- Use the timer shown by the live Boss Raid UI, but accept the wording
+    -- used by the different client builds. The old exact "end in" match made
+    -- Combat silently do nothing when the UI said "Ends in" or displayed
+    -- only a numeric countdown.
+    local text = string.lower(tostring(RaidState.timerText or ""))
+    if text == "" then return false end
+    if string.find(text, "unavailable", 1, true)
+        or string.find(text, "not available", 1, true)
+        or string.find(text, "closed", 1, true)
+        or string.find(text, "starts in", 1, true)
+        or string.find(text, "next raid", 1, true) then
+        return false
+    end
+    if string.find(text, "end in", 1, true)
+        or string.find(text, "ends in", 1, true)
+        or string.find(text, "open", 1, true)
+        or string.find(text, "active", 1, true)
+        or string.find(text, "ready", 1, true) then
+        return true
+    end
+
+    local hours, minutes, seconds = string.match(
+        text, "(%d+)%s*:%s*(%d+)%s*:%s*(%d+)"
+    )
+    if hours and minutes and seconds then
+        return tonumber(hours) + tonumber(minutes) + tonumber(seconds) > 0
+    end
+    minutes, seconds = string.match(text, "(%d+)%s*:%s*(%d+)")
+    if minutes and seconds then
+        return tonumber(minutes) + tonumber(seconds) > 0
+    end
+    local numeric = tonumber(string.match(text, "^%s*(%d+%.?%d*)%s*$"))
+    if numeric then
+        return numeric > 0
+    end
+    return false
 end
 
 task.spawn(function()
