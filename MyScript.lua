@@ -369,6 +369,7 @@ local raidState = {
     Received = false,
     Open = false,
     AlreadyUsed = false,
+    RetryAt = 0,
 }
 
 -- ── Data lists ───────────────────────────────────────────────
@@ -5003,14 +5004,20 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
 
     if mode == "BossRaid"
         and player:GetAttribute("InfinityTowerInBattle") == true then
-        if not exitInfinityTowerBattle() then
-            return false
-        end
-        for _ = 1, 30 do
+        -- BossRaidClient rejects StartFight while the tower attribute is
+        -- still true.  Clicking Exit once is not enough because the server
+        -- may need a few replication frames to clear the attribute.
+        for _ = 1, 3 do
+            exitInfinityTowerBattle()
+            for _ = 1, 15 do
+                if player:GetAttribute("InfinityTowerInBattle") ~= true then
+                    break
+                end
+                task.wait(0.1)
+            end
             if player:GetAttribute("InfinityTowerInBattle") ~= true then
                 break
             end
-            task.wait(0.1)
         end
         if player:GetAttribute("InfinityTowerInBattle") == true then
             return false
@@ -5045,9 +5052,10 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     if not started then return false end
 
     if mode == "BossRaid" then
-        -- Consume the hourly attempt as soon as the battle button is clicked.
-        -- Do not wait for the battle attribute: a rejected/failed start must
-        -- not cause the polling loop to spam the server repeatedly.
+        -- Do not permanently consume the attempt until the server confirms
+        -- the battle.  BossRaidClient can reject this click when the tower
+        -- attribute has not replicated clear yet; that failure must remain
+        -- retryable after a manual or delayed tower exit.
         raidAttemptConsumed = true
         local raidConfirmed = false
         for _ = 1, 20 do
@@ -5058,8 +5066,11 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
             task.wait(0.15)
         end
         if raidConfirmed then
+            raidState.RetryAt = 0
             completedRaidDifficulties[raidDifficulty] = true
         else
+            raidAttemptConsumed = false
+            raidState.RetryAt = os.clock() + 3
             return false
         end
     else
@@ -5088,6 +5099,7 @@ task.spawn(function()
             and isBossRaidOpen()
             and not raidState.AlreadyUsed
             and not raidAttemptConsumed
+            and os.clock() >= raidState.RetryAt
             and getNextRaidDifficulty() ~= nil
         local towerEnabled = Config.AutoInfinityTower
         local towerActive = player:GetAttribute("InfinityTowerInBattle") == true
@@ -5097,16 +5109,24 @@ task.spawn(function()
             combatBusy = true
 
             if towerActive then
-                exitInfinityTowerBattle()
-                for _ = 1, 30 do
+                for _ = 1, 3 do
+                    exitInfinityTowerBattle()
+                    for _ = 1, 15 do
+                        if player:GetAttribute("InfinityTowerInBattle") ~= true then
+                            break
+                        end
+                        task.wait(0.1)
+                    end
                     if player:GetAttribute("InfinityTowerInBattle") ~= true then
                         break
                     end
-                    task.wait(0.1)
                 end
             end
 
-            if not isCombatActive() then
+            -- Never click Boss Raid while the tower is still active.  The
+            -- game's BossRaidClient explicitly rejects that transition.
+            if player:GetAttribute("InfinityTowerInBattle") ~= true
+                and not isCombatActive() then
                 if Config.AutoTeamCardCycle then
                     local cardsEquipped = false
                     for _ = 1, 2 do
@@ -5139,6 +5159,12 @@ task.spawn(function()
 
         if towerEnabled and not isCombatActive() then
             combatBusy = true
+            -- The reward panel can briefly remain visible after the raid
+            -- attribute clears. Close it before preparing the next tower run.
+            if closeBossRaidReward and closeBossRaidReward() then
+                combatBusy = false
+                continue
+            end
             if Config.AutoTeamCardCycle then
                 local cardsEquipped = false
                 for _ = 1, 2 do
