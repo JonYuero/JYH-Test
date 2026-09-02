@@ -3650,8 +3650,34 @@ local function areAllCardSlotsOccupied()
     local function timePotionSlotIsOccupied(slot)
         if not slot then return false, false end
         local occupied = false
-        local packPresent = false
         local packOnCooldown = false
+
+        local function timerTextIsActive(text)
+            local normalized = string.lower(tostring(text or ""))
+            normalized = string.gsub(normalized, "%s+", "")
+            if normalized == "" or normalized == "ready" then
+                return false
+            end
+            return string.match(normalized, "^%d+:%d+:%d+$") ~= nil
+                or string.match(normalized, "^%d+:%d+$") ~= nil
+        end
+
+        local function packModelHasActiveTimer(packModel)
+            local timerGui = packModel:FindFirstChild(
+                "BillboardGuiTimer",
+                true
+            )
+            local timer = timerGui
+                and timerGui:FindFirstChild("Timer", true)
+            if not timer then return false end
+            if timer:IsA("TextLabel") or timer:IsA("TextButton") then
+                return timerTextIsActive(timer.Text)
+            end
+            if timer:IsA("StringValue") then
+                return timerTextIsActive(timer.Value)
+            end
+            return false
+        end
 
         -- Some game versions put the occupied state on the slot itself.
         for _, attributeName in ipairs({
@@ -3661,9 +3687,6 @@ local function areAllCardSlotsOccupied()
             local value = slot:GetAttribute(attributeName)
             if value ~= nil and value ~= false and value ~= "" then
                 occupied = true
-                if attributeName == "HasPack" or attributeName == "PackName" then
-                    packPresent = true
-                end
             end
         end
 
@@ -3689,7 +3712,6 @@ local function areAllCardSlotsOccupied()
             if name == "placedcard" or name == "cardname"
                 or name == "cardlevel" or name == "packname" then
                 occupied = true
-                if name == "packname" then packPresent = true end
             end
 
             -- Placed packs are live child Models under the slot, for example
@@ -3697,10 +3719,10 @@ local function areAllCardSlotsOccupied()
             -- necessarily expose a PackName value or attribute.
             if desc:IsA("Model") then
                 local compactName = string.gsub(name, "[^%w]", "")
+                local isPackModel = false
                 if string.find(compactName, "pack", 1, true)
                     or string.find(compactName, "crate", 1, true) then
-                    occupied = true
-                    packPresent = true
+                    isPackModel = true
                 end
                 for _, knownPack in ipairs(PACKS) do
                     local compactPack = string.gsub(
@@ -3712,8 +3734,13 @@ local function areAllCardSlotsOccupied()
                         and (compactName == compactPack
                             or string.find(compactName, compactPack, 1, true)
                             or string.find(compactPack, compactName, 1, true)) then
-                        occupied = true
-                        packPresent = true
+                        isPackModel = true
+                    end
+                end
+                if isPackModel then
+                    occupied = true
+                    if packModelHasActiveTimer(desc) then
+                        packOnCooldown = true
                     end
                 end
             end
@@ -3722,9 +3749,6 @@ local function areAllCardSlotsOccupied()
                 or desc:GetAttribute("PackName") ~= nil
                 or desc:GetAttribute("ItemId") ~= nil then
                 occupied = true
-                if desc:GetAttribute("PackName") ~= nil then
-                    packPresent = true
-                end
             end
 
             -- Remove is only present for an occupied slot. Do not use
@@ -3740,25 +3764,6 @@ local function areAllCardSlotsOccupied()
                     occupied = true
                 end
 
-                -- A pack is a valid Time Potion target only while its Timer
-                -- value is actively counting down. Ready packs use the same
-                -- UI objects but their Timer.Text is exactly "READY".
-                local countdownText = string.gsub(text, "%s+", "")
-                local hasCountdown = string.match(
-                    countdownText,
-                    "^%d+:%d+:%d+$"
-                ) ~= nil or string.match(
-                    countdownText,
-                    "^%d+:%d+$"
-                ) ~= nil
-                local isTimerObject = string.find(name, "timer", 1, true)
-                    ~= nil
-                local isReadyState = countdownText == "ready"
-                if isTimerObject and hasCountdown and not isReadyState then
-                    occupied = true
-                    packPresent = true
-                    packOnCooldown = true
-                end
             end
 
             if string.find(name, "remove", 1, true) ~= nil
@@ -3768,7 +3773,7 @@ local function areAllCardSlotsOccupied()
                 occupied = true
             end
         end
-        return occupied, packPresent and packOnCooldown
+        return occupied, packOnCooldown
     end
 
     local hasPackOnCooldown = false
