@@ -3633,13 +3633,22 @@ end
 
 local function areAllCardSlotsOccupied()
     local slots = getAllCardSlots()
-    if #slots == 0 then return false end
+    -- The feature is specifically for a full 30-slot plot. If a slot model
+    -- has not replicated yet, do not treat the plot as full.
+    if #slots < 30 then return false end
+    local hasPack = false
     for _, slot in ipairs(slots) do
         if not slotIsOccupied(slot) then
             return false
         end
+        -- An unopened pack exposes Open; a pack waiting on its timer exposes
+        -- Skip. Cards do not normally expose either interaction.
+        if findSlotButton(slot, "Open") ~= nil
+            or slotIsOnCooldown(slot) then
+            hasPack = true
+        end
     end
-    return true
+    return hasPack
 end
 
 findSlotButton = function(slotModel, buttonName)
@@ -4661,9 +4670,15 @@ task.spawn(function()
             nextInventorySync = now + 5
         end
 
+        -- Time Potions are only useful once every card slot is occupied.
+        -- This prevents consuming them while Auto Place Pack still has an
+        -- available slot, and also prevents them from being spammed on an
+        -- empty or partially replicated plot.
+        if not areAllCardSlotsOccupied() then continue end
+
         -- Time potions are consumables, not timed stat boosts. Do not wait
-        -- for an active boost, a full plot, or a card cooldown. Submit one
-        -- available potion per pass, just like Auto Potions.
+        -- for an active boost or a card cooldown. Submit one available potion
+        -- per pass once all 30 slots are occupied.
         local selectedPotion
         for _, potion in ipairs(TIME_POTIONS) do
             local inventoryItem, quantity = findPotionInventoryItem(potion)
