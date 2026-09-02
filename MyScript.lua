@@ -3666,6 +3666,23 @@ local function areAllCardSlotsOccupied()
             end
         end
 
+        -- Empty slots still contain a CardHolder with the static UI surface
+        -- objects. An occupied card adds dynamic content below CardHolder
+        -- (the current game commonly names the card child "1").
+        local cardHolder = slot:FindFirstChild("CardHolder", true)
+        if cardHolder then
+            for _, child in ipairs(cardHolder:GetChildren()) do
+                local childName = string.lower(child.Name)
+                if childName ~= "surfaceguiback"
+                    and childName ~= "surfaceguifront"
+                    and (tonumber(child.Name) ~= nil
+                        or child:IsA("Model")
+                        or child:IsA("Tool")) then
+                    occupied = true
+                end
+            end
+        end
+
         for _, desc in ipairs(slot:GetDescendants()) do
             local name = string.lower(desc.Name)
             if name == "placedcard" or name == "cardname"
@@ -3709,30 +3726,17 @@ local function areAllCardSlotsOccupied()
                 end
             end
 
-            -- Occupied card/pack slots expose one of these state controls,
-            -- even when their internal value objects use different names.
-            if string.find(name, "remove", 1, true)
-                or string.find(name, "open", 1, true)
-                or string.find(name, "skip", 1, true)
-                or string.find(name, "upgrade", 1, true) then
+            -- Remove is only present for an occupied slot. Do not use
+            -- UpgradePart, Open, or Skip as generic occupancy signals:
+            -- empty slots can contain those UI/state objects too.
+            if string.find(name, "remove", 1, true) then
                 occupied = true
-                if string.find(name, "open", 1, true)
-                    or string.find(name, "skip", 1, true) then
-                    hasPack = true
-                end
             end
 
             if desc:IsA("TextLabel") or desc:IsA("TextButton") then
                 local text = string.lower(tostring(desc.Text or ""))
-                if string.find(text, "remove", 1, true)
-                    or string.find(text, "open", 1, true)
-                    or string.find(text, "skip", 1, true)
-                    or string.find(text, "upgrade", 1, true) then
+                if string.find(text, "remove", 1, true) then
                     occupied = true
-                    if string.find(text, "open", 1, true)
-                        or string.find(text, "skip", 1, true) then
-                        hasPack = true
-                    end
                 end
             end
 
