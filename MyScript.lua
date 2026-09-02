@@ -3648,7 +3648,9 @@ local function areAllCardSlotsOccupied()
     -- disabled, and the shared slotIsOccupied assignment can still be
     -- pending while the script is finishing initialization.
     local function timePotionSlotIsOccupied(slot)
-        if not slot then return false end
+        if not slot then return false, false end
+        local occupied = false
+        local hasPack = false
 
         -- Some game versions put the occupied state on the slot itself.
         for _, attributeName in ipairs({
@@ -3657,7 +3659,10 @@ local function areAllCardSlotsOccupied()
         }) do
             local value = slot:GetAttribute(attributeName)
             if value ~= nil and value ~= false and value ~= "" then
-                return true
+                occupied = true
+                if attributeName == "HasPack" or attributeName == "PackName" then
+                    hasPack = true
+                end
             end
         end
 
@@ -3665,7 +3670,8 @@ local function areAllCardSlotsOccupied()
             local name = string.lower(desc.Name)
             if name == "placedcard" or name == "cardname"
                 or name == "cardlevel" or name == "packname" then
-                return true
+                occupied = true
+                if name == "packname" then hasPack = true end
             end
 
             -- Placed packs are live child Models under the slot, for example
@@ -3675,7 +3681,8 @@ local function areAllCardSlotsOccupied()
                 local compactName = string.gsub(name, "[^%w]", "")
                 if string.find(compactName, "pack", 1, true)
                     or string.find(compactName, "crate", 1, true) then
-                    return true
+                    occupied = true
+                    hasPack = true
                 end
                 for _, knownPack in ipairs(PACKS) do
                     local compactPack = string.gsub(
@@ -3687,7 +3694,8 @@ local function areAllCardSlotsOccupied()
                         and (compactName == compactPack
                             or string.find(compactName, compactPack, 1, true)
                             or string.find(compactPack, compactName, 1, true)) then
-                        return true
+                        occupied = true
+                        hasPack = true
                     end
                 end
             end
@@ -3695,7 +3703,10 @@ local function areAllCardSlotsOccupied()
             if desc:GetAttribute("CardName") ~= nil
                 or desc:GetAttribute("PackName") ~= nil
                 or desc:GetAttribute("ItemId") ~= nil then
-                return true
+                occupied = true
+                if desc:GetAttribute("PackName") ~= nil then
+                    hasPack = true
+                end
             end
 
             -- Occupied card/pack slots expose one of these state controls,
@@ -3704,7 +3715,11 @@ local function areAllCardSlotsOccupied()
                 or string.find(name, "open", 1, true)
                 or string.find(name, "skip", 1, true)
                 or string.find(name, "upgrade", 1, true) then
-                return true
+                occupied = true
+                if string.find(name, "open", 1, true)
+                    or string.find(name, "skip", 1, true) then
+                    hasPack = true
+                end
             end
 
             if desc:IsA("TextLabel") or desc:IsA("TextButton") then
@@ -3713,7 +3728,11 @@ local function areAllCardSlotsOccupied()
                     or string.find(text, "open", 1, true)
                     or string.find(text, "skip", 1, true)
                     or string.find(text, "upgrade", 1, true) then
-                    return true
+                    occupied = true
+                    if string.find(text, "open", 1, true)
+                        or string.find(text, "skip", 1, true) then
+                        hasPack = true
+                    end
                 end
             end
 
@@ -3721,18 +3740,24 @@ local function areAllCardSlotsOccupied()
                 and (desc:IsA("ClickDetector")
                     or desc:IsA("ProximityPrompt")
                     or desc:IsA("GuiObject")) then
-                return true
+                occupied = true
             end
         end
-        return false
+        return occupied, hasPack
     end
 
+    local hasPack = false
     for _, slot in ipairs(slots) do
-        if not timePotionSlotIsOccupied(slot) then
+        local occupied, slotHasPack = timePotionSlotIsOccupied(slot)
+        if not occupied then
             return false
         end
+        hasPack = hasPack or slotHasPack
     end
-    return true
+
+    -- A full plot of cards is not enough. At least one of the occupied slots
+    -- must still contain a pack for the Time Potion to have a target.
+    return hasPack
 end
 
 findSlotButton = function(slotModel, buttonName)
