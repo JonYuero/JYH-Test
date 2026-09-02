@@ -336,7 +336,7 @@ local UpgradesRE       = Remotes:FindFirstChild("UpgradesRE")
 local BossRaidRE = Remotes:WaitForChild("BossRaidRE", 15)
 local GradeRollRE      = Remotes:FindFirstChild("GradeRollRE")
 local TraitRollRE      = Remotes:FindFirstChild("TraitRollRE")
-local Modules    = ReplicatedStorage:FindFirstChild("Modules")
+local Modules    = ReplicatedStorage:WaitForChild("Modules", 15)
 local BossRaidConfig
 if Modules and Modules:FindFirstChild("BossRaidConfig") then
     pcall(function()
@@ -360,6 +360,15 @@ if Modules and Modules:FindFirstChild("GuiManager") then
     pcall(function()
         GuiManager = require(Modules.GuiManager)
     end)
+end
+local ConveyorPacks
+if Modules then
+    local conveyorPacksModule = Modules:WaitForChild("ConveyorPacks", 15)
+    if conveyorPacksModule then
+        pcall(function()
+            ConveyorPacks = require(conveyorPacksModule)
+        end)
+    end
 end
 -- Keep raid state in one local table.  This script is close to Luau's
 -- top-level local-register limit, so separate locals here can prevent the
@@ -392,6 +401,10 @@ local cardCraftState = {
     MutationOptions = { "All" },
     SelectedRecipeId = nil,
     LastMessage = nil,
+    CachedInventory = {},
+    InventoryCacheAt = 0,
+    LastStatusTitle = nil,
+    LastStatusContent = nil,
 }
 if Modules and Modules:WaitForChild("CardCraftConfig", 15) then
     pcall(function()
@@ -432,6 +445,95 @@ local PACKS = {
     "Dynasty Pack", "Grail Pack", "Conquest Pack", "Blaze Pack",
     "Devour Pack", "Raven Pack", "Arcane Pack", "Nightfall Pack",
 }
+
+-- ConveyorSettingsClient uses ReplicatedStorage.Modules.ConveyorPacks as the
+-- authoritative catalog. Build the same non-Robux pack list and rarity order
+-- here so every filter, fallback name matcher, auto-buy path, and sell filter
+-- automatically includes content added by the game.
+if type(ConveyorPacks) == "table" then
+    local dynamicPackEntries = {}
+    local dynamicPackSeen = {}
+    local dynamicRaritySeen = {}
+
+    if type(ConveyorPacks.List) == "table" then
+        for _, entry in ipairs(ConveyorPacks.List) do
+            if type(entry) == "table" then
+                local packName = entry.Id
+                    or entry.PackId
+                    or entry.PackName
+                    or entry.Name
+                if packName ~= nil and entry.RobuxOnly ~= true then
+                    packName = tostring(packName)
+                    if packName ~= "" and not dynamicPackSeen[packName] then
+                        dynamicPackSeen[packName] = true
+                        table.insert(dynamicPackEntries, {
+                            Name = packName,
+                            Rarity = tostring(entry.Rarity or ""),
+                            Price = tonumber(entry.Price) or 0,
+                        })
+                    end
+                end
+
+                local rarity = entry.Rarity
+                if rarity ~= nil and tostring(rarity) ~= "" then
+                    dynamicRaritySeen[tostring(rarity)] = true
+                end
+            end
+        end
+    end
+
+    local dynamicRarityEntries = {}
+    local dynamicRarityEntryByName = {}
+    if type(ConveyorPacks.RarityRank) == "table" then
+        for rarity, rank in pairs(ConveyorPacks.RarityRank) do
+            local entry = {
+                Name = tostring(rarity),
+                Rank = tonumber(rank) or 0,
+            }
+            table.insert(dynamicRarityEntries, entry)
+            dynamicRarityEntryByName[string.lower(entry.Name)] = true
+        end
+    end
+    for rarity in pairs(dynamicRaritySeen) do
+        if not dynamicRarityEntryByName[string.lower(rarity)] then
+            table.insert(dynamicRarityEntries, {
+                Name = rarity,
+                Rank = 0,
+            })
+            dynamicRarityEntryByName[string.lower(rarity)] = true
+        end
+    end
+
+    if #dynamicPackEntries > 0 then
+        local rarityRanks = type(ConveyorPacks.RarityRank) == "table"
+            and ConveyorPacks.RarityRank
+            or {}
+        table.sort(dynamicPackEntries, function(a, b)
+            local aRank = tonumber(rarityRanks[a.Rarity]) or 0
+            local bRank = tonumber(rarityRanks[b.Rarity]) or 0
+            if aRank ~= bRank then return aRank < bRank end
+            if a.Price ~= b.Price then return a.Price < b.Price end
+            return a.Name < b.Name
+        end)
+
+        PACKS = {}
+        for _, entry in ipairs(dynamicPackEntries) do
+            table.insert(PACKS, entry.Name)
+        end
+    end
+
+    if #dynamicRarityEntries > 0 then
+        table.sort(dynamicRarityEntries, function(a, b)
+            if a.Rank ~= b.Rank then return a.Rank < b.Rank end
+            return a.Name < b.Name
+        end)
+
+        RARITIES = {}
+        for _, entry in ipairs(dynamicRarityEntries) do
+            table.insert(RARITIES, entry.Name)
+        end
+    end
+end
 
 local POTIONS = {
     "LuckPotion1", "LuckPotion2", "LuckPotion3",
@@ -1475,6 +1577,10 @@ end
 
 -- ── Shared gate used by box handling and combat loops ─────────────────
 local boxHandlingActive = false
+-- Auto Stop uses this only while newly spawned records are being checked.
+-- Auto Buy waits during that window so it cannot remove the desired pack
+-- before the watcher sees the replicated metadata.
+local autoStopSearchActive = false
 
 -- ── Diagnostic helpers (used throughout the entire script) ───────────
 local diagnosticState = {}
@@ -1876,14 +1982,18 @@ evaluateRecordReadiness = function(record)
         and os.clock() >= (record.retryNotBefore or 0)
         and (hasPrompt or hasId)
 
-    if Config.AutoBuyMatching and purchaseWindowOpen then
+    if Config.AutoBuyMatching and purchaseWindowOpen
+        and not autoStopSearchActive then
         queuePurchase(record)
     end
 end
 
 -- ── Purchase queue ────────────────────────────────────────────────────
 queuePurchase = function(record)
-    if not record or record.state ~= "WaitingForPurchaseWindow" or record.filterPassed ~= true or PurchaseQueued[record] or os.clock() < (record.retryNotBefore or 0) then
+    if not record or record.state ~= "WaitingForPurchaseWindow"
+        or record.filterPassed ~= true or PurchaseQueued[record]
+        or autoStopSearchActive
+        or os.clock() < (record.retryNotBefore or 0) then
         return
     end
     PurchaseQueued[record] = true
@@ -1909,6 +2019,16 @@ end
 tryBuyRecord = function(record)
     if not record or not record.model or record.state ~= "Queued" then
         return false
+    end
+    if autoStopSearchActive then
+        -- Auto Stop is still validating newly spawned records. Put this
+        -- record back into the waiting state instead of buying it before the
+        -- watcher can inspect its final rarity/mutation.
+        PurchaseQueued[record] = nil
+        record.queued = false
+        transitionState(record, "WaitingForPurchaseWindow",
+            "Auto Stop metadata check")
+        return true
     end
     if not record.model:IsDescendantOf(workspace) then
         cleanupRecord(record)
@@ -2479,7 +2599,6 @@ task.spawn(function()
             autoStopHandled = false
         end
         if autoStopHandled then continue end
-
         -- Prefer the server-assigned plot before touching any ButtonPart.
         -- This prevents the default plot #1 from being clicked during the
         -- short window before PlotNumber finishes replicating.
@@ -2489,7 +2608,7 @@ task.spawn(function()
         end
 
         local previousIds
-        if Config.AutoStopSpawn then
+        if Config.AutoStopSpawn and not autoStopWatcherActive then
             previousIds = indexPackIds(getConveyorPacks())
         end
 
@@ -2517,149 +2636,168 @@ task.spawn(function()
             continue
         end
 
-        -- The watcher must be single-instance, but it must not pause the
-        -- actual spawn loop while it waits for the new pack's metadata.
-        if Config.AutoStopSpawn and not autoStopWatcherActive then
-            local capturedIds = previousIds
-            autoStopWatcherActive = true
-            task.spawn(function()
-                if not Config.AutoStopSpawn or not Config.AutoSpawnPack then
-                    autoStopWatcherActive = false
-                    return
-                end
-                if autoStopHandled then
-                    autoStopWatcherActive = false
-                    return
-                end
+        -- Start one rolling watcher instead of pausing the spawn loop or
+        -- starting a separate 5-second coroutine for every spawned pack.
+        -- The watcher keeps a small pending set and checks all new records
+        -- while Auto Spawn continues at the configured rate.
+        if Config.AutoStopSpawn then
+            autoStopSearchActive = true
+            if not autoStopWatcherActive then
+                autoStopWatcherActive = true
+                task.spawn(function()
+                    local seenIds = previousIds or indexPackIds(getConveyorPacks())
+                    local pendingRecords = {}
+                    local pendingLifetime = 1.5
 
-                -- ── Step 1: collect ALL new packs (up to 3 s) ───────────
-                -- With admin events two packs can spawn at once; we must
-                -- check every new pack for a filter match, not just the first.
-                local newRecords = {}
-                for _ = 1, 30 do
-                    if not Config.AutoStopSpawn or not Config.AutoSpawnPack then
-                        autoStopWatcherActive = false
-                        return
-                    end
-                    newRecords = {}
-                    for _, record in ipairs(getConveyorPacks()) do
-                        if not capturedIds[getPackKey(record)] then
-                            table.insert(newRecords, record)
+                    local function checkRecord(record)
+                        if not record or not record.model
+                            or not record.model:IsDescendantOf(workspace) then
+                            return nil
                         end
-                    end
-                    if #newRecords > 0 then break end
-                    task.wait(0.1)
-                end
 
-                if #newRecords == 0 then
-                    warnOnce("AutoStop:no-new-pack",
-                        "Auto Stop did not detect a new conveyor pack after spawning.")
-                    autoStopWatcherActive = false
-                    return
-                end
+                        local recordInfo = record.info or {}
+                        local liveInfo = nil
+                        local packName = recordInfo.pack or record.packName
+                        local rarity = recordInfo.rarity or record.rarity
+                        local mutation = recordInfo.mutation or record.mutation
 
-                -- ── Step 2: wait for metadata to replicate, find a match ─
-                -- Rarity/mutation may not be replicated yet the moment the
-                -- model appears. Poll up to 2 s so the filter sees real data.
-                --
-                -- NOTE: refreshRecordMetadata is local to the conveyor do-block
-                -- and is not in scope here. Instead read rarity/mutation directly
-                -- via getPackRarity/getPackMutation (declared before the block)
-                -- and build a fresh info table for the filter check.
-                local spawnedRecord = nil
-                for _ = 1, 20 do
-                    if not Config.AutoStopSpawn or not Config.AutoSpawnPack then
-                        autoStopWatcherActive = false
-                        return
-                    end
-                    task.wait(0.1)
-                    for _, record in ipairs(newRecords) do
-                        if not record.model:IsDescendantOf(workspace) then continue end
-                        local liveInfo = getBoxInfo(record.model)
-                        local freshInfo = {
-                            pack     = liveInfo and liveInfo.pack
-                                or record.packName or record.model.Name,
-                            rarity   = getPackRarity(record.model),
-                            mutation = getPackMutation(record.model),
+                        -- The scheduler normally supplies these values. Only
+                        -- scan the live hierarchy when one is still missing,
+                        -- which keeps this watcher cheap with rapid spawning.
+                        if not packName or not rarity or not mutation then
+                            liveInfo = getBoxInfo(record.model)
+                            packName = packName or (liveInfo and liveInfo.pack)
+                            rarity = rarity or getPackRarity(record.model)
+                            mutation = mutation or getPackMutation(record.model)
+                        end
+
+                        local packCandidates = {
+                            packName,
+                            liveInfo and liveInfo.pack,
+                            record.packName,
+                            record.model.Name,
                         }
-                        if passesFilter(freshInfo) then
-                            spawnedRecord = record
+                        for _, candidatePack in ipairs(packCandidates) do
+                            if candidatePack and passesFilter({
+                                pack = candidatePack,
+                                rarity = rarity,
+                                mutation = mutation,
+                            }) then
+                                return {
+                                    pack = candidatePack,
+                                    rarity = rarity,
+                                    mutation = mutation,
+                                }
+                            end
+                        end
+                        return nil
+                    end
+
+                    while Config.AutoStopSpawn and Config.AutoSpawnPack
+                        and not autoStopHandled do
+                        local now = os.clock()
+                        for _, record in ipairs(getConveyorPacks()) do
+                            local key = getPackKey(record)
+                            if not seenIds[key] then
+                                seenIds[key] = true
+                                pendingRecords[record] = now
+                            end
+                        end
+
+                        local matchedRecord, matchedInfo
+                        for record, firstSeen in pairs(pendingRecords) do
+                            if not record.model:IsDescendantOf(workspace) then
+                                pendingRecords[record] = nil
+                            else
+                                local info = checkRecord(record)
+                                if info then
+                                    matchedRecord = record
+                                    matchedInfo = info
+                                    break
+                                elseif now - firstSeen >= pendingLifetime then
+                                    -- It had enough time for the scheduler and
+                                    -- replication to populate its metadata.
+                                    pendingRecords[record] = nil
+                                end
+                            end
+                        end
+
+                        if matchedRecord then
+                            if autoStopHandled then break end
+                            autoStopHandled = true
+                            autoStopSearchActive = false
+
+                            -- Preserve the confirmed match for Auto Buy and
+                            -- Auto Continue even if the scheduler had briefly
+                            -- marked it FilterRejected during replication.
+                            matchedRecord.info = matchedInfo
+                            matchedRecord.packName = matchedInfo.pack
+                            matchedRecord.rarity = matchedInfo.rarity
+                            matchedRecord.mutation = matchedInfo.mutation
+                            matchedRecord.filterPassed = true
+
+                            Config.AutoSpawnPack = false
+                            if Controls.AutoSpawnPack and Controls.AutoSpawnPack.Set then
+                                pcall(function() Controls.AutoSpawnPack:Set(false) end)
+                            end
+                            notify("Auto Spawn Pack", "Stopped — filter match found!")
+
+                            -- Always watch a match when Auto Continue is on.
+                            -- It may be bought, removed, or expire independently
+                            -- of whether Auto Buy is enabled.
+                            if Config.AutoContinueSpawn then
+                                local watchedRecord = matchedRecord
+                                task.spawn(function()
+                                    local deadline = os.clock() + 30
+                                    while os.clock() < deadline do
+                                        task.wait(0.2)
+                                        local st = watchedRecord.state
+                                        if st == "BoughtAndRemove" or st == "Removed"
+                                            or not watchedRecord.model:IsDescendantOf(workspace) then
+                                            if Config.AutoContinueSpawn then
+                                                Config.AutoSpawnPack = true
+                                                if Controls.AutoSpawnPack and Controls.AutoSpawnPack.Set then
+                                                    pcall(function() Controls.AutoSpawnPack:Set(true) end)
+                                                end
+                                                notify("Spawn Manager", "Resumed — pack purchased or removed!")
+                                            end
+                                            autoStopHandled = false
+                                            autoStopWatcherActive = false
+                                            return
+                                        elseif st == "FilterRejected"
+                                            and watchedRecord.filterPassed ~= true then
+                                            autoStopHandled = false
+                                            autoStopWatcherActive = false
+                                            return
+                                        end
+                                    end
+                                    warn("[ACF] Auto Continue: 30 s timeout waiting for pack outcome — resuming spawn.")
+                                    if Config.AutoContinueSpawn then
+                                        Config.AutoSpawnPack = true
+                                        if Controls.AutoSpawnPack and Controls.AutoSpawnPack.Set then
+                                            pcall(function() Controls.AutoSpawnPack:Set(true) end)
+                                        end
+                                        notify("Spawn Manager", "Resumed — timeout waiting for pack.")
+                                    end
+                                    autoStopHandled = false
+                                    autoStopWatcherActive = false
+                                end)
+                            else
+                                autoStopWatcherActive = false
+                            end
                             break
                         end
+                        task.wait(0.15)
                     end
-                    if spawnedRecord then break end
-                end
 
-                if not spawnedRecord then
-                    autoStopWatcherActive = false
-                    return
-                end  -- no match among new packs
-
-                -- ── Step 3: stop spawning ────────────────────────────────
-                if autoStopHandled then
-                    autoStopWatcherActive = false
-                    return
-                end
-                autoStopHandled = true
-
-                Config.AutoSpawnPack = false
-                if Controls.AutoSpawnPack and Controls.AutoSpawnPack.Set then
-                    pcall(function() Controls.AutoSpawnPack:Set(false) end)
-                end
-                notify("Auto Spawn Pack", "Stopped — filter match found!")
-
-                -- ── Step 4: Auto Continue watcher ───────────────────────
-                -- Always launch when AutoContinueSpawn is on, regardless of
-                -- whether AutoBuyMatching is on — the pack may be removed by
-                -- the game, expire, or be bought manually, and we still need
-                -- to detect that and resume spawning.
-                if Config.AutoContinueSpawn then
-                    local watchedRecord = spawnedRecord
-                    task.spawn(function()
-                        -- Wait up to 30 s for a terminal outcome.
-                        local deadline = os.clock() + 30
-                        while os.clock() < deadline do
-                            task.wait(0.2)
-                            local st = watchedRecord.state
-                            if st == "BoughtAndRemove" or st == "Removed"
-                                or not watchedRecord.model:IsDescendantOf(workspace) then
-                                -- Pack was purchased or left workspace — resume spawning.
-                                if Config.AutoContinueSpawn then
-                                    Config.AutoSpawnPack = true
-                                    if Controls.AutoSpawnPack and Controls.AutoSpawnPack.Set then
-                                        pcall(function() Controls.AutoSpawnPack:Set(true) end)
-                                    end
-                                    notify("Spawn Manager", "Resumed — pack purchased or removed!")
-                                end
-                                autoStopHandled = false
-                                autoStopWatcherActive = false
-                                return
-                            elseif st == "FilterRejected" then
-                                -- Pack didn't pass the filter after all; unlock
-                                -- without resuming — let the next spawn decide.
-                                autoStopHandled = false
-                                autoStopWatcherActive = false
-                                return
-                            end
-                        end
-                        -- Hard timeout (30 s): pack was never confirmed bought or
-                        -- removed. Re-enable spawning so the user isn't stuck —
-                        -- 30 s is long enough for the belt to have cycled.
-                        warn("[ACF] Auto Continue: 30 s timeout waiting for pack outcome — resuming spawn.")
-                        if Config.AutoContinueSpawn then
-                            Config.AutoSpawnPack = true
-                            if Controls.AutoSpawnPack and Controls.AutoSpawnPack.Set then
-                                pcall(function() Controls.AutoSpawnPack:Set(true) end)
-                            end
-                            notify("Spawn Manager", "Resumed — timeout waiting for pack.")
-                        end
-                        autoStopHandled = false
+                    if not autoStopHandled then
+                        autoStopSearchActive = false
                         autoStopWatcherActive = false
-                    end)
-                else
-                    autoStopWatcherActive = false
-                end
-            end)
+                    end
+                end)
+            end
+        elseif not autoStopWatcherActive then
+            autoStopSearchActive = false
         end
     end
 end)
@@ -5630,6 +5768,11 @@ function cardCraftState.amountFor(requirement)
 end
 
 function cardCraftState.inventoryCounts()
+    local now = os.clock()
+    if now - cardCraftState.InventoryCacheAt < 0.75 then
+        return cardCraftState.CachedInventory
+    end
+
     local counts = {}
     for _, tool in ipairs(cardCraftState.availableCards()) do
         local cardName = tostring(tool:GetAttribute("CardName") or "")
@@ -5637,6 +5780,8 @@ function cardCraftState.inventoryCounts()
             counts[cardName] = (counts[cardName] or 0) + 1
         end
     end
+    cardCraftState.CachedInventory = counts
+    cardCraftState.InventoryCacheAt = now
     return counts
 end
 
@@ -5693,10 +5838,19 @@ function cardCraftState.updateStatus()
         end
     end
 
+    local title = "Card Crafting"
+    local content = table.concat(lines, "\n")
+    if title == cardCraftState.LastStatusTitle
+        and content == cardCraftState.LastStatusContent then
+        return
+    end
+
+    cardCraftState.LastStatusTitle = title
+    cardCraftState.LastStatusContent = content
     pcall(function()
         paragraph:Set({
-            Title = "Card Crafting",
-            Content = table.concat(lines, "\n"),
+            Title = title,
+            Content = content,
         })
     end)
 end
@@ -5796,6 +5950,7 @@ function cardCraftState.start()
 
     cardCraftState.Requesting = true
     cardCraftState.LastMessage = nil
+    cardCraftState.InventoryCacheAt = 0
     pcall(function()
         remote:FireServer("StartCraft", {
             RecipeId = recipeId,
@@ -5858,7 +6013,7 @@ end
 
 task.spawn(function()
     while true do
-        task.wait(0.25)
+        task.wait(0.5)
         cardCraftState.updateStatus()
         if cardCraftState.Active then
             cardCraftState.tryClaim()
