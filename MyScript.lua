@@ -3636,8 +3636,35 @@ local function areAllCardSlotsOccupied()
     -- The feature is specifically for a full 30-slot plot. If a slot model
     -- has not replicated yet, do not treat the plot as full.
     if #slots < 30 then return false end
+
+    -- Keep this check local to Auto Use Time Potion. Auto Place may be
+    -- disabled, and the shared slotIsOccupied assignment can still be
+    -- pending while the script is finishing initialization.
+    local function timePotionSlotIsOccupied(slot)
+        if not slot then return false end
+        for _, desc in ipairs(slot:GetDescendants()) do
+            local name = string.lower(desc.Name)
+            if name == "placedcard" or name == "cardname"
+                or name == "cardlevel" or name == "packname" then
+                return true
+            end
+            if desc:GetAttribute("CardName") ~= nil
+                or desc:GetAttribute("PackName") ~= nil
+                or desc:GetAttribute("ItemId") ~= nil then
+                return true
+            end
+            if string.find(name, "remove", 1, true) ~= nil
+                and (desc:IsA("ClickDetector")
+                    or desc:IsA("ProximityPrompt")
+                    or desc:IsA("GuiObject")) then
+                return true
+            end
+        end
+        return false
+    end
+
     for _, slot in ipairs(slots) do
-        if not slotIsOccupied(slot) then
+        if not timePotionSlotIsOccupied(slot) then
             return false
         end
     end
