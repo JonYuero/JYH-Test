@@ -3740,11 +3740,9 @@ local function areAllCardSlotsOccupied()
                     occupied = true
                 end
 
-                -- A pack is a valid Time Potion target only while its
-                -- displayed state is actively counting down. Ready packs
-                -- use the same UI objects but display "READY", so inspect
-                -- the Text value instead of relying on object names such as
-                -- Opening or Skip.
+                -- A pack is a valid Time Potion target only while its Timer
+                -- value is actively counting down. Ready packs use the same
+                -- UI objects but their Timer.Text is exactly "READY".
                 local countdownText = string.gsub(text, "%s+", "")
                 local hasCountdown = string.match(
                     countdownText,
@@ -3753,10 +3751,10 @@ local function areAllCardSlotsOccupied()
                     countdownText,
                     "^%d+:%d+$"
                 ) ~= nil
-                if string.find(text, "opening", 1, true)
-                    or string.find(text, "cooldown", 1, true)
-                    or string.find(text, "skip", 1, true)
-                    or hasCountdown then
+                local isTimerObject = string.find(name, "timer", 1, true)
+                    ~= nil
+                local isReadyState = countdownText == "ready"
+                if isTimerObject and hasCountdown and not isReadyState then
                     occupied = true
                     packPresent = true
                     packOnCooldown = true
