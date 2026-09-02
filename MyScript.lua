@@ -3636,19 +3636,12 @@ local function areAllCardSlotsOccupied()
     -- The feature is specifically for a full 30-slot plot. If a slot model
     -- has not replicated yet, do not treat the plot as full.
     if #slots < 30 then return false end
-    local hasPack = false
     for _, slot in ipairs(slots) do
         if not slotIsOccupied(slot) then
             return false
         end
-        -- An unopened pack exposes Open; a pack waiting on its timer exposes
-        -- Skip. Cards do not normally expose either interaction.
-        if findSlotButton(slot, "Open") ~= nil
-            or slotIsOnCooldown(slot) then
-            hasPack = true
-        end
     end
-    return hasPack
+    return true
 end
 
 findSlotButton = function(slotModel, buttonName)
