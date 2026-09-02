@@ -3632,6 +3632,13 @@ local function getAvailableCardSlots()
 end
 
 local function areAllCardSlotsOccupied()
+    -- Auto Use Time Potion must work by itself, so do not rely on Auto Spawn
+    -- having performed plot detection first.
+    local detectedPlot = autoDetectMyPlotNumber()
+    if detectedPlot and detectedPlot ~= Config.PlotNumber then
+        setPlotNumber(detectedPlot)
+    end
+
     local slots = getAllCardSlots()
     -- The feature is specifically for a full 30-slot plot. If a slot model
     -- has not replicated yet, do not treat the plot as full.
@@ -3642,17 +3649,74 @@ local function areAllCardSlotsOccupied()
     -- pending while the script is finishing initialization.
     local function timePotionSlotIsOccupied(slot)
         if not slot then return false end
+
+        -- Some game versions put the occupied state on the slot itself.
+        for _, attributeName in ipairs({
+            "Occupied", "IsOccupied", "HasCard", "HasPack",
+            "CardName", "PackName", "ItemId",
+        }) do
+            local value = slot:GetAttribute(attributeName)
+            if value ~= nil and value ~= false and value ~= "" then
+                return true
+            end
+        end
+
         for _, desc in ipairs(slot:GetDescendants()) do
             local name = string.lower(desc.Name)
             if name == "placedcard" or name == "cardname"
                 or name == "cardlevel" or name == "packname" then
                 return true
             end
+
+            -- Placed packs are live child Models under the slot, for example
+            -- CardSlot9 > Void Pack or CardSlotN > Brown Crate. They do not
+            -- necessarily expose a PackName value or attribute.
+            if desc:IsA("Model") then
+                local compactName = string.gsub(name, "[^%w]", "")
+                if string.find(compactName, "pack", 1, true)
+                    or string.find(compactName, "crate", 1, true) then
+                    return true
+                end
+                for _, knownPack in ipairs(PACKS) do
+                    local compactPack = string.gsub(
+                        string.lower(tostring(knownPack)),
+                        "[^%w]",
+                        ""
+                    )
+                    if compactPack ~= ""
+                        and (compactName == compactPack
+                            or string.find(compactName, compactPack, 1, true)
+                            or string.find(compactPack, compactName, 1, true)) then
+                        return true
+                    end
+                end
+            end
+
             if desc:GetAttribute("CardName") ~= nil
                 or desc:GetAttribute("PackName") ~= nil
                 or desc:GetAttribute("ItemId") ~= nil then
                 return true
             end
+
+            -- Occupied card/pack slots expose one of these state controls,
+            -- even when their internal value objects use different names.
+            if string.find(name, "remove", 1, true)
+                or string.find(name, "open", 1, true)
+                or string.find(name, "skip", 1, true)
+                or string.find(name, "upgrade", 1, true) then
+                return true
+            end
+
+            if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+                local text = string.lower(tostring(desc.Text or ""))
+                if string.find(text, "remove", 1, true)
+                    or string.find(text, "open", 1, true)
+                    or string.find(text, "skip", 1, true)
+                    or string.find(text, "upgrade", 1, true) then
+                    return true
+                end
+            end
+
             if string.find(name, "remove", 1, true) ~= nil
                 and (desc:IsA("ClickDetector")
                     or desc:IsA("ProximityPrompt")
