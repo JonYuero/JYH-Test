@@ -3734,25 +3734,29 @@ local function areAllCardSlotsOccupied()
                 occupied = true
             end
 
-            -- A pack is a valid Time Potion target only while its timer is
-            -- active. The live game displays this as "OPENING IN"; other
-            -- versions may expose "Cooldown" or "Skip".
-            if string.find(name, "opening", 1, true)
-                or string.find(name, "cooldown", 1, true)
-                or string.find(name, "skip", 1, true) then
-                occupied = true
-                packPresent = true
-                packOnCooldown = true
-            end
-
             if desc:IsA("TextLabel") or desc:IsA("TextButton") then
                 local text = string.lower(tostring(desc.Text or ""))
                 if string.find(text, "remove", 1, true) then
                     occupied = true
                 end
+
+                -- A pack is a valid Time Potion target only while its
+                -- displayed state is actively counting down. Ready packs
+                -- use the same UI objects but display "READY", so inspect
+                -- the Text value instead of relying on object names such as
+                -- Opening or Skip.
+                local countdownText = string.gsub(text, "%s+", "")
+                local hasCountdown = string.match(
+                    countdownText,
+                    "^%d+:%d+:%d+$"
+                ) ~= nil or string.match(
+                    countdownText,
+                    "^%d+:%d+$"
+                ) ~= nil
                 if string.find(text, "opening", 1, true)
                     or string.find(text, "cooldown", 1, true)
-                    or string.find(text, "skip", 1, true) then
+                    or string.find(text, "skip", 1, true)
+                    or hasCountdown then
                     occupied = true
                     packPresent = true
                     packOnCooldown = true
