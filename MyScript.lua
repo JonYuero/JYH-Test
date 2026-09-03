@@ -718,10 +718,10 @@ local Config = {
 
     -- Auto Sell Cards
     FilteredSellMode  = "Whitelist",
-    FilteredSellCard  = "All",
-    FilteredSellMutation = "All",
-    FilteredSellRanking = "All",
-    FilteredSellTrait = "All",
+    FilteredSellCard  = { "All" },
+    FilteredSellMutation = { "All" },
+    FilteredSellRanking = { "All" },
+    FilteredSellTrait = { "All" },
     AutoFilteredSell  = false,
 
     -- Combat
@@ -4072,15 +4072,7 @@ filteredSellState.getCardTrait = function(item)
 end
 
 filteredSellState.fieldMatches = function(value, selected)
-    local wanted = string.lower(string.gsub(
-        tostring(selected or "All"),
-        "^%s*(.-)%s*$",
-        "%1"
-    ))
-    if wanted == "" or wanted == "all" or wanted == "any" then
-        return true
-    end
-    return filterValueMatches(value, normalizeFilterSelection({ selected }))
+    return filterValueMatches(value, normalizeFilterSelection(selected))
 end
 
 filteredSellState.cardMatches = function(item)
@@ -6405,9 +6397,26 @@ local function saveConfig(name, allowOverwrite)
 end
 
 local function normalizeLoadedSelection(value)
-    if type(value) == "table" then return value end
-    if value == nil then return {} end
-    return { tostring(value) }
+    local values = type(value) == "table" and value or { value }
+    local normalized = {}
+    local seen = {}
+
+    for _, option in ipairs(values) do
+        option = tostring(option or "")
+        option = option:gsub("^%s*(.-)%s*$", "%1")
+        if option == "" or option == "Any" or option == "All" then
+            return { "All" }
+        end
+        if not seen[option] then
+            seen[option] = true
+            table.insert(normalized, option)
+        end
+    end
+
+    if #normalized == 0 then
+        return { "All" }
+    end
+    return normalized
 end
 
 local function getAutoload()
@@ -6525,6 +6534,12 @@ local function loadConfig(name, isAutoload)
             end
             if key == "CardCraftMutations" then
                 value = cardCraftState.normalizeMutations(value)
+            end
+            if key == "FilteredSellCard"
+                or key == "FilteredSellMutation"
+                or key == "FilteredSellRanking"
+                or key == "FilteredSellTrait" then
+                value = normalizeLoadedSelection(value)
             end
             Config[key] = value
             local control = Controls[key]
@@ -7004,7 +7019,7 @@ local function resolveFilteredSellValue(value, fallback)
 end
 
 local filteredSellCardOptions = { "All" }
-    for _, cardName in ipairs(cardCraftState.IndexCards) do
+for _, cardName in ipairs(cardCraftState.IndexCards) do
     table.insert(filteredSellCardOptions, cardName)
 end
 
@@ -7042,50 +7057,51 @@ Controls.FilteredSellMode = cardsTab:CreateDropdown({
 Controls.FilteredSellCard = cardsTab:CreateDropdown({
     Name            = "Card",
     Options         = filteredSellCardOptions,
-    CurrentOption   = resolveFilteredSellValue(Config.FilteredSellCard, "All"),
-    MultipleOptions = false,
+    CurrentOption   = normalizeLoadedSelection(Config.FilteredSellCard),
+    MultipleOptions = true,
+    Searchable      = true,
     Flag            = "FilteredSellCard",
     Callback        = function(v)
-        Config.FilteredSellCard = resolveFilteredSellValue(v, "All")
+        Config.FilteredSellCard = normalizeLoadedSelection(v)
     end,
 })
 
 Controls.FilteredSellMutation = cardsTab:CreateDropdown({
     Name            = "Mutation",
     Options         = filteredSellMutationOptions,
-    CurrentOption   = resolveFilteredSellValue(
+    CurrentOption   = normalizeLoadedSelection(
         Config.FilteredSellMutation,
         "All"
     ),
-    MultipleOptions = false,
+    MultipleOptions = true,
     Flag            = "FilteredSellMutation",
     Callback        = function(v)
-        Config.FilteredSellMutation = resolveFilteredSellValue(v, "All")
+        Config.FilteredSellMutation = normalizeLoadedSelection(v)
     end,
 })
 
 Controls.FilteredSellRanking = cardsTab:CreateDropdown({
     Name            = "Ranking",
     Options         = filteredSellRankingOptions,
-    CurrentOption   = resolveFilteredSellValue(
+    CurrentOption   = normalizeLoadedSelection(
         Config.FilteredSellRanking,
         "All"
     ),
-    MultipleOptions = false,
+    MultipleOptions = true,
     Flag            = "FilteredSellRanking",
     Callback        = function(v)
-        Config.FilteredSellRanking = resolveFilteredSellValue(v, "All")
+        Config.FilteredSellRanking = normalizeLoadedSelection(v)
     end,
 })
 
 Controls.FilteredSellTrait = cardsTab:CreateDropdown({
     Name            = "Trait",
     Options         = filteredSellTraitOptions,
-    CurrentOption   = resolveFilteredSellValue(Config.FilteredSellTrait, "All"),
-    MultipleOptions = false,
+    CurrentOption   = normalizeLoadedSelection(Config.FilteredSellTrait),
+    MultipleOptions = true,
     Flag            = "FilteredSellTrait",
     Callback        = function(v)
-        Config.FilteredSellTrait = resolveFilteredSellValue(v, "All")
+        Config.FilteredSellTrait = normalizeLoadedSelection(v)
     end,
 })
 
