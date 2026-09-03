@@ -4112,13 +4112,41 @@ filteredSellState.getFilteredCards = function()
     return result
 end
 
--- The filtered action is intentionally separate from SellHand/SellCards:
--- those existing actions are broad and would ignore the selected filters.
+-- The filtered action scans the backpack itself, then follows the same
+-- equipped-tool path as the working "SellHand" action. The broad SellCards
+-- remote is intentionally not used because it ignores these filters.
 filteredSellState.sellCard = function(card)
-    if not card or card.Parent ~= player:FindFirstChild("Backpack") then
+    local backpack = player:FindFirstChild("Backpack")
+    local character = player.Character
+    local humanoid = character
+        and character:FindFirstChildOfClass("Humanoid")
+    if not card or not backpack or card.Parent ~= backpack
+        or not character or not humanoid then
         return false
     end
-    return fireRemote("SellRE", "SellCard", { Tool = card })
+
+    -- Make sure the card being processed is the active held tool.
+    pcall(function() humanoid:UnequipTools() end)
+    task.wait(0.1)
+    pcall(function() humanoid:EquipTool(card) end)
+
+    -- EquipTool is asynchronous in Roblox; do not fire SellHand until the
+    -- server-visible parent has changed from Backpack to Character.
+    for _ = 1, 15 do
+        if card.Parent == character then break end
+        task.wait(0.1)
+    end
+    if card.Parent ~= character then
+        return false
+    end
+
+    -- Give the game's server a moment to register the newly held card before
+    -- using the same SellHand request as the manual button.
+    task.wait(0.15)
+    local sold = fireRemote("SellRE", "SellHand")
+    task.wait(0.15)
+    pcall(function() humanoid:UnequipTools() end)
+    return sold
 end
 
 getSortedCardsInBackpack = function()
