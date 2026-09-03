@@ -329,8 +329,6 @@ local ItemsREForAutomation = Remotes:WaitForChild("ItemsRE", 15)
 local PlayTimeRewardRE = Remotes:FindFirstChild("PlayTimeRewardRE")
 local DailyRewardRE    = Remotes:FindFirstChild("DailyRewardRE")
 local UpgradesRE       = Remotes:FindFirstChild("UpgradesRE")
-local ArtifactRE       = Remotes:WaitForChild("ArtifactRE", 15)
-local BossCardRE       = Remotes:WaitForChild("BossCardRE", 15)
 -- BossRaidClient waits for this remote before it can receive the authoritative
 -- open/closed state.  Do the same here instead of taking a one-time snapshot:
 -- FindFirstChild can run before the remote has replicated and leave the
@@ -381,6 +379,13 @@ local raidState = {
     Open = false,
     AlreadyUsed = false,
     RetryAt = 0,
+    DifficultyOptions = {},
+    CompletedDifficulties = {},
+    AttemptConsumed = false,
+    ClosedSince = nil,
+    InfoParagraph = nil,
+    TimerText = "Searching for Boss Raid timer...",
+    DifficultyInfo = {},
 }
 
 -- Card Craft is driven by the same CardCraftRE used by the game's own
@@ -762,6 +767,8 @@ local Controls = {}
 -- Artifact and boss-card automation state. Keep this in one table because
 -- this script is already close to Luau's top-level local-register limit.
 local artifactState = {
+    ArtifactRE = Remotes:WaitForChild("ArtifactRE", 15),
+    BossCardRE = Remotes:WaitForChild("BossCardRE", 15),
     ArtifactDropdown = nil,
     ArtifactLevelDropdown = nil,
     BossCardDropdown = nil,
@@ -1825,24 +1832,24 @@ do
     end
 
     local function fireArtifact(action, data)
-        if not ArtifactRE then return false end
+        if not artifactState.ArtifactRE then return false end
         local ok = pcall(function()
             if data == nil then
-                ArtifactRE:FireServer(action)
+                artifactState.ArtifactRE:FireServer(action)
             else
-                ArtifactRE:FireServer(action, data)
+                artifactState.ArtifactRE:FireServer(action, data)
             end
         end)
         return ok
     end
 
     local function fireBossCard(action, data)
-        if not BossCardRE then return false end
+        if not artifactState.BossCardRE then return false end
         local ok = pcall(function()
             if data == nil then
-                BossCardRE:FireServer(action)
+                artifactState.BossCardRE:FireServer(action)
             else
-                BossCardRE:FireServer(action, data)
+                artifactState.BossCardRE:FireServer(action, data)
             end
         end)
         return ok
@@ -5872,7 +5879,7 @@ end
 -- could contain choices that do not exist in the current game revision, so
 -- selectRaidDifficulty() would silently fail and BATTLE would be clicked with
 -- no valid difficulty selected.
-local raidDifficultyOptions = getRaidDifficultyOptions()
+raidState.DifficultyOptions = getRaidDifficultyOptions()
 
 local function normalizeRaidDifficulties(value)
     local selected = {}
@@ -5888,13 +5895,9 @@ local function normalizeRaidDifficulties(value)
     return selected
 end
 
-local completedRaidDifficulties = {}
 -- Boss Raid grants one attempt per hourly window. Keep the feature enabled
 -- after the first click, but latch the attempt so the polling loops cannot
 -- click again until the next window is detected.
-local raidAttemptConsumed = false
-local raidClosedSince = nil
-
 local function getSelectedRaidDifficulties()
     local selected = normalizeRaidDifficulties(Config.RaidDifficulties)
     local selectedSet = {}
@@ -5903,20 +5906,20 @@ local function getSelectedRaidDifficulties()
     end
 
     local ordered = {}
-    for _, difficulty in ipairs(raidDifficultyOptions) do
+    for _, difficulty in ipairs(raidState.DifficultyOptions) do
         if selectedSet[difficulty] then
             table.insert(ordered, difficulty)
         end
     end
-    if #ordered == 0 and raidDifficultyOptions[1] then
-        ordered[1] = raidDifficultyOptions[1]
+    if #ordered == 0 and raidState.DifficultyOptions[1] then
+        ordered[1] = raidState.DifficultyOptions[1]
     end
     return ordered
 end
 
 local function getNextRaidDifficulty()
     for _, difficulty in ipairs(getSelectedRaidDifficulties()) do
-        if not completedRaidDifficulties[difficulty] then
+        if not raidState.CompletedDifficulties[difficulty] then
             return difficulty
         end
     end
@@ -5924,8 +5927,8 @@ local function getNextRaidDifficulty()
 end
 
 local function clearCompletedRaidDifficulties()
-    for difficulty in pairs(completedRaidDifficulties) do
-        completedRaidDifficulties[difficulty] = nil
+    for difficulty in pairs(raidState.CompletedDifficulties) do
+        raidState.CompletedDifficulties[difficulty] = nil
     end
 end
 
@@ -5945,7 +5948,7 @@ local function getRaidRequirement(difficulty)
     return nil
 end
 
-local RAID_DIFFICULTY_INFO = {
+raidState.DifficultyInfo = {
     Easy = {
         damage = "2.1B",
         description = "At least 2.1B damage per card.",
@@ -5964,12 +5967,9 @@ local RAID_DIFFICULTY_INFO = {
     },
 }
 
-local raidInfoParagraph
-local raidTimerText = "Searching for Boss Raid timer..."
-
 local function getRaidDifficultyInfo(difficulty)
     local wanted = string.lower(tostring(difficulty or ""))
-    for name, info in pairs(RAID_DIFFICULTY_INFO) do
+    for name, info in pairs(raidState.DifficultyInfo) do
         if string.lower(name) == wanted then
             return info
         end
@@ -5977,8 +5977,10 @@ local function getRaidDifficultyInfo(difficulty)
     return nil
 end
 
-local function updateRaidInfoDisplay(difficulties)
-    if not raidInfoParagraph or not raidInfoParagraph.Set then return end
+raidState.UpdateInfoDisplay = function(difficulties)
+    if not raidState.InfoParagraph or not raidState.InfoParagraph.Set then
+        return
+    end
 
     local selected = getSelectedRaidDifficulties()
 
@@ -5993,23 +5995,23 @@ local function updateRaidInfoDisplay(difficulties)
             )
         end
     end
-    table.insert(lines, "Timer: " .. raidTimerText)
+    table.insert(lines, "Timer: " .. raidState.TimerText)
 
     pcall(function()
-        raidInfoParagraph:Set({
+        raidState.InfoParagraph:Set({
             Title = "Boss Raid",
             Content = table.concat(lines, "\n"),
         })
     end)
 end
 
-local function showRaidRequirement(difficulties)
+raidState.ShowRequirement = function(difficulties)
     local selected = getSelectedRaidDifficulties()
     notify(
         "Boss Raid Difficulty",
         "Selected " .. table.concat(selected, ", ") .. "."
     )
-    updateRaidInfoDisplay(selected)
+    raidState.UpdateInfoDisplay(selected)
 end
 
 if BossRaidRE then
@@ -6027,7 +6029,7 @@ if BossRaidRE then
     pcall(function() BossRaidRE:FireServer("RequestState") end)
 end
 
-local function readRaidTimerText(timer)
+raidState.ReadTimerText = function(timer)
     if not timer then return nil end
 
     local function read(instance)
@@ -6094,7 +6096,7 @@ function isBossRaidOpen()
         -- Older BossRaidClient revisions do not always deliver the State
         -- event to scripts that start after the raid window opened. The live
         -- countdown is still a valid readiness signal in that case.
-        local timerText = string.lower(tostring(raidTimerText or ""))
+        local timerText = string.lower(tostring(raidState.TimerText or ""))
         if not raidState.AlreadyUsed
             and string.find(timerText, "end in", 1, true) then
             return true
@@ -6104,7 +6106,7 @@ function isBossRaidOpen()
 
     -- Fallback for older game revisions that do not expose BossRaidRE.
     return string.find(
-        string.lower(raidTimerText or ""),
+        string.lower(raidState.TimerText or ""),
         "end in",
         1,
         true
@@ -6116,13 +6118,13 @@ task.spawn(function()
     while true do
         task.wait(0.5)
         local timer = findBossRaidTimer()
-        local text = readRaidTimerText(timer)
+        local text = raidState.ReadTimerText(timer)
         if text and text ~= "" then
-            raidTimerText = text
+            raidState.TimerText = text
         elseif timer then
-            raidTimerText = "Timer found, waiting for countdown..."
+            raidState.TimerText = "Timer found, waiting for countdown..."
         else
-            raidTimerText = "Boss Raid is currently unavailable"
+            raidState.TimerText = "Boss Raid is currently unavailable"
         end
 
         -- Refresh the authoritative state periodically. This covers the
@@ -6138,18 +6140,18 @@ task.spawn(function()
         -- scheduler and the visible Boss Raid description now read the same
         -- timer text on every pass.
         if isBossRaidOpen() then
-            raidClosedSince = nil
+            raidState.ClosedSince = nil
         else
-            raidClosedSince = raidClosedSince or now
+            raidState.ClosedSince = raidState.ClosedSince or now
             -- Require a stable closed state before re-arming. This avoids a brief
             -- timer/UI replication gap reopening the same hourly attempt.
-            if now - raidClosedSince >= 3 then
-                raidAttemptConsumed = false
+            if now - raidState.ClosedSince >= 3 then
+                raidState.AttemptConsumed = false
                 clearCompletedRaidDifficulties()
             end
         end
 
-        updateRaidInfoDisplay(Config.RaidDifficulties)
+        raidState.UpdateInfoDisplay(Config.RaidDifficulties)
     end
 end)
 
@@ -6162,7 +6164,7 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
     if mode == "BossRaid" and not isBossRaidOpen() then
         return false
     end
-    if mode == "BossRaid" and raidAttemptConsumed then
+    if mode == "BossRaid" and raidState.AttemptConsumed then
         return false
     end
 
@@ -6220,7 +6222,7 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
         -- the battle.  BossRaidClient can reject this click when the tower
         -- attribute has not replicated clear yet; that failure must remain
         -- retryable after a manual or delayed tower exit.
-        raidAttemptConsumed = true
+        raidState.AttemptConsumed = true
         local raidConfirmed = false
         for _ = 1, 20 do
             if player:GetAttribute("BossRaidInBattle") == true then
@@ -6231,9 +6233,9 @@ startCombatBattle = function(mode, equipBest, hideBattle, difficulty)
         end
         if raidConfirmed then
             raidState.RetryAt = 0
-            completedRaidDifficulties[raidDifficulty] = true
+            raidState.CompletedDifficulties[raidDifficulty] = true
         else
-            raidAttemptConsumed = false
+            raidState.AttemptConsumed = false
             raidState.RetryAt = os.clock() + 3
             return false
         end
@@ -6262,7 +6264,7 @@ task.spawn(function()
         local raidReady = Config.AutoRaid
             and isBossRaidOpen()
             and not raidState.AlreadyUsed
-            and not raidAttemptConsumed
+            and not raidState.AttemptConsumed
             and os.clock() >= raidState.RetryAt
             and getNextRaidDifficulty() ~= nil
         local towerEnabled = Config.AutoInfinityTower
@@ -7990,26 +7992,28 @@ combatTab:CreateToggle({
 
 combatTab:CreateSection("Boss Raid")
 
-raidInfoParagraph = combatTab:CreateParagraph({
+raidState.InfoParagraph = combatTab:CreateParagraph({
     Title   = "Boss Raid",
     Content = "Loading Boss Raid information...",
 })
-updateRaidInfoDisplay(Config.RaidDifficulties)
+raidState.UpdateInfoDisplay(Config.RaidDifficulties)
 
 Controls.RaidDifficulties = combatTab:CreateDropdown({
     Name          = "Select Difficulty",
-    Options       = raidDifficultyOptions,
-    CurrentOption = Config.RaidDifficulties[1] or raidDifficultyOptions[1] or "Normal",
+    Options       = raidState.DifficultyOptions,
+    CurrentOption = Config.RaidDifficulties[1]
+        or raidState.DifficultyOptions[1]
+        or "Normal",
     MultipleOptions = false,
     Flag          = "RaidDifficulties",
     Callback      = function(v)
         local selected = normalizeRaidDifficulties(v)
         if #selected == 0 then
-            selected = { raidDifficultyOptions[1] }
+            selected = { raidState.DifficultyOptions[1] }
         end
         Config.RaidDifficulties = selected
         clearCompletedRaidDifficulties()
-        showRaidRequirement(selected)
+        raidState.ShowRequirement(selected)
     end,
 })
 
