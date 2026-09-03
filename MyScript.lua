@@ -7023,6 +7023,42 @@ for _, cardName in ipairs(cardCraftState.IndexCards) do
     table.insert(filteredSellCardOptions, cardName)
 end
 
+local function refreshFilteredSellCardOptions(query)
+    local queryKey = filterCompareKey(query)
+    if queryKey == "" then queryKey = nil end
+
+    local selected = normalizeLoadedSelection(Config.FilteredSellCard)
+    local selectedKeys = {}
+    for _, cardName in ipairs(selected) do
+        local cardKey = filterCompareKey(cardName)
+        if cardKey then selectedKeys[cardKey] = true end
+    end
+
+    local options = { "All" }
+    local added = { all = true }
+    for _, cardName in ipairs(cardCraftState.IndexCards) do
+        local cardKey = filterCompareKey(cardName)
+        local matchesSearch = (
+            not queryKey
+            or (cardKey and string.find(cardKey, queryKey, 1, true))
+            or selectedKeys[cardKey]
+        )
+        if cardKey and matchesSearch and not added[cardKey] then
+            added[cardKey] = true
+            table.insert(options, cardName)
+        end
+    end
+
+    filteredSellCardOptions = options
+    local dropdown = Controls.FilteredSellCard
+    if dropdown and dropdown.Refresh then
+        pcall(function()
+            dropdown:Refresh(options)
+            if dropdown.Set then dropdown:Set(selected) end
+        end)
+    end
+end
+
 local filteredSellMutationOptions = { "All" }
 for _, mutationName in ipairs(MUTATIONS) do
     table.insert(filteredSellMutationOptions, mutationName)
@@ -7054,12 +7090,21 @@ Controls.FilteredSellMode = cardsTab:CreateDropdown({
     end,
 })
 
+Controls.FilteredSellCardSearch = cardsTab:CreateInput({
+    Name                  = "Search Cards",
+    CurrentValue          = "",
+    PlaceholderText       = "Type a card name to filter the dropdown",
+    RemoveTextAfterFocusLost = false,
+    Callback              = function(text)
+        refreshFilteredSellCardOptions(text)
+    end,
+})
+
 Controls.FilteredSellCard = cardsTab:CreateDropdown({
     Name            = "Card",
     Options         = filteredSellCardOptions,
     CurrentOption   = normalizeLoadedSelection(Config.FilteredSellCard),
     MultipleOptions = true,
-    Searchable      = true,
     Flag            = "FilteredSellCard",
     Callback        = function(v)
         Config.FilteredSellCard = normalizeLoadedSelection(v)
