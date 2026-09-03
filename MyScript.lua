@@ -411,6 +411,14 @@ if Modules and Modules:WaitForChild("CardCraftConfig", 15) then
         cardCraftState.Module = require(Modules.CardCraftConfig)
     end)
 end
+if Modules then
+    local cardsConfigModule = Modules:WaitForChild("CardsConfig", 15)
+    if cardsConfigModule then
+        pcall(function()
+            cardCraftState.IndexConfig = require(cardsConfigModule)
+        end)
+    end
+end
 
 -- ── Data lists ───────────────────────────────────────────────
 local RARITIES = {
@@ -431,6 +439,49 @@ local MUTATIONS = {
     "Rainbow", "Sakura", "Candy", "Blessed",
     "Radioactive", "Glitch", "Starfallen", "Admin", "Unknow",
 }
+
+-- The IndexClient builds its cards and mutation buttons from CardsConfig.
+-- Use that same module here so new cards/mutations appear automatically
+-- instead of requiring another hard-coded list update.
+local INDEX_CARDS = {}
+if type(cardCraftState.IndexConfig) == "table" then
+    if type(cardCraftState.IndexConfig.GetAllCardsSorted) == "function" then
+        local ok, cards = pcall(cardCraftState.IndexConfig.GetAllCardsSorted)
+        if ok and type(cards) == "table" then
+            local seen = {}
+            for _, entry in ipairs(cards) do
+                if type(entry) == "table" then
+                    local cardName = entry.Name or entry.CardName
+                    if cardName ~= nil then
+                        cardName = tostring(cardName)
+                        local key = string.lower(cardName)
+                        if cardName ~= "" and not seen[key] then
+                            seen[key] = true
+                            table.insert(INDEX_CARDS, cardName)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if type(cardCraftState.IndexConfig.MutationOrder) == "table"
+        and #cardCraftState.IndexConfig.MutationOrder > 0 then
+        local indexMutations = {}
+        local seen = {}
+        for _, mutation in ipairs(cardCraftState.IndexConfig.MutationOrder) do
+            mutation = tostring(mutation)
+            local key = string.lower(mutation)
+            if mutation ~= "" and not seen[key] then
+                seen[key] = true
+                table.insert(indexMutations, mutation)
+            end
+        end
+        if #indexMutations > 0 then
+            MUTATIONS = indexMutations
+        end
+    end
+end
 
 local PACKS = {
     "Ice Pack", "Sand Pack", "Inferno Pack", "Lightning Pack",
@@ -665,10 +716,9 @@ local Config = {
     AutoTimePotion    = false,
     AutoBuyBoost      = false,
 
-    -- Filtered Sell
+    -- Auto Sell Cards
     FilteredSellMode  = "Whitelist",
-    FilteredSellPack  = "All",
-    FilteredSellRarity = "All",
+    FilteredSellCard  = "All",
     FilteredSellMutation = "All",
     FilteredSellRanking = "All",
     FilteredSellTrait = "All",
@@ -3969,21 +4019,44 @@ local getSortedCardsInBackpack
 
 local filteredSellState = {}
 
-filteredSellState.getCardPack = function(item)
-    local pack = readBoxValue(item, {
-        "Pack", "PackName", "CardPack", "CardPackName", "pack",
-    })
-    if pack ~= nil and tostring(pack) ~= "" then
-        return pack
-    end
+local function getIndexCardName(value)
+    if value == nil then return nil end
 
-    local itemName = string.lower(tostring(item and item.Name or ""))
-    for _, packName in ipairs(PACKS) do
-        if string.find(itemName, string.lower(packName), 1, true) then
-            return packName
+    local key = filterCompareKey(value)
+    if not key then return nil end
+
+    local partialMatch
+    local partialLength = 0
+    for _, cardName in ipairs(INDEX_CARDS) do
+        local cardKey = filterCompareKey(cardName)
+        if cardKey then
+            if cardKey == key then
+                return cardName
+            end
+            -- Prefer the longest match so a short card name cannot win
+            -- before a more specific card name in the Index.
+            if #cardKey > partialLength
+                and (string.find(key, cardKey, 1, true)
+                    or string.find(cardKey, key, 1, true)) then
+                partialMatch = cardName
+                partialLength = #cardKey
+            end
         end
     end
-    return nil
+    return partialMatch
+end
+
+filteredSellState.getCardName = function(item)
+    local cardValue = readBoxValue(item, {
+        "CardName", "Card", "CardId", "Name",
+        "cardname", "card", "cardid",
+    })
+    local cardName = getIndexCardName(cardValue)
+        or getIndexCardName(item and item.Name)
+
+    -- Keep a raw fallback for game versions that expose a card tool before
+    -- the matching entry is replicated in CardsConfig.
+    return cardName or (item and item.Name)
 end
 
 filteredSellState.getCardRanking = function(item)
@@ -4014,12 +4087,8 @@ filteredSellState.cardMatches = function(item)
     local cardInfo = getCardInfo(item)
     local matches = (
         filteredSellState.fieldMatches(
-            filteredSellState.getCardPack(item),
-            Config.FilteredSellPack
-        )
-        and filteredSellState.fieldMatches(
-            cardInfo.rarity,
-            Config.FilteredSellRarity
+            filteredSellState.getCardName(item),
+            Config.FilteredSellCard
         )
         and filteredSellState.fieldMatches(
             cardInfo.mutation,
@@ -6281,8 +6350,7 @@ local function buildSerializableConfig()
         AutoTimePotion    = Config.AutoTimePotion,
         AutoBuyBoost      = Config.AutoBuyBoost,
         FilteredSellMode  = Config.FilteredSellMode,
-        FilteredSellPack  = Config.FilteredSellPack,
-        FilteredSellRarity = Config.FilteredSellRarity,
+        FilteredSellCard  = Config.FilteredSellCard,
         FilteredSellMutation = Config.FilteredSellMutation,
         FilteredSellRanking = Config.FilteredSellRanking,
         FilteredSellTrait = Config.FilteredSellTrait,
@@ -6428,7 +6496,7 @@ local function loadConfig(name, isAutoload)
         "RankUseGems", "RankUseCash", "AutoRankRoll",
         "AutoClaimPlaytime", "AutoClaimDaily",
         "AutoPlacePack", "AutoOpenPack", "AutoTimePotion", "AutoBuyBoost",
-        "FilteredSellMode", "FilteredSellPack", "FilteredSellRarity",
+        "FilteredSellMode", "FilteredSellCard",
         "FilteredSellMutation", "FilteredSellRanking", "FilteredSellTrait",
         "AutoFilteredSell",
         "AutoInfinityEquip", "AutoInfinityTower", "AutoInfinityHide",
@@ -6437,6 +6505,14 @@ local function loadConfig(name, isAutoload)
         "SelectedBoosts", "AntiAfk", "AutoContinueSpawn",
         "UseCashReserve", "CashReserve",
     }
+
+    -- Older settings used Pack + Rarity for this feature. Do not silently
+    -- turn an old filtered-sale profile into an unrestricted card sale.
+    if data.FilteredSellCard == nil
+        and (data.FilteredSellPack ~= nil or data.FilteredSellRarity ~= nil) then
+        data.FilteredSellCard = "All"
+        data.AutoFilteredSell = false
+    end
 
     for _, key in ipairs(knownKeys) do
         if data[key] ~= nil then
@@ -6914,7 +6990,7 @@ cardsTab:CreateButton({
     end,
 })
 
-cardsTab:CreateSection("Filtered Sell")
+cardsTab:CreateSection("Auto Sell Cards")
 
 local function resolveFilteredSellValue(value, fallback)
     if type(value) == "table" then
@@ -6927,14 +7003,9 @@ local function resolveFilteredSellValue(value, fallback)
     return value
 end
 
-local filteredSellPackOptions = { "All" }
-for _, packName in ipairs(PACKS) do
-    table.insert(filteredSellPackOptions, packName)
-end
-
-local filteredSellRarityOptions = { "All" }
-for _, rarityName in ipairs(RARITIES) do
-    table.insert(filteredSellRarityOptions, rarityName)
+local filteredSellCardOptions = { "All" }
+for _, cardName in ipairs(INDEX_CARDS) do
+    table.insert(filteredSellCardOptions, cardName)
 end
 
 local filteredSellMutationOptions = { "All" }
@@ -6968,25 +7039,14 @@ Controls.FilteredSellMode = cardsTab:CreateDropdown({
     end,
 })
 
-Controls.FilteredSellPack = cardsTab:CreateDropdown({
-    Name            = "Pack",
-    Options         = filteredSellPackOptions,
-    CurrentOption   = resolveFilteredSellValue(Config.FilteredSellPack, "All"),
+Controls.FilteredSellCard = cardsTab:CreateDropdown({
+    Name            = "Card",
+    Options         = filteredSellCardOptions,
+    CurrentOption   = resolveFilteredSellValue(Config.FilteredSellCard, "All"),
     MultipleOptions = false,
-    Flag            = "FilteredSellPack",
+    Flag            = "FilteredSellCard",
     Callback        = function(v)
-        Config.FilteredSellPack = resolveFilteredSellValue(v, "All")
-    end,
-})
-
-Controls.FilteredSellRarity = cardsTab:CreateDropdown({
-    Name            = "Rarity",
-    Options         = filteredSellRarityOptions,
-    CurrentOption   = resolveFilteredSellValue(Config.FilteredSellRarity, "All"),
-    MultipleOptions = false,
-    Flag            = "FilteredSellRarity",
-    Callback        = function(v)
-        Config.FilteredSellRarity = resolveFilteredSellValue(v, "All")
+        Config.FilteredSellCard = resolveFilteredSellValue(v, "All")
     end,
 })
 
@@ -7039,7 +7099,7 @@ end
 local updatingFilteredSellControl = false
 
 Controls.AutoFilteredSell = cardsTab:CreateToggle({
-    Name         = "Auto Sell",
+    Name         = "Auto Sell Cards",
     CurrentValue = Config.AutoFilteredSell,
     Flag         = "AutoFilteredSell",
     Callback     = function(v)
@@ -7058,7 +7118,7 @@ Controls.AutoFilteredSell = cardsTab:CreateToggle({
         end
 
         confirmSellAction(
-            "Filtered Sell",
+            "Auto Sell Cards",
             nil,
             function()
                 Config.AutoFilteredSell = true
@@ -7068,7 +7128,7 @@ Controls.AutoFilteredSell = cardsTab:CreateToggle({
                     pcall(function() Controls.AutoFilteredSell:Set(true) end)
                     updatingFilteredSellControl = false
                 end
-                notify("Filtered Sell", "Auto Sell enabled.")
+                notify("Auto Sell Cards", "Auto Sell Cards enabled.")
             end,
             filteredSellConfirmationMessage()
         )
