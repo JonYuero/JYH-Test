@@ -663,6 +663,23 @@ end
 
 local MAX_CARD_LEVEL = 50
 local CARD_REMOVAL_DELAY = 0.5
+local AUTO_REMOVE_CARD_SLOT_OPTIONS = {
+    "Slot 1-5",
+    "Slot 6-10",
+    "Slot 11-15",
+    "Slot 16-20",
+    "Slot 21-25",
+    "Slot 26-30",
+}
+
+local function normalizeAutoRemoveCardSlot(value)
+    if type(value) == "table" then value = value[1] end
+    value = tostring(value or "")
+    for _, option in ipairs(AUTO_REMOVE_CARD_SLOT_OPTIONS) do
+        if value == option then return option end
+    end
+    return AUTO_REMOVE_CARD_SLOT_OPTIONS[1]
+end
 
 local RARITY_RANK = {}
 for index, rarity in ipairs(RARITIES) do
@@ -715,6 +732,8 @@ local Config = {
     AutoOpenPack      = false,
     AutoTimePotion    = false,
     AutoBuyBoost      = false,
+    AutoRemoveCard    = false,
+    AutoRemoveCardSlot = "Slot 1-5",
 
     -- Auto Sell Cards
     FilteredSellMode  = "Whitelist",
@@ -758,6 +777,7 @@ local clickGuiButton
 local startCombatBattle
 local removeAllCards
 local removeFirstFourCardSlots
+local removeCardSlotsInRange
 local doEquipBestCards
 local closeBossRaidReward
 local exitInfinityTowerBattle
@@ -5033,7 +5053,7 @@ doEquipBestCards = function(slotLimit)
     return placedCount
 end
 
-removeAllCards = function(limit)
+removeAllCards = function(limit, minimum)
     local char     = player.Character
     local root     = char and char:FindFirstChild("HumanoidRootPart")
     local humanoid = char and char:FindFirstChildOfClass("Humanoid")
@@ -5046,6 +5066,7 @@ removeAllCards = function(limit)
     for _, slot in ipairs(slots) do
         local slotIndex = getCardSlotIndex(slot)
         if not slotIndex then continue end
+        if minimum and slotIndex < minimum then continue end
         if limit and slotIndex > limit then continue end
         if slotIsOnCooldown(slot) then continue end
         local removeBtn = findSlotButton(slot, "Remove")
@@ -5068,6 +5089,20 @@ removeAllCards = function(limit)
 
     restoreCharacterPosition(savedCFrame)
     return removed
+end
+
+removeCardSlotsInRange = function(rangeLabel)
+    local normalized = normalizeAutoRemoveCardSlot(rangeLabel)
+    local firstSlot, lastSlot = string.match(
+        normalized,
+        "^Slot%s+(%d+)%-(%d+)$"
+    )
+    firstSlot = tonumber(firstSlot) or 1
+    lastSlot = tonumber(lastSlot) or 5
+
+    -- Reuse the same interaction, cooldown, teleport, and CardSlotRE
+    -- fallback logic as the existing Remove All Cards action.
+    return removeAllCards(lastSlot, firstSlot)
 end
 
 removeFirstFourCardSlots = function()
@@ -6369,6 +6404,8 @@ local function buildSerializableConfig()
         AutoOpenPack      = Config.AutoOpenPack,
         AutoTimePotion    = Config.AutoTimePotion,
         AutoBuyBoost      = Config.AutoBuyBoost,
+        AutoRemoveCard    = Config.AutoRemoveCard,
+        AutoRemoveCardSlot = Config.AutoRemoveCardSlot,
         FilteredSellMode  = Config.FilteredSellMode,
         FilteredSellCard  = Config.FilteredSellCard,
         FilteredSellMutation = Config.FilteredSellMutation,
@@ -6533,6 +6570,7 @@ local function loadConfig(name, isAutoload)
         "RankUseGems", "RankUseCash", "AutoRankRoll",
         "AutoClaimPlaytime", "AutoClaimDaily",
         "AutoPlacePack", "AutoOpenPack", "AutoTimePotion", "AutoBuyBoost",
+        "AutoRemoveCard", "AutoRemoveCardSlot",
         "FilteredSellMode", "FilteredSellCard",
         "FilteredSellMutation", "FilteredSellRanking", "FilteredSellTrait",
         "AutoFilteredSell",
@@ -6562,6 +6600,9 @@ local function loadConfig(name, isAutoload)
             end
             if key == "CardCraftMutations" then
                 value = cardCraftState.normalizeMutations(value)
+            end
+            if key == "AutoRemoveCardSlot" then
+                value = normalizeAutoRemoveCardSlot(value)
             end
             if key == "FilteredSellCard"
                 or key == "FilteredSellMutation"
@@ -6827,6 +6868,23 @@ cardsTab:CreateButton({
     end,
 })
 
+cardsTab:CreateSlider({
+    Name         = "Remove / Place / Open Delay (s)",
+    Range        = { 0.5, 5 },
+    Increment    = 0.1,
+    Suffix       = "s",
+    CurrentValue = Config.CardActionDelay,
+    Flag         = "CardActionDelay",
+    Callback     = function(v) Config.CardActionDelay = math.max(0.5, v) end,
+})
+
+cardsTab:CreateSection("Auto Remove Card")
+
+cardsTab:CreateParagraph({
+    Title   = "Auto Remove Card",
+    Content = "Removes cards placed in the selected five-slot range.",
+})
+
 cardsTab:CreateButton({
     Name     = "Remove All Cards",
     Callback = function()
@@ -6837,15 +6895,43 @@ cardsTab:CreateButton({
     end,
 })
 
-cardsTab:CreateSlider({
-    Name         = "Remove / Place / Open Delay (s)",
-    Range        = { 0.5, 5 },
-    Increment    = 0.1,
-    Suffix       = "s",
-    CurrentValue = Config.CardActionDelay,
-    Flag         = "CardActionDelay",
-    Callback     = function(v) Config.CardActionDelay = math.max(0.5, v) end,
+Controls.AutoRemoveCardSlot = cardsTab:CreateDropdown({
+    Name            = "Slot Range",
+    Options         = AUTO_REMOVE_CARD_SLOT_OPTIONS,
+    CurrentOption   = normalizeAutoRemoveCardSlot(Config.AutoRemoveCardSlot),
+    MultipleOptions = false,
+    Flag            = "AutoRemoveCardSlot",
+    Callback        = function(v)
+        Config.AutoRemoveCardSlot = normalizeAutoRemoveCardSlot(v)
+    end,
 })
+
+Controls.AutoRemoveCard = cardsTab:CreateToggle({
+    Name         = "Auto Remove Card",
+    CurrentValue = Config.AutoRemoveCard,
+    Flag         = "AutoRemoveCard",
+    Callback     = function(v) Config.AutoRemoveCard = v end,
+})
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if not Config.AutoRemoveCard then continue end
+
+        local ok, removed = pcall(function()
+            return removeCardSlotsInRange(Config.AutoRemoveCardSlot)
+        end)
+        if ok and removed > 0 then
+            notify(
+                "Auto Remove Card",
+                "Removed " .. tostring(removed) .. " card(s) from "
+                    .. normalizeAutoRemoveCardSlot(Config.AutoRemoveCardSlot)
+            )
+        elseif not ok then
+            warn("[ACF] Auto Remove Card failed: " .. tostring(removed))
+        end
+    end
+end)
 
 cardsTab:CreateSection("Upgrade")
 
