@@ -329,6 +329,8 @@ local ItemsREForAutomation = Remotes:WaitForChild("ItemsRE", 15)
 local PlayTimeRewardRE = Remotes:FindFirstChild("PlayTimeRewardRE")
 local DailyRewardRE    = Remotes:FindFirstChild("DailyRewardRE")
 local UpgradesRE       = Remotes:FindFirstChild("UpgradesRE")
+local ArtifactRE       = Remotes:WaitForChild("ArtifactRE", 15)
+local BossCardRE       = Remotes:WaitForChild("BossCardRE", 15)
 -- BossRaidClient waits for this remote before it can receive the authoritative
 -- open/closed state.  Do the same here instead of taking a one-time snapshot:
 -- FindFirstChild can run before the remote has replicated and leave the
@@ -715,6 +717,13 @@ local Config = {
     AutoOpenPack      = false,
     AutoTimePotion    = false,
     AutoBuyBoost      = false,
+    AutoUpgradeArtifact = false,
+    SelectedArtifacts = { "All" },
+    SelectedArtifactLevels = { "All" },
+    AutoSellArtifacts = false,
+    SelectedBossCard  = "WhiteTitan",
+    AutoEquipBossCard = false,
+    AutoUpgradeBossCard = false,
     AutoRemoveCard    = false,
     AutoRemoveCardSlot = "Slot 1-5",
 
@@ -749,6 +758,20 @@ local Config = {
 
 -- ── Controls table (Rayfield control references for config loading) ──
 local Controls = {}
+
+-- Artifact and boss-card automation state. Keep this in one table because
+-- this script is already close to Luau's top-level local-register limit.
+local artifactState = {
+    ArtifactDropdown = nil,
+    ArtifactLevelDropdown = nil,
+    BossCardDropdown = nil,
+    ArtifactOptions = { "All" },
+    BossCardOptions = { "White Titan", "Moon Demon", "Chimera King" },
+    LastSoldAt = {},
+    LastBossEquipAt = 0,
+    LastArtifactRefreshAt = 0,
+    InventoryCounts = {},
+}
 
 -- Playtime state is pushed by the game's client remote.
 local playtimeReadyRewards = {}
@@ -1539,6 +1562,424 @@ local function getBoxInfo(box)
         mutation = readBoxValue(box, { "Mutation",  "MutationName", "mutation" }),
         pack     = packValue,
     }
+end
+
+-- ════════════════════════════════════════════════════════════════════════
+--  ARTIFACTS & BOSS CARDS
+--  Artifact inventory entries are rendered by ArtifactClient as
+--  ArtifactSelectFrame_<uid>. Placed artifacts and the boss card live on the
+--  player's plot and expose their upgrade data as attributes.
+-- ════════════════════════════════════════════════════════════════════════
+do
+    local ARTIFACT_LEVEL_OPTIONS = {
+        "1", "2", "3", "4", "5",
+        "6", "7", "8", "9", "10",
+    }
+
+    local BOSS_CARDS = {
+        {
+            Id = "WhiteTitan",
+            Label = "White Titan",
+            Shards = { "WhiteTitanShards", "WhiteTitanShard" },
+        },
+        {
+            Id = "MoonDemon",
+            Label = "Moon Demon",
+            Shards = { "MoonDemonShards", "MoonDemonShard" },
+        },
+        {
+            Id = "ChimeraKing",
+            Label = "Chimera King",
+            Shards = { "ChimeraKingShards", "ChimeraKingShard" },
+        },
+    }
+
+    local function lowerSet(names)
+        local result = {}
+        for _, name in ipairs(names) do
+            result[string.lower(tostring(name))] = true
+        end
+        return result
+    end
+
+    local function readFreshValue(root, names)
+        if not root then return nil end
+        local wanted = lowerSet(names)
+
+        for _, name in ipairs(names) do
+            local value = root:GetAttribute(name)
+            if value ~= nil then return value end
+        end
+
+        local function valueFrom(instance)
+            if instance:IsA("ValueBase") then
+                return instance.Value
+            end
+            if instance:IsA("TextLabel") or instance:IsA("TextButton") then
+                return instance.Text
+            end
+            return nil
+        end
+
+        if wanted[string.lower(root.Name)] then
+            local value = valueFrom(root)
+            if value ~= nil then return value end
+        end
+
+        for _, child in ipairs(root:GetDescendants()) do
+            if wanted[string.lower(child.Name)] then
+                local value = valueFrom(child)
+                if value ~= nil then return value end
+            end
+        end
+        return nil
+    end
+
+    local function readNumber(root, names)
+        local value = readFreshValue(root, names)
+        if type(value) == "number" then return value end
+        if value ~= nil then
+            return tonumber(value) or parseCompactCash(tostring(value))
+        end
+        return nil
+    end
+
+    local function readBool(root, names)
+        local value = readFreshValue(root, names)
+        if type(value) == "boolean" then return value end
+        if value ~= nil then
+            return string.lower(tostring(value)) == "true"
+        end
+        return false
+    end
+
+    local function artifactUidFromFrame(frame)
+        local uid = readFreshValue(frame, {
+            "ArtifactUid", "ArtifactUID", "Uid", "UID",
+        })
+        if uid ~= nil and tostring(uid) ~= "" then
+            return tostring(uid)
+        end
+
+        local suffix = tostring(frame.Name):match(
+            "^[Aa]rtifact[Ss]elect[Ff]rame[_%-](.+)$"
+        )
+        if suffix and suffix ~= "" then return suffix end
+        return nil
+    end
+
+    local function getArtifactLevel(entry)
+        local value = readNumber(entry, {
+            "ArtifactLevel", "Level", "Lvl",
+        })
+        if value then return math.floor(value) end
+
+        for _, child in ipairs(entry:GetDescendants()) do
+            if child:IsA("TextLabel") or child:IsA("TextButton") then
+                local level = tostring(child.Text or ""):match("(%d+)")
+                if level and (
+                    string.find(string.lower(child.Name), "lvl", 1, true)
+                    or string.find(string.lower(child.Name), "level", 1, true)
+                ) then
+                    return tonumber(level)
+                end
+            end
+        end
+        return 0
+    end
+
+    local function getArtifactName(entry)
+        local value = readFreshValue(entry, {
+            "ArtifactId", "ArtifactID", "ArtifactName", "Name",
+        })
+        if value ~= nil and tostring(value) ~= "" then
+            return tostring(value)
+        end
+        return tostring(entry.Name)
+    end
+
+    local function getArtifactEntries()
+        local result = {}
+        local seen = {}
+
+        for _, descendant in ipairs(playerGui:GetDescendants()) do
+            local name = string.lower(tostring(descendant.Name))
+            if string.find(name, "artifactselectframe", 1, true) then
+                local uid = artifactUidFromFrame(descendant)
+                if uid and not seen[uid] then
+                    seen[uid] = true
+                    table.insert(result, {
+                        Uid = uid,
+                        Name = getArtifactName(descendant),
+                        Level = getArtifactLevel(descendant),
+                        Frame = descendant,
+                    })
+                end
+            end
+        end
+
+        table.sort(result, function(a, b)
+            local an = string.lower(tostring(a.Name))
+            local bn = string.lower(tostring(b.Name))
+            if an ~= bn then return an < bn end
+            if a.Level ~= b.Level then return a.Level < b.Level end
+            return a.Uid < b.Uid
+        end)
+        return result
+    end
+
+    local function getPlacedArtifactUids()
+        local result = {}
+        local plot = findPlot(Config.PlotNumber)
+        if not plot then return result end
+
+        for slotIndex = 1, 3 do
+            local slot = plot:FindFirstChild("ArtifactSlot" .. tostring(slotIndex), true)
+            local uid = slot and readFreshValue(slot, {
+                "ArtifactUid", "ArtifactUID", "Uid", "UID",
+            })
+            if uid ~= nil and tostring(uid) ~= "" then
+                result[tostring(uid)] = true
+            end
+        end
+        return result
+    end
+
+    local function getResourceCount(names)
+        for _, name in ipairs(names) do
+            local cached = artifactState.InventoryCounts[name]
+            if cached ~= nil then
+                return tonumber(cached) or parseCompactCash(tostring(cached)) or 0
+            end
+        end
+
+        local function readFromContainer(container)
+            if not container then return nil end
+            local value = readNumber(container, names)
+            if value ~= nil then return value end
+            return nil
+        end
+
+        for _, name in ipairs(names) do
+            local value = readFromContainer(player:FindFirstChild(name))
+            if value ~= nil then return value end
+            value = tonumber(player:GetAttribute(name))
+            if value ~= nil then return value end
+        end
+
+        local leaderstats = player:FindFirstChild("leaderstats")
+        for _, name in ipairs(names) do
+            local value = readFromContainer(
+                leaderstats and leaderstats:FindFirstChild(name)
+            )
+            if value ~= nil then return value end
+        end
+
+        -- The Items UI uses ObjectFrame_<resource> with a nested Quantity
+        -- label. This is the fallback used when the balance is not replicated
+        -- as a ValueBase or player attribute.
+        local wanted = {}
+        for _, name in ipairs(names) do
+            local key = string.lower(tostring(name))
+            wanted[key] = true
+            wanted["objectframe_" .. key] = true
+        end
+        for _, descendant in ipairs(playerGui:GetDescendants()) do
+            if wanted[string.lower(tostring(descendant.Name))] then
+                for _, child in ipairs(descendant:GetDescendants()) do
+                    if child:IsA("TextLabel") or child:IsA("TextButton") then
+                        local value = parseCompactCash(tostring(child.Text or ""))
+                        if value ~= nil then return value end
+                    end
+                end
+            end
+        end
+        return 0
+    end
+
+    local function selectedMatches(value, selection)
+        return filterValueMatches(value, normalizeFilterSelection(selection))
+    end
+
+    local function selectedBossId(value)
+        if type(value) == "table" then value = value[1] end
+        value = tostring(value or "")
+        for _, card in ipairs(BOSS_CARDS) do
+            if value == card.Id or value == card.Label then
+                return card.Id
+            end
+        end
+        return BOSS_CARDS[1].Id
+    end
+
+    local function bossCardById(id)
+        for _, card in ipairs(BOSS_CARDS) do
+            if card.Id == id then return card end
+        end
+        return BOSS_CARDS[1]
+    end
+
+    local function getBossSlot()
+        local plot = findPlot(Config.PlotNumber)
+        return plot and plot:FindFirstChild("BossSlot", true)
+    end
+
+    local function fireArtifact(action, data)
+        if not ArtifactRE then return false end
+        local ok = pcall(function()
+            if data == nil then
+                ArtifactRE:FireServer(action)
+            else
+                ArtifactRE:FireServer(action, data)
+            end
+        end)
+        return ok
+    end
+
+    local function fireBossCard(action, data)
+        if not BossCardRE then return false end
+        local ok = pcall(function()
+            if data == nil then
+                BossCardRE:FireServer(action)
+            else
+                BossCardRE:FireServer(action, data)
+            end
+        end)
+        return ok
+    end
+
+    artifactState.getArtifactEntries = getArtifactEntries
+    artifactState.getArtifactLevelOptions = function()
+        return ARTIFACT_LEVEL_OPTIONS
+    end
+    artifactState.getBossCards = function()
+        return BOSS_CARDS
+    end
+    artifactState.getBossCardId = selectedBossId
+
+    artifactState.refreshArtifactOptions = function()
+        local options = { "All" }
+        local seen = { all = true }
+        for _, entry in ipairs(getArtifactEntries()) do
+            local label = tostring(entry.Name)
+            local key = string.lower(label)
+            if label ~= "" and not seen[key] then
+                seen[key] = true
+                table.insert(options, label)
+            end
+        end
+
+        -- Keep a loaded selection visible until the inventory UI replicates.
+        for _, selected in ipairs(type(Config.SelectedArtifacts) == "table"
+            and Config.SelectedArtifacts or {}) do
+            local label = tostring(selected)
+            local key = string.lower(label)
+            if label ~= "" and label ~= "All" and not seen[key] then
+                seen[key] = true
+                table.insert(options, label)
+            end
+        end
+
+        table.sort(options, function(a, b)
+            if a == b then return false end
+            if a == "All" then return true end
+            if b == "All" then return false end
+            return string.lower(a) < string.lower(b)
+        end)
+        artifactState.ArtifactOptions = options
+
+        local dropdown = artifactState.ArtifactDropdown
+        if dropdown and dropdown.Refresh then
+            pcall(function()
+                dropdown:Refresh(options, Config.SelectedArtifacts)
+            end)
+        end
+    end
+
+    artifactState.sellMatchingArtifacts = function()
+        local placed = getPlacedArtifactUids()
+        local sold = 0
+        local now = os.clock()
+        for _, entry in ipairs(getArtifactEntries()) do
+            local matchesName = selectedMatches(
+                entry.Name,
+                Config.SelectedArtifacts
+            )
+            local matchesLevel = selectedMatches(
+                tostring(entry.Level),
+                Config.SelectedArtifactLevels
+            )
+            local recentlySold = (now - (artifactState.LastSoldAt[entry.Uid] or 0)) < 2
+            if matchesName and matchesLevel
+                and not placed[entry.Uid] and not recentlySold then
+                if fireArtifact("Sell", { Uid = entry.Uid }) then
+                    artifactState.LastSoldAt[entry.Uid] = now
+                    sold = sold + 1
+                    task.wait(0.25)
+                end
+            end
+        end
+        return sold
+    end
+
+    artifactState.upgradeArtifacts = function()
+        local plot = findPlot(Config.PlotNumber)
+        if not plot then return 0 end
+
+        local upgraded = 0
+        local raidShards = getResourceCount({ "RaidShards", "RaidShard" })
+        for slotIndex = 1, 3 do
+            local slot = plot:FindFirstChild("ArtifactSlot" .. tostring(slotIndex), true)
+            if slot and readBool(slot, { "IsActive", "Active" })
+                and not readBool(slot, { "IsMaxLevel", "MaxLevel" }) then
+                local cost = readNumber(slot, { "UpgradeCost", "Cost" })
+                if cost and cost > 0 and raidShards >= cost then
+                    if fireArtifact("Upgrade", { SlotIndex = slotIndex }) then
+                        upgraded = upgraded + 1
+                        raidShards = raidShards - cost
+                        task.wait(0.2)
+                    end
+                end
+            end
+        end
+        return upgraded
+    end
+
+    artifactState.equipBossCard = function()
+        local id = selectedBossId(Config.SelectedBossCard)
+        local slot = getBossSlot()
+        local current = slot and readFreshValue(slot, {
+            "BossCardId", "BossCardID", "CardId",
+        })
+        if tostring(current or "") == id then return false end
+
+        local now = os.clock()
+        if now - artifactState.LastBossEquipAt < 2 then return false end
+        artifactState.LastBossEquipAt = now
+        return fireBossCard("Place", {
+            SlotIndex = 1,
+            BossCardId = id,
+        })
+    end
+
+    artifactState.upgradeBossCard = function()
+        local id = selectedBossId(Config.SelectedBossCard)
+        local card = bossCardById(id)
+        local slot = getBossSlot()
+        if not slot then return false end
+
+        local current = readFreshValue(slot, {
+            "BossCardId", "BossCardID", "CardId",
+        })
+        if tostring(current or "") ~= id then return false end
+        if readBool(slot, { "IsMaxLevel", "MaxLevel" }) then return false end
+
+        local cost = readNumber(slot, { "UpgradeCost", "Cost" })
+        if not cost or cost <= 0 then return false end
+        local shards = getResourceCount(card.Shards)
+        if shards < cost then return false end
+        return fireBossCard("Upgrade")
+    end
 end
 
 local function getItemId(container)
@@ -3185,6 +3626,7 @@ do
         -- activeBoosts[family] = tier/expiry while that boost is running
         -- Keep this inventory mirror available to the pack automation below.
         local potionCounts = potionInventoryCounts
+        local itemCounts = artifactState.InventoryCounts
         -- activeBoosts is indexed by potion family (luck/cash/etc.), not by
         -- the raw stat key.  That lets CashPotion I/II/III share one timer.
         local activeBoosts = {}
@@ -3457,6 +3899,7 @@ do
                     potionCounts[data.ItemId] = data.Quantity
                         or data.QuantityValue or data.Amount
                         or data.Count or 0
+                    itemCounts[data.ItemId] = potionCounts[data.ItemId]
                 else
                     local items = data.Items or data.Inventory or data.ItemsData
                     if type(items) ~= "table" then
@@ -3465,11 +3908,13 @@ do
                     end
                     if action == "FullInventory" then
                         table.clear(potionCounts)
+                        table.clear(itemCounts)
                     end
                     for itemId, quantity in pairs(items) do
                         if itemId ~= "Items" and itemId ~= "Inventory"
                             and itemId ~= "ItemsData" then
                             potionCounts[itemId] = quantity
+                            itemCounts[itemId] = quantity
                         end
                     end
                 end
@@ -3479,6 +3924,7 @@ do
             elseif action == "ItemUpdate" and type(data) == "table" then
                 potionCounts[data.ItemId] = data.Quantity or data.QuantityValue
                 or data.Amount or data.Count or 0
+                itemCounts[data.ItemId] = potionCounts[data.ItemId]
 
             elseif action == "BoostUpdate" then
                 applyBoosts(data)
@@ -3633,6 +4079,37 @@ task.spawn(function()
                     task.wait(0.2)
                 end
             end
+        end
+    end
+end)
+
+-- ── Artifact and Boss Card automation ─────────────────────────
+-- Each action is gated by the live upgrade cost and the matching shard
+-- balance. The loops intentionally stop quietly when the relevant UI/data has
+-- not replicated yet; the next pass will try again.
+task.spawn(function()
+    while true do
+        task.wait(1)
+
+        if os.clock() - artifactState.LastArtifactRefreshAt >= 2 then
+            artifactState.LastArtifactRefreshAt = os.clock()
+            pcall(artifactState.refreshArtifactOptions)
+        end
+
+        if Config.AutoUpgradeArtifact then
+            pcall(artifactState.upgradeArtifacts)
+        end
+
+        if Config.AutoSellArtifacts then
+            pcall(artifactState.sellMatchingArtifacts)
+        end
+
+        if Config.AutoEquipBossCard then
+            pcall(artifactState.equipBossCard)
+        end
+
+        if Config.AutoUpgradeBossCard then
+            pcall(artifactState.upgradeBossCard)
         end
     end
 end)
@@ -6404,6 +6881,13 @@ local function buildSerializableConfig()
         AutoOpenPack      = Config.AutoOpenPack,
         AutoTimePotion    = Config.AutoTimePotion,
         AutoBuyBoost      = Config.AutoBuyBoost,
+        AutoUpgradeArtifact = Config.AutoUpgradeArtifact,
+        SelectedArtifacts = Config.SelectedArtifacts,
+        SelectedArtifactLevels = Config.SelectedArtifactLevels,
+        AutoSellArtifacts = Config.AutoSellArtifacts,
+        SelectedBossCard  = Config.SelectedBossCard,
+        AutoEquipBossCard = Config.AutoEquipBossCard,
+        AutoUpgradeBossCard = Config.AutoUpgradeBossCard,
         AutoRemoveCard    = Config.AutoRemoveCard,
         AutoRemoveCardSlot = Config.AutoRemoveCardSlot,
         FilteredSellMode  = Config.FilteredSellMode,
@@ -6570,6 +7054,9 @@ local function loadConfig(name, isAutoload)
         "RankUseGems", "RankUseCash", "AutoRankRoll",
         "AutoClaimPlaytime", "AutoClaimDaily",
         "AutoPlacePack", "AutoOpenPack", "AutoTimePotion", "AutoBuyBoost",
+        "AutoUpgradeArtifact", "SelectedArtifacts", "SelectedArtifactLevels",
+        "AutoSellArtifacts", "SelectedBossCard", "AutoEquipBossCard",
+        "AutoUpgradeBossCard",
         "AutoRemoveCard", "AutoRemoveCardSlot",
         "FilteredSellMode", "FilteredSellCard",
         "FilteredSellMutation", "FilteredSellRanking", "FilteredSellTrait",
@@ -6603,6 +7090,21 @@ local function loadConfig(name, isAutoload)
             end
             if key == "AutoRemoveCardSlot" then
                 value = normalizeAutoRemoveCardSlot(value)
+            end
+            if key == "SelectedArtifacts" then
+                value = collapseFullSelection(
+                    value,
+                    artifactState.ArtifactOptions
+                )
+            end
+            if key == "SelectedArtifactLevels" then
+                value = collapseFullSelection(
+                    value,
+                    artifactState.getArtifactLevelOptions()
+                )
+            end
+            if key == "SelectedBossCard" then
+                value = artifactState.getBossCardId(value)
             end
             if key == "FilteredSellCard"
                 or key == "FilteredSellMutation"
@@ -7761,6 +8263,110 @@ miscTab:CreateToggle({
     CurrentValue = Config.AutoBuyBoost,
     Flag         = "AutoBuyBoost",
     Callback     = function(v) Config.AutoBuyBoost = v end,
+})
+
+miscTab:CreateSection("Artifacts")
+
+miscTab:CreateParagraph({
+    Title   = "Artifact Automation",
+    Content = "Artifact upgrades use Raid Shards only when the live UpgradeCost is affordable. Selling ignores artifacts currently placed in ArtifactSlot1-3.",
+})
+
+Controls.AutoUpgradeArtifact = miscTab:CreateToggle({
+    Name         = "Auto Upgrade Artifact",
+    CurrentValue = Config.AutoUpgradeArtifact,
+    Flag         = "AutoUpgradeArtifact",
+    Callback     = function(v) Config.AutoUpgradeArtifact = v end,
+})
+
+artifactState.refreshArtifactOptions()
+
+Controls.SelectedArtifacts = miscTab:CreateDropdown({
+    Name            = "Select Artifacts",
+    Options         = artifactState.ArtifactOptions,
+    CurrentOption   = Config.SelectedArtifacts,
+    MultipleOptions = true,
+    Flag            = "SelectedArtifacts",
+    Callback        = function(v)
+        Config.SelectedArtifacts = collapseFullSelection(
+            v,
+            artifactState.ArtifactOptions
+        )
+        artifactState.refreshArtifactOptions()
+    end,
+})
+artifactState.ArtifactDropdown = Controls.SelectedArtifacts
+artifactState.refreshArtifactOptions()
+
+local artifactLevelOptions = { "All" }
+for _, level in ipairs(artifactState.getArtifactLevelOptions()) do
+    table.insert(artifactLevelOptions, level)
+end
+
+Controls.SelectedArtifactLevels = miscTab:CreateDropdown({
+    Name            = "Select Level",
+    Options         = artifactLevelOptions,
+    CurrentOption   = collapseFullSelection(
+        Config.SelectedArtifactLevels,
+        artifactState.getArtifactLevelOptions()
+    ),
+    MultipleOptions = true,
+    Flag            = "SelectedArtifactLevels",
+    Callback        = function(v)
+        Config.SelectedArtifactLevels = collapseFullSelection(
+            v,
+            artifactState.getArtifactLevelOptions()
+        )
+    end,
+})
+
+Controls.AutoSellArtifacts = miscTab:CreateToggle({
+    Name         = "Auto Sell Artifacts",
+    CurrentValue = Config.AutoSellArtifacts,
+    Flag         = "AutoSellArtifacts",
+    Callback     = function(v) Config.AutoSellArtifacts = v end,
+})
+
+miscTab:CreateSection("Boss Card")
+
+miscTab:CreateParagraph({
+    Title   = "Boss Card Automation",
+    Content = "Select one card. Auto upgrade checks that card's own shard type and live UpgradeCost before sending the upgrade request.",
+})
+
+local bossCardLabels = {}
+local bossCardLabelById = {}
+for _, card in ipairs(artifactState.getBossCards()) do
+    table.insert(bossCardLabels, card.Label)
+    bossCardLabelById[card.Id] = card.Label
+end
+
+local selectedBossCardId = artifactState.getBossCardId(Config.SelectedBossCard)
+Config.SelectedBossCard = selectedBossCardId
+
+Controls.SelectedBossCard = miscTab:CreateDropdown({
+    Name            = "Select Boss Card",
+    Options         = bossCardLabels,
+    CurrentOption   = bossCardLabelById[selectedBossCardId],
+    MultipleOptions = false,
+    Flag            = "SelectedBossCard",
+    Callback        = function(v)
+        Config.SelectedBossCard = artifactState.getBossCardId(v)
+    end,
+})
+
+Controls.AutoEquipBossCard = miscTab:CreateToggle({
+    Name         = "Auto Equip Boss Card",
+    CurrentValue = Config.AutoEquipBossCard,
+    Flag         = "AutoEquipBossCard",
+    Callback     = function(v) Config.AutoEquipBossCard = v end,
+})
+
+Controls.AutoUpgradeBossCard = miscTab:CreateToggle({
+    Name         = "Auto Upgrade Boss Card",
+    CurrentValue = Config.AutoUpgradeBossCard,
+    Flag         = "AutoUpgradeBossCard",
+    Callback     = function(v) Config.AutoUpgradeBossCard = v end,
 })
 
 miscTab:CreateSection("Anti-AFK")
