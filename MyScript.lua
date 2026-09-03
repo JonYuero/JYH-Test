@@ -780,6 +780,7 @@ local artifactState = {
     CatalogScanned = false,
     ArtifactOptions = { "All" },
     ArtifactSelectionOptions = {},
+    ArtifactSelectionOptionMap = {},
     BossCardOptions = { "White Titan", "Moon Demon", "Chimera King" },
     LastSoldAt = {},
     LastArtifactEquipAt = {},
@@ -1892,6 +1893,48 @@ do
         return result
     end
 
+    -- Match the rank/trait card selectors: every owned copy gets its own
+    -- option, while the first copy keeps the base name and later copies get
+    -- a numbered suffix. The map is important because two artifacts with
+    -- the same name can have different Uids.
+    local function buildArtifactSelectionOptions()
+        local options = {}
+        local optionMap = {}
+        local counts = {}
+        local baseSeen = {}
+
+        for _, entry in ipairs(getArtifactEntries()) do
+            local baseName = tostring(entry.Name or "")
+            if baseName ~= "" then
+                counts[baseName] = (counts[baseName] or 0) + 1
+                local label = baseName
+                if counts[baseName] > 1 then
+                    label = baseName .. " #" .. tostring(counts[baseName])
+                end
+                table.insert(options, label)
+                optionMap[label] = entry
+                baseSeen[string.lower(baseName)] = true
+            end
+        end
+
+        -- Keep catalog entries selectable even when the inventory UI has not
+        -- replicated an owned copy yet. These entries have no Uid and use
+        -- the normal name-based fallback when they become available.
+        for _, label in ipairs(discoverArtifactCatalog()) do
+            local key = string.lower(tostring(label))
+            if not baseSeen[key] then
+                table.insert(options, label)
+                optionMap[label] = nil
+                baseSeen[key] = true
+            end
+        end
+
+        table.sort(options, function(a, b)
+            return string.lower(tostring(a)) < string.lower(tostring(b))
+        end)
+        return options, optionMap
+    end
+
     local function getPlacedArtifactUids()
         local result = {}
         local plot = findPlot(Config.PlotNumber)
@@ -2118,14 +2161,13 @@ do
             return string.lower(a) < string.lower(b)
         end)
         artifactState.ArtifactOptions = options
-        artifactState.ArtifactSelectionOptions = {}
-        for _, option in ipairs(options) do
-            if option ~= "All" then
-                table.insert(artifactState.ArtifactSelectionOptions, option)
-            end
-        end
+        local selectionOptions, selectionMap =
+            buildArtifactSelectionOptions()
+        artifactState.ArtifactSelectionOptions = selectionOptions
+        artifactState.ArtifactSelectionOptionMap = selectionMap
         if #artifactState.ArtifactSelectionOptions == 0 then
             artifactState.ArtifactSelectionOptions = { "No artifacts found" }
+            artifactState.ArtifactSelectionOptionMap = {}
         end
 
         local selectDropdown = artifactState.ArtifactDropdown
@@ -2149,6 +2191,31 @@ do
         end
     end
 
+    local function findSelectedArtifactEntry(wanted, entries, used)
+        local label = tostring(wanted or "")
+        local mapped = artifactState.ArtifactSelectionOptionMap[label]
+        if mapped then
+            for _, entry in ipairs(entries) do
+                if tostring(entry.Uid) == tostring(mapped.Uid)
+                    and (not used or not used[tostring(entry.Uid)]) then
+                    return entry
+                end
+            end
+        end
+
+        -- A saved selection may outlive the inventory frame that created it.
+        -- Fall back to the base name after removing our duplicate suffix.
+        local baseName = label:gsub("%s+#%d+$", "")
+        for _, entry in ipairs(entries) do
+            local uid = tostring(entry.Uid)
+            if (not used or not used[uid])
+                and selectedMatches(entry.Name, { baseName }) then
+                return entry
+            end
+        end
+        return nil
+    end
+
     artifactState.updateArtifactSelectionInfo = function()
         local paragraph = artifactState.ArtifactSelectParagraph
         if not paragraph or not paragraph.Set then return end
@@ -2164,15 +2231,8 @@ do
             table.insert(lines, "No artifacts selected.")
         else
             for slotIndex, wanted in ipairs(selected) do
-                local match
-                for _, entry in ipairs(entries) do
-                    local key = tostring(entry.Uid)
-                    if not used[key] and selectedMatches(entry.Name, { wanted }) then
-                        match = entry
-                        used[key] = true
-                        break
-                    end
-                end
+                local match = findSelectedArtifactEntry(wanted, entries, used)
+                if match then used[tostring(match.Uid)] = true end
                 if match then
                     table.insert(
                         lines,
@@ -2245,20 +2305,14 @@ do
             local currentUid = slot and readFreshValue(slot, {
                 "ArtifactUid", "ArtifactUID", "Uid", "UID",
             })
-            local match
+            local match = findSelectedArtifactEntry(wanted, entries)
 
-            for _, entry in ipairs(entries) do
-                if selectedMatches(entry.Name, { wanted })
-                    and (
-                        tostring(entry.Uid) == tostring(currentUid or "")
-                        or not placed[entry.Uid]
-                    ) then
-                    match = entry
-                    break
-                end
-            end
-
-            if match and tostring(match.Uid) ~= tostring(currentUid or "") then
+            if match
+                and (
+                    tostring(match.Uid) == tostring(currentUid or "")
+                    or not placed[match.Uid]
+                )
+                and tostring(match.Uid) ~= tostring(currentUid or "") then
                 local last = artifactState.LastArtifactEquipAt[slotIndex] or 0
                 if os.clock() - last >= 2
                     and fireArtifact("Place", {
@@ -2276,29 +2330,16 @@ do
     end
 
     artifactState.upgradeArtifacts = function()
-        local plot = findPlot(Config.PlotNumber)
-        if not plot then return 0 end
-
         local upgraded = 0
-        local raidShards = getResourceCount({
-            "RaidShards", "RaidShard", "Raid Shards", "Raid Shard",
-        })
+
+        -- ArtifactRE performs the live ownership, level, and shard checks on
+        -- the server. Do not gate this request on slot attributes: those
+        -- values are not replicated consistently and were preventing the
+        -- remote from being called at all.
         for slotIndex = 1, 3 do
-            local slot = plot:FindFirstChild("ArtifactSlot" .. tostring(slotIndex), true)
-            local level = slot and readNumber(slot, {
-                "ArtifactLevel", "Level", "Lvl",
-            })
-            if slot
-                and not readBool(slot, { "IsMaxLevel", "MaxLevel" })
-                and (not level or level < 10) then
-                local cost = readNumber(slot, { "UpgradeCost", "Cost" })
-                if cost and cost > 0 and raidShards >= cost then
-                    if fireArtifact("Upgrade", { SlotIndex = slotIndex }) then
-                        upgraded = upgraded + 1
-                        raidShards = raidShards - cost
-                        task.wait(0.2)
-                    end
-                end
+            if fireArtifact("Upgrade", { SlotIndex = slotIndex }) then
+                upgraded = upgraded + 1
+                task.wait(0.2)
             end
         end
         return upgraded
@@ -2322,32 +2363,8 @@ do
     end
 
     artifactState.upgradeBossCard = function()
-        local slot = getBossSlot()
-        if not slot then return false end
-
-        local current = readFreshValue(slot, {
-            "BossCardId", "BossCardID", "CardId",
-        })
-        if readBool(slot, { "IsMaxLevel", "MaxLevel" }) then return false end
-
-        local cost = readNumber(slot, { "UpgradeCost", "Cost" })
-        if not cost or cost <= 0 then return false end
-        local id = selectedBossId(current or Config.SelectedBossCard)
-        local card = bossCardById(id)
-        local resourceNames = {}
-        for _, name in ipairs(card.Shards) do
-            table.insert(resourceNames, name)
-        end
-        local liveCurrency = readFreshValue(slot, {
-            "UpgradeCurrency", "ShardCurrency", "Currency", "Resource",
-        })
-        if liveCurrency ~= nil then
-            table.insert(resourceNames, 1, tostring(liveCurrency))
-        end
-        table.insert(resourceNames, id .. "Shards")
-        table.insert(resourceNames, id .. "Shard")
-        local shards = getResourceCount(resourceNames)
-        if shards < cost then return false end
+        -- BossCardRE upgrades the equipped boss card in slot 1. The request
+        -- intentionally has no payload, matching the game's own call.
         return fireBossCard("Upgrade")
     end
 end
