@@ -443,7 +443,7 @@ local MUTATIONS = {
 -- The IndexClient builds its cards and mutation buttons from CardsConfig.
 -- Use that same module here so new cards/mutations appear automatically
 -- instead of requiring another hard-coded list update.
-local INDEX_CARDS = {}
+cardCraftState.IndexCards = {}
 if type(cardCraftState.IndexConfig) == "table" then
     if type(cardCraftState.IndexConfig.GetAllCardsSorted) == "function" then
         local ok, cards = pcall(cardCraftState.IndexConfig.GetAllCardsSorted)
@@ -457,7 +457,7 @@ if type(cardCraftState.IndexConfig) == "table" then
                         local key = string.lower(cardName)
                         if cardName ~= "" and not seen[key] then
                             seen[key] = true
-                            table.insert(INDEX_CARDS, cardName)
+                            table.insert(cardCraftState.IndexCards, cardName)
                         end
                     end
                 end
@@ -4019,7 +4019,7 @@ local getSortedCardsInBackpack
 
 local filteredSellState = {}
 
-local function getIndexCardName(value)
+filteredSellState.getIndexCardName = function(value)
     if value == nil then return nil end
 
     local key = filterCompareKey(value)
@@ -4027,7 +4027,7 @@ local function getIndexCardName(value)
 
     local partialMatch
     local partialLength = 0
-    for _, cardName in ipairs(INDEX_CARDS) do
+    for _, cardName in ipairs(cardCraftState.IndexCards) do
         local cardKey = filterCompareKey(cardName)
         if cardKey then
             if cardKey == key then
@@ -4051,8 +4051,8 @@ filteredSellState.getCardName = function(item)
         "CardName", "Card", "CardId", "Name",
         "cardname", "card", "cardid",
     })
-    local cardName = getIndexCardName(cardValue)
-        or getIndexCardName(item and item.Name)
+    local cardName = filteredSellState.getIndexCardName(cardValue)
+        or filteredSellState.getIndexCardName(item and item.Name)
 
     -- Keep a raw fallback for game versions that expose a card tool before
     -- the matching entry is replicated in CardsConfig.
@@ -7004,7 +7004,7 @@ local function resolveFilteredSellValue(value, fallback)
 end
 
 local filteredSellCardOptions = { "All" }
-for _, cardName in ipairs(INDEX_CARDS) do
+    for _, cardName in ipairs(cardCraftState.IndexCards) do
     table.insert(filteredSellCardOptions, cardName)
 end
 
