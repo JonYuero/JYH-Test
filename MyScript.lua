@@ -663,23 +663,6 @@ end
 
 local MAX_CARD_LEVEL = 50
 local CARD_REMOVAL_DELAY = 0.5
-local AUTO_REMOVE_CARD_SLOT_OPTIONS = {
-    "Slot 1-5",
-    "Slot 6-10",
-    "Slot 11-15",
-    "Slot 16-20",
-    "Slot 21-25",
-    "Slot 26-30",
-}
-
-local function normalizeAutoRemoveCardSlot(value)
-    if type(value) == "table" then value = value[1] end
-    value = tostring(value or "")
-    for _, option in ipairs(AUTO_REMOVE_CARD_SLOT_OPTIONS) do
-        if value == option then return option end
-    end
-    return AUTO_REMOVE_CARD_SLOT_OPTIONS[1]
-end
 
 local RARITY_RANK = {}
 for index, rarity in ipairs(RARITIES) do
@@ -777,7 +760,6 @@ local clickGuiButton
 local startCombatBattle
 local removeAllCards
 local removeFirstFourCardSlots
-local removeCardSlotsInRange
 local doEquipBestCards
 local closeBossRaidReward
 local exitInfinityTowerBattle
@@ -5091,20 +5073,6 @@ removeAllCards = function(limit, minimum)
     return removed
 end
 
-removeCardSlotsInRange = function(rangeLabel)
-    local normalized = normalizeAutoRemoveCardSlot(rangeLabel)
-    local firstSlot, lastSlot = string.match(
-        normalized,
-        "^Slot%s+(%d+)%-(%d+)$"
-    )
-    firstSlot = tonumber(firstSlot) or 1
-    lastSlot = tonumber(lastSlot) or 5
-
-    -- Reuse the same interaction, cooldown, teleport, and CardSlotRE
-    -- fallback logic as the existing Remove All Cards action.
-    return removeAllCards(lastSlot, firstSlot)
-end
-
 removeFirstFourCardSlots = function()
     return removeAllCards(4)
 end
@@ -6312,6 +6280,38 @@ end)
 -- this boundary the many UI controls added below make the whole script fail
 -- during compilation with "Out of local registers".
 function buildUserInterface()
+
+local AUTO_REMOVE_CARD_SLOT_OPTIONS = {
+    "Slot 1-5",
+    "Slot 6-10",
+    "Slot 11-15",
+    "Slot 16-20",
+    "Slot 21-25",
+    "Slot 26-30",
+}
+
+local function normalizeAutoRemoveCardSlot(value)
+    if type(value) == "table" then value = value[1] end
+    value = tostring(value or "")
+    for _, option in ipairs(AUTO_REMOVE_CARD_SLOT_OPTIONS) do
+        if value == option then return option end
+    end
+    return AUTO_REMOVE_CARD_SLOT_OPTIONS[1]
+end
+
+local function removeCardSlotsInRange(rangeLabel)
+    local normalized = normalizeAutoRemoveCardSlot(rangeLabel)
+    local firstSlot, lastSlot = string.match(
+        normalized,
+        "^Slot%s+(%d+)%-(%d+)$"
+    )
+    firstSlot = tonumber(firstSlot) or 1
+    lastSlot = tonumber(lastSlot) or 5
+
+    -- Reuse the same interaction, cooldown, teleport, and CardSlotRE
+    -- fallback logic as the existing Remove All Cards action.
+    return removeAllCards(lastSlot, firstSlot)
+end
 
 local ConfigManager = {
     ConfigName        = "",
