@@ -733,6 +733,7 @@ local Config = {
     AutoUpgradeBossCard = false,
     AutoRemoveCard    = false,
     AutoRemoveCardSlot = "Slot 1-5",
+    AutoRemoveCardDelay = 30,
 
     -- Auto Sell Cards
     FilteredSellMode  = "Whitelist",
@@ -7159,11 +7160,6 @@ end)
 -- during compilation with "Out of local registers".
 function buildUserInterface()
 
--- Auto Remove Card is intentionally throttled to avoid scanning and
--- teleporting through the plot continuously.  Thirty minutes is the default
--- cleanup interval.
-local AUTO_REMOVE_CARD_INTERVAL = 30 * 60
-
 local AUTO_REMOVE_CARD_SLOT_OPTIONS = {
     "Slot 1-5",
     "Slot 6-10",
@@ -7298,6 +7294,7 @@ local function buildSerializableConfig()
         AutoUpgradeBossCard = Config.AutoUpgradeBossCard,
         AutoRemoveCard    = Config.AutoRemoveCard,
         AutoRemoveCardSlot = Config.AutoRemoveCardSlot,
+        AutoRemoveCardDelay = Config.AutoRemoveCardDelay,
         FilteredSellMode  = Config.FilteredSellMode,
         FilteredSellCard  = Config.FilteredSellCard,
         FilteredSellMutation = Config.FilteredSellMutation,
@@ -7466,7 +7463,7 @@ local function loadConfig(name, isAutoload)
         "SelectedArtifacts", "SelectedArtifactLevels",
         "AutoSellArtifacts", "SelectedBossCard", "AutoEquipBossCard",
         "AutoUpgradeBossCard",
-        "AutoRemoveCard", "AutoRemoveCardSlot",
+        "AutoRemoveCard", "AutoRemoveCardSlot", "AutoRemoveCardDelay",
         "FilteredSellMode", "FilteredSellCard",
         "FilteredSellMutation", "FilteredSellRanking", "FilteredSellTrait",
         "AutoFilteredSell",
@@ -7499,6 +7496,10 @@ local function loadConfig(name, isAutoload)
             end
             if key == "AutoRemoveCardSlot" then
                 value = normalizeAutoRemoveCardSlot(value)
+            end
+            if key == "AutoRemoveCardDelay" then
+                value = math.floor(tonumber(value) or 30)
+                value = math.max(1, math.min(60, value))
             end
             if key == "SelectedArtifacts" then
                 value = collapseFullSelection(
@@ -7815,6 +7816,28 @@ Controls.AutoRemoveCardSlot = cardsTab:CreateDropdown({
     end,
 })
 
+local autoRemoveNextRunAt
+
+Controls.AutoRemoveCardDelay = cardsTab:CreateSlider({
+    Name         = "Delay",
+    Range        = { 1, 60 },
+    Increment    = 1,
+    Suffix       = " minute(s)",
+    CurrentValue = math.max(
+        1,
+        math.min(60, math.floor(tonumber(Config.AutoRemoveCardDelay) or 30))
+    ),
+    Flag         = "AutoRemoveCardDelay",
+    Callback     = function(v)
+        Config.AutoRemoveCardDelay = math.max(
+            1,
+            math.min(60, math.floor(tonumber(v) or 30))
+        )
+        -- Apply a newly selected delay without waiting for the old timer.
+        autoRemoveNextRunAt = nil
+    end,
+})
+
 Controls.AutoRemoveCard = cardsTab:CreateToggle({
     Name         = "Auto Remove Card",
     CurrentValue = Config.AutoRemoveCard,
@@ -7823,17 +7846,25 @@ Controls.AutoRemoveCard = cardsTab:CreateToggle({
 })
 
 task.spawn(function()
-    local nextAutoRemoveAt = os.clock() + AUTO_REMOVE_CARD_INTERVAL
     while true do
         task.wait(1)
         if not Config.AutoRemoveCard then
             -- Start a fresh full interval whenever the toggle is re-enabled.
-            nextAutoRemoveAt = os.clock() + AUTO_REMOVE_CARD_INTERVAL
+            autoRemoveNextRunAt = nil
             continue
         end
 
         local now = os.clock()
-        if now < nextAutoRemoveAt then continue end
+        if not autoRemoveNextRunAt then
+            local delayMinutes = math.max(
+                1,
+                math.min(60, math.floor(
+                    tonumber(Config.AutoRemoveCardDelay) or 30
+                ))
+            )
+            autoRemoveNextRunAt = now + (delayMinutes * 60)
+        end
+        if now < autoRemoveNextRunAt then continue end
 
         local ok, removed = pcall(function()
             return removeCardSlotsInRange(Config.AutoRemoveCardSlot)
@@ -7848,7 +7879,13 @@ task.spawn(function()
             warn("[ACF] Auto Remove Card failed: " .. tostring(removed))
         end
 
-        nextAutoRemoveAt = os.clock() + AUTO_REMOVE_CARD_INTERVAL
+        local delayMinutes = math.max(
+            1,
+            math.min(60, math.floor(
+                tonumber(Config.AutoRemoveCardDelay) or 30
+            ))
+        )
+        autoRemoveNextRunAt = os.clock() + (delayMinutes * 60)
     end
 end)
 
