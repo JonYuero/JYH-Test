@@ -707,7 +707,7 @@ local Config = {
     -- Cards
     AutoUpgrade       = false,
     UpgradeDelay      = 0.15,
-    CardActionDelay   = 0.6,
+    CardActionDelay   = 1,
     AutoTraitRoll     = false,
     SelectedRankCards = { "All" },
     TargetRank        = {},
