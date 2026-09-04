@@ -4753,6 +4753,41 @@ local function findSlotInteraction(slotModel, names)
     return nil
 end
 
+-- Auto Place Pack must never use a card tool. Some card names can contain
+-- words that also occur in pack names, so a loose substring check is unsafe.
+-- Prefer the game's pack metadata and only fall back to an exact normalized
+-- name match.
+local function isKnownPackValue(value)
+    local key = normalizePackName(value)
+    if not key or key == "" then return false end
+    for _, packName in ipairs(PACKS) do
+        if key == normalizePackName(packName) then
+            return true
+        end
+    end
+    return false
+end
+
+local function isPackTool(item)
+    if not item or not item:IsA("Tool") then return false end
+
+    -- Card tools expose CardLevel/CardName in the backpack. Reject these
+    -- before checking the display name so they can never be placed as packs.
+    if item:FindFirstChild("CardLevel") ~= nil
+        or item:GetAttribute("CardLevel") ~= nil
+        or item:FindFirstChild("CardName") ~= nil
+        or item:GetAttribute("CardName") ~= nil then
+        return false
+    end
+
+    local packValue = readBoxValue(item, {
+        "PackName", "Pack", "PackId",
+    })
+    if isKnownPackValue(packValue) then return true end
+
+    return isKnownPackValue(item.Name)
+end
+
 local function slotIsOnCooldown(slotModel)
     if not slotModel then return false end
     for _, desc in ipairs(slotModel:GetDescendants()) do
@@ -4787,17 +4822,7 @@ local function getFilteredPacksInBackpack()
     local backpack = player:FindFirstChild("Backpack")
     if not backpack then return result end
     for _, item in ipairs(backpack:GetChildren()) do
-        if not item:IsA("Tool") then continue end
-        local handle = item:FindFirstChild("Handle")
-        if handle and handle:FindFirstChild("Box") then continue end
-        local lname = string.lower(item.Name)
-        local isPack = false
-        for _, packName in ipairs(PACKS) do
-            if string.find(lname, string.lower(packName), 1, true) then
-                isPack = true ; break
-            end
-        end
-        if not isPack then continue end
+        if not isPackTool(item) then continue end
         local info = {
             pack     = item.Name,
             rarity   = readBoxValue(item, { "Rarity", "rarity" }),
@@ -4816,17 +4841,7 @@ local function getAllPacksInBackpack()
     if not backpack then return result end
 
     for _, item in ipairs(backpack:GetChildren()) do
-        if not item:IsA("Tool") then continue end
-        local handle = item:FindFirstChild("Handle")
-        if handle and handle:FindFirstChild("Box") then continue end
-
-        local name = string.lower(item.Name)
-        for _, packName in ipairs(PACKS) do
-            if string.find(name, string.lower(packName), 1, true) then
-                table.insert(result, item)
-                break
-            end
-        end
+        if isPackTool(item) then table.insert(result, item) end
     end
     return result
 end
@@ -7144,6 +7159,11 @@ end)
 -- during compilation with "Out of local registers".
 function buildUserInterface()
 
+-- Auto Remove Card is intentionally throttled to avoid scanning and
+-- teleporting through the plot continuously.  Thirty minutes is the default
+-- cleanup interval.
+local AUTO_REMOVE_CARD_INTERVAL = 30 * 60
+
 local AUTO_REMOVE_CARD_SLOT_OPTIONS = {
     "Slot 1-5",
     "Slot 6-10",
@@ -7774,11 +7794,6 @@ cardsTab:CreateSlider({
 
 cardsTab:CreateSection("Auto Remove Card")
 
-cardsTab:CreateParagraph({
-    Title   = "Auto Remove Card",
-    Content = "Removes cards placed in the selected five-slot range.",
-})
-
 cardsTab:CreateButton({
     Name     = "Remove All Cards",
     Callback = function()
@@ -7808,9 +7823,17 @@ Controls.AutoRemoveCard = cardsTab:CreateToggle({
 })
 
 task.spawn(function()
+    local nextAutoRemoveAt = os.clock() + AUTO_REMOVE_CARD_INTERVAL
     while true do
         task.wait(1)
-        if not Config.AutoRemoveCard then continue end
+        if not Config.AutoRemoveCard then
+            -- Start a fresh full interval whenever the toggle is re-enabled.
+            nextAutoRemoveAt = os.clock() + AUTO_REMOVE_CARD_INTERVAL
+            continue
+        end
+
+        local now = os.clock()
+        if now < nextAutoRemoveAt then continue end
 
         local ok, removed = pcall(function()
             return removeCardSlotsInRange(Config.AutoRemoveCardSlot)
@@ -7824,6 +7847,8 @@ task.spawn(function()
         elseif not ok then
             warn("[ACF] Auto Remove Card failed: " .. tostring(removed))
         end
+
+        nextAutoRemoveAt = os.clock() + AUTO_REMOVE_CARD_INTERVAL
     end
 end)
 
